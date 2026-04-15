@@ -116,6 +116,30 @@ class DisplayAttentionCameraFusionTests(unittest.TestCase):
         self.assertTrue(dropout.observation.looking_toward_device)
         self.assertEqual(dropout.debug_details["dropout_hold_source"], "attention_fused")
 
+    def test_recent_hand_semantics_tracks_fresh_attention_or_gesture_context(self) -> None:
+        config = TwinrConfig(
+            display_driver="hdmi_wayland",
+            display_attention_refresh_interval_s=0.5,
+            proactive_capture_interval_s=6.0,
+        )
+        fusion = DisplayAttentionCameraFusion.from_config(config)
+
+        fusion.fuse_attention(
+            observed_at=30.0,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                primary_person_zone=SocialPersonZone.CENTER,
+                primary_person_center_x=0.5,
+                primary_person_center_y=0.5,
+                hand_or_object_near_camera=True,
+                showing_intent_likely=True,
+            ),
+        )
+
+        self.assertTrue(fusion.has_recent_hand_semantics(observed_at=30.2))
+        self.assertFalse(fusion.has_recent_hand_semantics(observed_at=33.0))
+
 
 if __name__ == "__main__":
     unittest.main()

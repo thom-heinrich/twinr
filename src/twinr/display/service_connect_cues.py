@@ -7,6 +7,8 @@
 # SEC-2: Files/locks are created with private permissions and only safe regular files are read; QR payloads are restricted to bounded base64 raster images.
 # IMP-1: Added an optional msgspec fast-path for schema-backed JSON decode/encode on constrained edge hardware.
 # IMP-2: Added bounded file-size enforcement and compact JSON output to reduce memory spikes and write amplification.
+# BUG-5: signature() now excludes updated_at/expires_at so cue lifetime refreshes do not
+#        force semantically identical HDMI reserve rerenders on hdmi_wayland.
 
 """Persist active service-connect reserve cues for Twinr's HDMI info lane.
 
@@ -527,8 +529,6 @@ class DisplayServiceConnectCue:
 
         return (
             self.source,
-            self.updated_at,
-            self.expires_at,
             self.service_id,
             self.service_label,
             self.phase,

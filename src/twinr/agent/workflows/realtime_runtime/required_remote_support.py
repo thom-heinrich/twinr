@@ -8,6 +8,10 @@
 # flip the runtime straight into visible error; entry now honors a bounded
 # failure threshold so transient deep-probe stalls can recover without a user-
 # visible fail-close while repeated failures still fail closed quickly.
+# BUG-7: Direct LongTermRemoteUnavailableError paths in watchdog-artifact mode
+# now consult the authoritative watchdog snapshot and honor the same transient
+# failure threshold instead of bypassing it and forcing a visible error on the
+# first corroborated watchdog fail sample.
 # SEC-1: Output/log injection fixed: untrusted exception text and correlation IDs are now control-character-neutralized before emission to line-oriented control-plane channels.
 # SEC-2: Telemetry minimization added: raw remote exception details and remote_write_context are now redacted/canonicalized before tracing/emission to avoid leaking tokens/PII.
 # IMP-1: Frontier readiness model: required-remote now follows startup/readiness semantics with fail-closed startup, recovery hysteresis, and conservative ownership handling.
@@ -67,6 +71,7 @@ def _ensure_required_remote_state(loop: Any) -> None:
         "_required_remote_dependency_refresh_inflight": False,
         "_required_remote_dependency_last_success_at": None,
         "_required_remote_dependency_last_failure_at": None,
+        "_required_remote_dependency_last_failure_sample_fingerprint": None,
     }
     for name, value in defaults.items():
         if not hasattr(loop, name):
@@ -266,6 +271,38 @@ def _required_remote_next_delay_seconds(
     return _apply_required_remote_jitter(loop, delay_s)
 
 
+def _watchdog_failure_sample_fingerprint(assessment: Any) -> tuple[str, object] | None:
+    """Return a stable identity for one watchdog sample when available."""
+
+    sample_seq = getattr(assessment, "sample_seq", None)
+    if isinstance(sample_seq, int) and sample_seq > 0:
+        return ("seq", sample_seq)
+    sample_mono_ns = getattr(assessment, "sample_captured_monotonic_ns", None)
+    if isinstance(sample_mono_ns, int) and sample_mono_ns > 0:
+        return ("captured_monotonic_ns", sample_mono_ns)
+    sample_captured_at = _normalize_text(getattr(assessment, "sample_captured_at", None))
+    if sample_captured_at:
+        return ("captured_at", sample_captured_at)
+    return None
+
+
+def _next_required_remote_failure_streak_locked(
+    loop: Any,
+    *,
+    watchdog_failure_assessment: Any | None = None,
+) -> int:
+    """Advance the failure streak once per distinct watchdog sample."""
+
+    current_streak = max(0, int(getattr(loop, "_required_remote_dependency_failure_streak", 0) or 0))
+    fingerprint = _watchdog_failure_sample_fingerprint(watchdog_failure_assessment)
+    if fingerprint is not None:
+        previous_fingerprint = getattr(loop, "_required_remote_dependency_last_failure_sample_fingerprint", None)
+        if previous_fingerprint == fingerprint:
+            return max(1, current_streak)
+        loop._required_remote_dependency_last_failure_sample_fingerprint = fingerprint
+    return max(1, current_streak + 1)
+
+
 def required_remote_dependency_uses_watchdog_artifact(loop: Any) -> bool:
     """Report whether live remote gating should use the external watchdog artifact."""
 
@@ -352,6 +389,7 @@ def _defer_required_remote_error_entry_if_transient(
     detail_text: str,
     default_interval_s: float,
     observed_at_monotonic_s: float,
+    watchdog_failure_assessment: Any | None = None,
 ) -> int | None:
     """Keep the runtime visibly ready through one bounded transient watchdog failure."""
 
@@ -364,11 +402,12 @@ def _defer_required_remote_error_entry_if_transient(
             return None
         if not _had_recent_required_remote_ready_proof(loop):
             return None
-        failure_streak = max(
-            1,
-            int(getattr(loop, "_required_remote_dependency_failure_streak", 0) or 0) + 1,
+        failure_streak = _next_required_remote_failure_streak_locked(
+            loop,
+            watchdog_failure_assessment=watchdog_failure_assessment,
         )
         if failure_streak >= failure_threshold:
+            loop._required_remote_dependency_failure_streak = failure_streak
             return None
         loop._required_remote_dependency_failure_streak = failure_streak
         loop._required_remote_dependency_cached_ready = True
@@ -463,6 +502,8 @@ def enter_required_remote_error(
     extract_remote_write_context: Callable[[BaseException], dict[str, object] | None],
     default_interval_s: float,
     observed_at_monotonic_s: float | None = None,
+    watchdog_failure_assessment: Any | None = None,
+    assess_watchdog_snapshot: Callable[[Any], Any] | None = None,
 ) -> bool:
     """Fail closed when required remote memory is unavailable."""
 
@@ -479,13 +520,54 @@ def enter_required_remote_error(
     remote_write_context = extract_remote_write_context(exc) if isinstance(exc, BaseException) else None
     sanitized_context = _sanitize_telemetry_mapping(remote_write_context, max_len=_MAX_TRACE_TEXT_CHARS)
     observed_at = float(observed_at_monotonic_s) if observed_at_monotonic_s is not None else time.monotonic()
+    resolved_watchdog_failure_assessment = watchdog_failure_assessment
+
+    if resolved_watchdog_failure_assessment is None and required_remote_dependency_uses_watchdog_artifact(loop):
+        if callable(assess_watchdog_snapshot):
+            try:
+                resolved_watchdog_failure_assessment = assess_watchdog_snapshot(loop.config)
+            except Exception as assessment_exc:
+                _trace_required_remote_event(
+                    loop,
+                    "required_remote_direct_failure_watchdog_assessment_failed",
+                    kind="error",
+                    level="ERROR",
+                    details={
+                        "error_type": type(assessment_exc).__name__,
+                        "error": getattr(loop, "_safe_error_text", str)(assessment_exc),
+                    },
+                )
+                resolved_watchdog_failure_assessment = None
+        assessment_ready = getattr(resolved_watchdog_failure_assessment, "ready", None)
+        if assessment_ready is False:
+            deferred_failure_streak = _defer_required_remote_error_entry_if_transient(
+                loop,
+                detail_text=detail_text,
+                default_interval_s=default_interval_s,
+                observed_at_monotonic_s=observed_at,
+                watchdog_failure_assessment=resolved_watchdog_failure_assessment,
+            )
+            if deferred_failure_streak is not None:
+                _trace_required_remote_event(
+                    loop,
+                    "required_remote_direct_error_deferred",
+                    kind="cache",
+                    level="WARN",
+                    details={
+                        "failure_streak": deferred_failure_streak,
+                        "failure_threshold": required_remote_dependency_failure_threshold(loop),
+                        "detail": detail_text,
+                        "assessment_detail": getattr(resolved_watchdog_failure_assessment, "detail", None),
+                    },
+                )
+                return False
 
     with loop._get_lock("_required_remote_dependency_lock"):
         active = bool(getattr(loop, "_required_remote_dependency_error_active", False))
         runtime_status_value = getattr(getattr(getattr(loop, "runtime", None), "status", None), "value", None)
-        loop._required_remote_dependency_failure_streak = max(
-            1,
-            int(getattr(loop, "_required_remote_dependency_failure_streak", 0) or 0) + 1,
+        loop._required_remote_dependency_failure_streak = _next_required_remote_failure_streak_locked(
+            loop,
+            watchdog_failure_assessment=resolved_watchdog_failure_assessment,
         )
         loop._required_remote_dependency_cached_ready = False
         loop._required_remote_dependency_checked_once = True
@@ -665,6 +747,7 @@ def refresh_required_remote_dependency(
             loop._required_remote_dependency_next_check_at = 0.0
             loop._required_remote_dependency_failure_streak = 0
             loop._required_remote_dependency_refresh_inflight = False
+            loop._required_remote_dependency_last_failure_sample_fingerprint = None
         _trace_required_remote_event(
             loop,
             "required_remote_not_required",
@@ -787,6 +870,7 @@ def refresh_required_remote_dependency(
             detail_text=getattr(loop, "_safe_error_text", str)(check_error),
             default_interval_s=default_interval_s,
             observed_at_monotonic_s=completed_at,
+            watchdog_failure_assessment=watchdog_failure_assessment,
         )
         if deferred_failure_streak is not None:
             _trace_required_remote_event(
@@ -813,6 +897,7 @@ def refresh_required_remote_dependency(
             extract_remote_write_context=extract_remote_write_context,
             default_interval_s=default_interval_s,
             observed_at_monotonic_s=completed_at,
+            watchdog_failure_assessment=watchdog_failure_assessment,
         )
         return False
 
@@ -873,6 +958,7 @@ def refresh_required_remote_dependency(
             )
             loop._required_remote_dependency_last_success_at = completed_at
             loop._required_remote_dependency_failure_streak = 0
+            loop._required_remote_dependency_last_failure_sample_fingerprint = None
             if error_active and runtime_status_value == "error" and ownership == "owned":
                 should_reset_runtime_error = True
             elif error_active and runtime_status_value == "error" and ownership == "foreign":

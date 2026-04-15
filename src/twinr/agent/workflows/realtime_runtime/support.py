@@ -25,7 +25,7 @@ import uuid
 from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, Lock, RLock, Thread, current_thread
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, cast
 
 try:
     from queue import ShutDown as QueueShutDown
@@ -118,6 +118,16 @@ _WHITESPACE_RE = re.compile(r"\s+")
 _SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)\b(?P<key>x-?api-?key|api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|secret|signature|sig)\b\s*[:=]\s*(?P<value>[^\s,;]+)"
 )
+
+
+def _call_finalize_speculative_clear(
+    callback: Callable[..., object],
+    *,
+    status: str,
+) -> None:
+    """Invoke one optional status hook with a bounded runtime status payload."""
+
+    callback(status=status)
 _AUTHORIZATION_RE = re.compile(
     r"(?i)\bauthorization\b\s*[:=]\s*(?P<scheme>bearer\s+)?(?P<value>[^\s,;]+)"
 )
@@ -604,6 +614,7 @@ class TwinrRealtimeSupportMixin:
             exc,
             extract_remote_write_context=extract_remote_write_context,
             default_interval_s=_DEFAULT_REQUIRED_REMOTE_HEALTHCHECK_INTERVAL_SECONDS,
+            assess_watchdog_snapshot=assess_required_remote_watchdog_snapshot,
         )
 
     def _required_remote_dependency_current_ready(self) -> bool:
@@ -734,6 +745,7 @@ class TwinrRealtimeSupportMixin:
             self._required_remote_dependency_error_active = False
             self._required_remote_dependency_error_message = None
             self._required_remote_dependency_recovery_started_at = None
+            self._required_remote_dependency_last_failure_sample_fingerprint = None
             self._trace_event(
                 "required_remote_error_cleared_for_non_remote_failure",
                 kind="invariant",
@@ -807,6 +819,20 @@ class TwinrRealtimeSupportMixin:
                 details={"active_statuses": active_statuses_label, "force": force},
             )
             self._last_active_statuses = active_statuses_label
+        finalize_speculative_clear = getattr(
+            self,
+            "_finalize_pending_speculative_wake_display_clear",
+            None,
+        )
+        if callable(finalize_speculative_clear):
+            finalize_speculative_clear_fn = cast(
+                Callable[..., object],
+                finalize_speculative_clear,
+            )
+            _call_finalize_speculative_clear(
+                finalize_speculative_clear_fn,
+                status=status,
+            )
 
     def _reload_live_config_from_env(self, env_path: Path) -> None:
         config_lock = self._get_lock("_config_lock")
@@ -966,6 +992,18 @@ class TwinrRealtimeSupportMixin:
             "listen_beep_completed",
             kind="io",
             details={"settle_ms": config.audio_beep_settle_ms},
+        )
+
+    def _acknowledge_follow_up_open(self, *, request_source: str) -> None:
+        """Confirm a reopened follow-up listening window with the shared earcon."""
+
+        self._play_listen_beep()
+        self.emit("conversation_follow_up_ack=earcon")
+        self._record_event(
+            "conversation_follow_up_acknowledged",
+            "Twinr confirmed a reopened follow-up listening window with an earcon.",
+            prompt="earcon",
+            request_source=request_source,
         )
 
     def _start_working_feedback_loop(self, kind: WorkingFeedbackKind) -> Callable[[], None]:

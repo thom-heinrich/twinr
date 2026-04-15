@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, Final
 
 from fastapi import Request
-from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from markupsafe import Markup
 
@@ -24,7 +23,8 @@ from twinr.automations import AutomationStore
 from twinr.integrations import TwinrIntegrationStore
 from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
 from twinr.memory.reminders import ReminderStore
-from twinr.ops import TwinrOpsEventStore, TwinrUsageStore
+from twinr.ops.events import TwinrOpsEventStore
+from twinr.ops.usage import TwinrUsageStore
 from twinr.ops.remote_memory_watchdog import RemoteMemoryWatchdogSnapshot, RemoteMemoryWatchdogStore
 from twinr.web.presenters import _nav_items
 from twinr.web.support.auth import FileBackedWebAuthStore
@@ -227,7 +227,7 @@ class WebAppContext:
         active_page: str,
         restart_notice: str | None = DEFAULT_RESTART_NOTICE,
         **context: Any,
-    ) -> HTMLResponse:
+    ) -> Any:
         """Render one template with Twinr-controlled context keys.
 
         Args:
@@ -240,8 +240,7 @@ class WebAppContext:
                 Twinr-reserved keys.
 
         Returns:
-            Rendered `HTMLResponse`, or a minimal fallback page when template
-            rendering fails.
+            Rendered template response.
         """
 
         # AUDIT-FIX(#5): Prevent caller-supplied context from overriding framework-controlled keys such as request/nav_items/env_path.
@@ -266,27 +265,19 @@ class WebAppContext:
             if key not in _RESERVED_CONTEXT_KEYS
         }
 
-        try:
-            response_context = {
-                **passthrough_context,
-                "request": request,
-                "page_title": page_title,
-                "active_page": active_page,
-                "nav_items": _nav_items(active_page),
-                "saved": saved,
-                "error_message": error_message,
-                "restart_notice": restart_notice,
-                "env_path": str(self.env_path),
-                "auth_context": getattr(request.state, "web_auth_context", None),
-            }
-            return self.templates.TemplateResponse(request, template_name, response_context)
-        except Exception:
-            # AUDIT-FIX(#4): Degrade to a minimal safe HTML page instead of crashing the request path on template lookup/render failures.
-            logger.exception("Failed to render Twinr template %s", template_name)
-            return HTMLResponse(
-                self._fallback_render_html(page_title),
-                status_code=500,
-            )
+        response_context = {
+            **passthrough_context,
+            "request": request,
+            "page_title": page_title,
+            "active_page": active_page,
+            "nav_items": _nav_items(active_page),
+            "saved": saved,
+            "error_message": error_message,
+            "restart_notice": restart_notice,
+            "env_path": str(self.env_path),
+            "auth_context": getattr(request.state, "web_auth_context", None),
+        }
+        return self.templates.TemplateResponse(request, template_name, response_context)
 
     @staticmethod
     def _stat_fingerprint(stat_result: os.stat_result) -> tuple[int, int, int, int, int]:
@@ -339,26 +330,3 @@ class WebAppContext:
             normalized = normalized[: _MAX_ERROR_MESSAGE_CHARS - 1].rstrip() + "…"
 
         return Markup.escape(normalized)
-
-    @staticmethod
-    def _fallback_render_html(page_title: str) -> str:
-        """Build a minimal HTML fallback page for template failures."""
-
-        # AUDIT-FIX(#4): Return a plain, dependency-free fallback page when the normal template pipeline fails.
-        safe_title = Markup.escape(page_title or "Twinr")
-        return (
-            "<!doctype html>"
-            "<html lang=\"en\">"
-            "<head>"
-            "<meta charset=\"utf-8\">"
-            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-            f"<title>{safe_title}</title>"
-            "</head>"
-            "<body>"
-            "<main>"
-            "<h1>Page unavailable</h1>"
-            "<p>This page could not be opened right now. Please try again. If the problem continues, restart Twinr.</p>"
-            "</main>"
-            "</body>"
-            "</html>"
-        )

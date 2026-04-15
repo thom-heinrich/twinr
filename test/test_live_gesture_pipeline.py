@@ -993,6 +993,48 @@ class LiveGesturePipelineTests(unittest.TestCase):
         self.assertTrue(debug_snapshot["live_custom_enabled"])
         self.assertTrue(debug_snapshot["observe_policy_enable_custom_live"])
 
+    def test_observe_user_facing_fast_policy_emits_live_custom_peace_sign_above_hdmi_floor(
+        self,
+    ) -> None:
+        pipeline = LiveGesturePipeline(
+            config=MediaPipeVisionConfig(
+                pose_model_path="pose.task",
+                hand_landmarker_model_path="hand.task",
+                gesture_model_path="gesture.task",
+                custom_gesture_model_path="custom.task",
+                live_gesture_mode="live_stream",
+            )
+        )
+        pipeline._runtime = _StubRuntime(
+            builtin_results=[
+                _GestureResult(
+                    gestures=[[_Category("none", 0.97)]],
+                    hand_landmarks=[[_Landmark(0.46, 0.42), _Landmark(0.53, 0.58)]],
+                )
+            ],
+            custom_results=[
+                _GestureResult(
+                    gestures=[[_Category("peace_sign", 0.719)]],
+                    hand_landmarks=[[_Landmark(0.46, 0.42), _Landmark(0.53, 0.58)]],
+                )
+            ],
+        )
+
+        observation = pipeline.observe(
+            frame_rgb="frame",
+            observed_at=7.0,
+            observe_policy=LiveGestureObservePolicy.user_facing_fast(),
+        )
+        debug_snapshot = pipeline.debug_snapshot()
+
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.PEACE_SIGN)
+        self.assertAlmostEqual(observation.fine_hand_gesture_confidence or 0.0, 0.719, places=3)
+        self.assertEqual(observation.gesture_activation_key, "fine:peace_sign")
+        self.assertEqual(observation.gesture_activation_source, "live_stream")
+        self.assertEqual(debug_snapshot["resolved_source"], "live_stream")
+        self.assertEqual(debug_snapshot["temporal_reason"], "user_facing_hdmi_floor")
+        self.assertAlmostEqual(debug_snapshot["temporal_user_facing_min_confidence"], 0.6, places=3)
+
     def test_observe_user_facing_fast_policy_recovers_pending_custom_symbol_from_live_hand_roi(self) -> None:
         pipeline = LiveGesturePipeline(
             config=MediaPipeVisionConfig(
@@ -1064,7 +1106,7 @@ class LiveGesturePipelineTests(unittest.TestCase):
             AICameraFineHandGesture.PEACE_SIGN.value,
         )
 
-    def test_observe_user_facing_fast_policy_waits_for_consensus_before_emitting_weak_live_stream_symbol(
+    def test_observe_user_facing_fast_policy_emits_hdmi_supported_live_symbol_above_hdmi_floor(
         self,
     ) -> None:
         pipeline = LiveGesturePipeline(
@@ -1093,24 +1135,14 @@ class LiveGesturePipelineTests(unittest.TestCase):
             observe_policy=LiveGestureObservePolicy.user_facing_fast(),
         )
         first_debug = pipeline.debug_snapshot()
-        second = pipeline.observe(
-            frame_rgb="frame",
-            observed_at=7.1,
-            observe_policy=LiveGestureObservePolicy.user_facing_fast(),
-        )
-        second_debug = pipeline.debug_snapshot()
 
-        self.assertEqual(first.fine_hand_gesture, AICameraFineHandGesture.NONE)
-        self.assertIsNone(first.fine_hand_gesture_confidence)
-        self.assertIsNone(first.gesture_activation_token)
-        self.assertEqual(first_debug["resolved_source"], "temporal_guard")
-        self.assertEqual(first_debug["temporal_reason"], "weak_live_waiting_for_consensus")
-        self.assertEqual(second.fine_hand_gesture, AICameraFineHandGesture.THUMBS_UP)
-        self.assertAlmostEqual(second.fine_hand_gesture_confidence or 0.0, 0.62, places=3)
-        self.assertEqual(second.gesture_activation_key, "fine:thumbs_up")
-        self.assertEqual(second.gesture_activation_source, "temporal_consensus")
-        self.assertEqual(second_debug["resolved_source"], "temporal_consensus")
-        self.assertEqual(second_debug["temporal_reason"], "consensus")
+        self.assertEqual(first.fine_hand_gesture, AICameraFineHandGesture.THUMBS_UP)
+        self.assertAlmostEqual(first.fine_hand_gesture_confidence or 0.0, 0.62, places=3)
+        self.assertEqual(first.gesture_activation_key, "fine:thumbs_up")
+        self.assertEqual(first.gesture_activation_source, "live_stream")
+        self.assertEqual(first_debug["resolved_source"], "live_stream")
+        self.assertEqual(first_debug["temporal_reason"], "user_facing_hdmi_floor")
+        self.assertAlmostEqual(first_debug["temporal_user_facing_min_confidence"], 0.48, places=3)
 
     def test_observe_user_facing_fast_policy_ignores_recent_hand_box_reuse(self) -> None:
         pipeline = LiveGesturePipeline(

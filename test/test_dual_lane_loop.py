@@ -806,6 +806,167 @@ class DualLaneLoopTests(unittest.TestCase):
         self.assertEqual(supervisor.start_calls, [])
         self.assertEqual(specialist.start_calls, [])
 
+    def test_prefetched_direct_decision_survives_skip_supervisor_decision(self) -> None:
+        supervisor = FakeSupervisorProvider()
+        specialist = FakeSpecialistProvider()
+        prefetched_decision = SimpleNamespace(
+            action="direct",
+            spoken_reply="Mir geht es gut.",
+            spoken_ack=None,
+            kind=None,
+            goal=None,
+            allow_web_search=None,
+            response_id="prefetched_direct_1",
+            request_id="prefetched_direct_req_1",
+            model="gpt-4o-mini",
+            token_usage=None,
+        )
+        streamed: list[str] = []
+        loop = DualLaneToolLoop(
+            supervisor_provider=supervisor,
+            specialist_provider=specialist,
+            tool_handlers={},
+            tool_schemas=[],
+            supervisor_instructions="Supervisor instructions",
+            specialist_instructions="Specialist instructions",
+        )
+
+        result = loop.run(
+            "Wie geht es dir?",
+            prefetched_decision=prefetched_decision,
+            skip_supervisor_decision=True,
+            on_text_delta=streamed.append,
+        )
+
+        self.assertEqual(result.text, "Mir geht es gut.")
+        self.assertEqual(streamed, ["Mir geht es gut."])
+        self.assertEqual(supervisor.start_calls, [])
+        self.assertEqual(specialist.start_calls, [])
+
+    def test_prefetched_end_conversation_survives_skip_supervisor_decision(self) -> None:
+        supervisor = FakeSupervisorProvider()
+        specialist = FakeSpecialistProvider()
+        prefetched_decision = SimpleNamespace(
+            action="end_conversation",
+            spoken_reply="Bis spaeter.",
+            spoken_ack=None,
+            kind=None,
+            goal=None,
+            allow_web_search=None,
+            response_id="prefetched_end_1",
+            request_id="prefetched_end_req_1",
+            model="gpt-4o-mini",
+            token_usage=None,
+        )
+        streamed: list[str] = []
+        loop = DualLaneToolLoop(
+            supervisor_provider=supervisor,
+            specialist_provider=specialist,
+            tool_handlers={},
+            tool_schemas=[],
+            supervisor_instructions="Supervisor instructions",
+            specialist_instructions="Specialist instructions",
+        )
+
+        result = loop.run(
+            "Danke, das war's.",
+            prefetched_decision=prefetched_decision,
+            skip_supervisor_decision=True,
+            on_text_delta=streamed.append,
+        )
+
+        self.assertEqual(result.text, "Bis spaeter.")
+        self.assertEqual(streamed, ["Bis spaeter."])
+        self.assertEqual(len(result.tool_calls), 1)
+        self.assertEqual(result.tool_calls[0].name, "end_conversation")
+        self.assertEqual(supervisor.start_calls, [])
+        self.assertEqual(specialist.start_calls, [])
+
+    def test_prefetched_end_conversation_passes_json_arguments_to_plain_handler(self) -> None:
+        supervisor = FakeSupervisorProvider()
+        specialist = FakeSpecialistProvider()
+        captured_arguments: list[object] = []
+
+        def end_handler(arguments):
+            captured_arguments.append(arguments)
+            return {"status": "ok"}
+
+        loop = DualLaneToolLoop(
+            supervisor_provider=supervisor,
+            specialist_provider=specialist,
+            tool_handlers={"end_conversation": end_handler},
+            tool_schemas=[],
+            supervisor_instructions="Supervisor instructions",
+            specialist_instructions="Specialist instructions",
+        )
+        prefetched_decision = SimpleNamespace(
+            action="end_conversation",
+            spoken_reply="Bis spaeter.",
+            spoken_ack=None,
+            kind=None,
+            goal=None,
+            allow_web_search=None,
+            response_id="prefetched_end_local_1",
+            request_id="prefetched_end_local_req_1",
+            model="gpt-4o-mini",
+            token_usage=None,
+        )
+
+        result = loop.run(
+            "Danke, das war's.",
+            prefetched_decision=prefetched_decision,
+            skip_supervisor_decision=True,
+        )
+
+        self.assertEqual(result.text, "Bis spaeter.")
+        self.assertEqual(captured_arguments, [{}])
+        self.assertEqual(result.tool_calls[0].name, "end_conversation")
+
+    def test_prefetched_end_conversation_passes_tool_call_to_opted_in_handler(self) -> None:
+        supervisor = FakeSupervisorProvider()
+        specialist = FakeSpecialistProvider()
+        captured_calls: list[AgentToolCall] = []
+
+        def end_handler(tool_call):
+            captured_calls.append(tool_call)
+            return {"status": "ok"}
+
+        setattr(end_handler, "_twinr_accepts_tool_call", True)
+        loop = DualLaneToolLoop(
+            supervisor_provider=supervisor,
+            specialist_provider=specialist,
+            tool_handlers={},
+            supervisor_tool_handlers={"end_conversation": end_handler},
+            tool_schemas=[],
+            supervisor_instructions="Supervisor instructions",
+            specialist_instructions="Specialist instructions",
+        )
+        prefetched_decision = SimpleNamespace(
+            action="end_conversation",
+            spoken_reply="Bis spaeter.",
+            spoken_ack=None,
+            kind=None,
+            goal=None,
+            allow_web_search=None,
+            response_id="prefetched_end_remote_1",
+            request_id="prefetched_end_remote_req_1",
+            model="gpt-4o-mini",
+            token_usage=None,
+        )
+
+        result = loop.run(
+            "Danke, das war's.",
+            prefetched_decision=prefetched_decision,
+            skip_supervisor_decision=True,
+        )
+
+        self.assertEqual(result.text, "Bis spaeter.")
+        self.assertEqual(len(captured_calls), 1)
+        self.assertIsInstance(captured_calls[0], AgentToolCall)
+        self.assertEqual(captured_calls[0].call_id, "prefetched_end_remote_1")
+        self.assertEqual(captured_calls[0].arguments, {})
+        self.assertEqual(result.tool_calls[0].name, "end_conversation")
+
     def test_supervisor_loop_failure_raises_explicit_error(self) -> None:
         class ExplodingSupervisorProvider(FakeSupervisorProvider):
             def start_turn_streaming(self, *args, **kwargs):  # type: ignore[override]

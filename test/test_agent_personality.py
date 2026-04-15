@@ -6,9 +6,11 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+import twinr.agent.personality.store as personality_store_module
 from twinr.agent.base_agent.contracts import AgentToolCall, AgentToolResult
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.personality.ambient_feedback import AmbientImpulseFeedbackExtractor
@@ -325,6 +327,38 @@ class AgentPersonalityTests(unittest.TestCase):
         )
 
         self.assertEqual(store.calls, ["namespace-a", "namespace-b"])
+
+    def test_service_load_snapshot_surfaces_remote_unavailable(self) -> None:
+        class _UnavailableSnapshotStore:
+            def load_snapshot(self, *, config: TwinrConfig, remote_state=None) -> PersonalitySnapshot | None:
+                del config, remote_state
+                raise LongTermRemoteUnavailableError("remote personality unavailable")
+
+        service = PersonalityContextService(store=_UnavailableSnapshotStore())
+
+        with self.assertRaises(LongTermRemoteUnavailableError) as raised:
+            service.load_snapshot(config=TwinrConfig(project_root="."))
+
+        self.assertEqual(str(raised.exception), "remote personality unavailable")
+
+    def test_build_static_sections_surfaces_prompt_plan_failures(self) -> None:
+        class _FailingBuilder:
+            def build_prompt_plan(self, **kwargs):
+                del kwargs
+                raise RuntimeError("prompt plan boom")
+
+        service = PersonalityContextService(
+            builder=_FailingBuilder(),
+            store=_InMemorySnapshotStore(None),
+        )
+
+        with self.assertRaises(RuntimeError) as raised:
+            service.build_static_sections(
+                legacy_sections=(("SYSTEM", "System"),),
+                config=TwinrConfig(project_root="."),
+            )
+
+        self.assertEqual(str(raised.exception), "prompt plan boom")
 
     def test_builder_renders_structured_personality_layers_in_expected_order(self) -> None:
         builder = PersonalityContextBuilder()
@@ -1053,7 +1087,7 @@ class AgentPersonalityTests(unittest.TestCase):
             remote_state=remote_state,
         )
 
-        self.assertIsNotNone(snapshot)
+        self.assertIsNone(snapshot)
         self.assertEqual(remote_state.client.records_by_document_id, {})
         self.assertEqual(remote_state.client.records_by_uri, {})
 
@@ -1112,6 +1146,29 @@ class AgentPersonalityTests(unittest.TestCase):
         self.assertIsNotNone(snapshot)
         self.assertIn(2.0, remote_state.client.clone_timeout_history)
 
+    def test_remote_state_store_load_snapshot_never_probes_legacy_head_on_prompt_path(self) -> None:
+        store = RemoteStatePersonalitySnapshotStore()
+        remote_state = _FakeRemoteState(None)
+
+        with patch.object(personality_store_module, "LongTermRemoteCurrentRecordStore") as current_store_cls:
+            current_store = current_store_cls.return_value
+            current_store.probe_current_head.return_value = None
+            current_store.probe_legacy_collection_head.side_effect = AssertionError(
+                "prompt-time personality snapshot load must not probe legacy heads",
+            )
+
+            snapshot = store.load_snapshot(
+                config=TwinrConfig(project_root="."),
+                remote_state=remote_state,
+            )
+
+        self.assertIsNone(snapshot)
+        current_store.probe_current_head.assert_called_once_with(
+            snapshot_kind=DEFAULT_PERSONALITY_SNAPSHOT_KIND,
+        )
+        current_store.load_collection_payloads.assert_not_called()
+        current_store.probe_legacy_collection_head.assert_not_called()
+
     def test_remote_state_store_load_snapshot_skips_legacy_blob_read_when_no_head_exists(self) -> None:
         store = RemoteStatePersonalitySnapshotStore()
         remote_state = _FakeRemoteState(None)
@@ -1129,16 +1186,7 @@ class AgentPersonalityTests(unittest.TestCase):
 
         self.assertIsNone(snapshot)
         self.assertEqual(remote_state.calls, [])
-        self.assertEqual(
-            remote_state.probe_calls,
-            [
-                {
-                    "snapshot_kind": DEFAULT_PERSONALITY_SNAPSHOT_KIND,
-                    "prefer_cached_document_id": True,
-                    "prefer_metadata_only": True,
-                }
-            ],
-        )
+        self.assertEqual(remote_state.probe_calls, [])
 
     def test_evolution_store_round_trips_signals_and_deltas(self) -> None:
         remote_state = _FakeRemoteState(None)

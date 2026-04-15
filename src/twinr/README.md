@@ -9,9 +9,11 @@ set of shared helpers that multiple subsystems reuse.
 `twinr` owns:
 - expose the canonical `twinr` import surface
 - bootstrap `python -m twinr` and the installed `twinr` script
-- gate `/twinr`-only runtime sidecars such as the display companion and remote-memory watchdog so the acceptance instance stays authoritative, while allowing explicit per-env display-companion overrides
+- gate `/twinr`-only runtime sidecars such as the authoritative display surface and remote-memory watchdog so the acceptance instance stays authoritative, while allowing explicit per-env display-companion overrides
+- fail closed when host-side service commands such as `run-orchestrator-server` are launched from anything other than the leading repo root and import path, so stale stage snapshots cannot masquerade as the active runtime
 - define the versioned package boundary around optional browser automation contracts and its local unversioned workspace hook
 - keep shared root helpers for text normalization, local-date parsing, and structured JSON response handling
+- keep shared authoritative-host policy helpers such as `/twinr` root detection, Raspberry Pi host detection, and visible-display launch policy so the CLI and runtime supervisor do not drift
 - define the boundary around the documented child packages
 
 `twinr` does **not** own:
@@ -29,6 +31,7 @@ set of shared helpers that multiple subsystems reuse.
 |---|---|
 | [__init__.py](./__init__.py) | Lazy root exports |
 | [__main__.py](./__main__.py) | CLI bootstrap and dispatch |
+| [runtime_host.py](./runtime_host.py) | Authoritative Pi host/root and visible-display launch policy helpers |
 | [browser_automation/README.md](./browser_automation/README.md) | Optional browser-automation API boundary |
 | [channels/README.md](./channels/README.md) | External text-channel package |
 | [component.yaml](./component.yaml) | Structured package metadata |

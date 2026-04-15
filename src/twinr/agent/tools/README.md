@@ -11,6 +11,7 @@ tool orchestration while leaving concrete handler modules internal.
 - route callers toward the correct child package for prompting, schemas, runtime, or handlers
 - preserve the package boundary that keeps concrete handlers off the public API
 - carry the canonical schema/instruction surface for reminder, automation, memory, guided user-discovery, and self-coding tools, including learned-skill activation and control
+- carry the explicit durable-memory write and read tool surface so `remember_memory` and exact later recall share one authoritative runtime contract
 - expose the route-aware first-word overlay builder used when the local semantic router short-circuits into `web`, `memory`, or `tool` handoffs
 - keep schema/prompt builders importable without eagerly pulling runtime-loop modules back into provider session bootstrap
 

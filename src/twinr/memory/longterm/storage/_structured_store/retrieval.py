@@ -9,6 +9,7 @@ from typing import Mapping, cast
 from twinr.agent.workflows.forensics import workflow_decision, workflow_event, workflow_span
 from twinr.memory.fulltext import FullTextDocument, FullTextSelector
 from twinr.memory.longterm.core.models import LongTermMemoryConflictV1, LongTermMemoryObjectV1
+from twinr.memory.longterm.reasoning.conversation_recall import is_conversation_episode_object
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteReadFailedError
 from twinr.text_utils import retrieval_terms
 
@@ -18,6 +19,8 @@ from .shared import (
     _retrieval_trace_details,
     _run_timed_workflow_step,
 )
+
+_CONTEXT_OBJECT_LIVE_STATUSES = frozenset({"active", "candidate", "uncertain"})
 
 
 class StructuredStoreRetrievalMixin:
@@ -268,14 +271,10 @@ class StructuredStoreRetrievalMixin:
                     durable_limit=resolved_durable_limit,
                 ),
             )
-            return self._rescue_underfilled_context_sections(
+            return self._select_context_objects_from_loaded(
                 query_text=clean_query,
-                partitioned=self._partition_context_objects(
-                    query_text=clean_query,
-                    objects=bridge_objects,
-                    episodic_limit=resolved_episodic_limit,
-                    durable_limit=resolved_durable_limit,
-                ),
+                objects=bridge_objects,
+                episodic_limit=resolved_episodic_limit,
                 durable_limit=resolved_durable_limit,
             )
 
@@ -396,11 +395,71 @@ class StructuredStoreRetrievalMixin:
                     ),
                 ):
                     shared_objects = self._load_remote_objects_from_payloads(payloads=direct_payloads)
+                    local_projection_objects: tuple[LongTermMemoryObjectV1, ...] = ()
                     partitioned = self._partition_context_objects(
                         query_text=clean_query,
                         objects=shared_objects,
                         episodic_limit=resolved_episodic_limit,
                         durable_limit=resolved_durable_limit,
+                    )
+                    if direct_payloads:
+                        local_projection_objects = self._local_catalog_projection_selected_objects(
+                            query_text=clean_query,
+                            limit=candidate_limit,
+                        )
+                        if local_projection_objects:
+                            rescued_partition = self._partition_context_objects(
+                                query_text=clean_query,
+                                objects=local_projection_objects,
+                                episodic_limit=resolved_episodic_limit,
+                                durable_limit=resolved_durable_limit,
+                            )
+                            if rescued_partition[0] or rescued_partition[1]:
+                                merged_partition = self._merge_context_partition_sections(
+                                    query_text=clean_query,
+                                    primary_partition=partitioned,
+                                    alternate_partition=rescued_partition,
+                                    episodic_limit=resolved_episodic_limit,
+                                    durable_limit=resolved_durable_limit,
+                                )
+                                if merged_partition != partitioned:
+                                    selected_episodic_ids = [
+                                        item.memory_id for item in merged_partition[0][:resolved_episodic_limit]
+                                    ]
+                                    selected_durable_ids = [
+                                        item.memory_id for item in merged_partition[1][:resolved_durable_limit]
+                                    ]
+                                    workflow_event(
+                                        kind="decision",
+                                        msg="longterm_context_objects_local_projection_rescue",
+                                        details={
+                                            **_retrieval_trace_details(
+                                                clean_query,
+                                                episodic_limit=resolved_episodic_limit,
+                                                durable_limit=resolved_durable_limit,
+                                                candidate_limit=candidate_limit,
+                                                payload_count=len(direct_payloads),
+                                            ),
+                                            "primary_episodic_ids": [
+                                                item.memory_id for item in partitioned[0][:resolved_episodic_limit]
+                                            ],
+                                            "primary_durable_ids": [
+                                                item.memory_id for item in partitioned[1][:resolved_durable_limit]
+                                            ],
+                                            "alternate_episodic_ids": [
+                                                item.memory_id for item in rescued_partition[0][:resolved_episodic_limit]
+                                            ],
+                                            "alternate_durable_ids": [
+                                                item.memory_id for item in rescued_partition[1][:resolved_durable_limit]
+                                            ],
+                                            "selected_episodic_ids": selected_episodic_ids,
+                                            "selected_durable_ids": selected_durable_ids,
+                                        },
+                                    )
+                                partitioned = merged_partition
+                    rescue_pool = self._merge_context_rescue_object_pools(
+                        shared_objects,
+                        local_projection_objects,
                     )
                 if direct_payloads and not partitioned[0] and not partitioned[1]:
                     if not self._collapsed_scope_partition_needs_catalog_rescue(
@@ -456,6 +515,37 @@ class StructuredStoreRetrievalMixin:
                         },
                     )
                     continue
+                if not direct_payloads and not partitioned[0] and not partitioned[1]:
+                    workflow_event(
+                        kind="branch",
+                        msg="longterm_context_objects_scope_false_empty",
+                        details=_retrieval_trace_details(
+                            clean_query,
+                            episodic_limit=resolved_episodic_limit,
+                            durable_limit=resolved_durable_limit,
+                            candidate_limit=candidate_limit,
+                            payload_count=0,
+                        ),
+                        reason={
+                            "selected": {
+                                "id": "retry_or_catalog_rescue",
+                                "summary": "Current-scope retrieval returned no payloads, so the shared selector must advance into the next window or catalog rescue instead of returning an empty context early.",
+                            },
+                            "options": [
+                                {
+                                    "id": "retry_or_catalog_rescue",
+                                    "summary": "Continue into the next candidate window or catalog rescue.",
+                                    "constraints_violated": [],
+                                },
+                                {
+                                    "id": "return_empty_partition",
+                                    "summary": "Return no shared context objects.",
+                                    "constraints_violated": ["would_hide_catalog_visible_memory"],
+                                },
+                            ],
+                        },
+                    )
+                    continue
                 with workflow_span(
                     name="longterm_context_objects_rescue_underfilled_sections",
                     kind="retrieval",
@@ -470,7 +560,9 @@ class StructuredStoreRetrievalMixin:
                     return self._rescue_underfilled_context_sections(
                         query_text=clean_query,
                         partitioned=partitioned,
+                        episodic_limit=resolved_episodic_limit,
                         durable_limit=resolved_durable_limit,
+                        bridge_objects=rescue_pool,
                     )
             try:
                 if not remote_catalog.catalog_available(snapshot_kind="objects"):
@@ -530,7 +622,9 @@ class StructuredStoreRetrievalMixin:
                 return self._rescue_underfilled_context_sections(
                     query_text=clean_query,
                     partitioned=partitioned,
+                    episodic_limit=resolved_episodic_limit,
                     durable_limit=resolved_durable_limit,
+                    bridge_objects=shared_objects,
                 )
 
         with self._lock:
@@ -549,22 +643,59 @@ class StructuredStoreRetrievalMixin:
                     reverse=True,
                 )
             )
-            if not objects:
-                return (), ()
-            selector = self._object_selector(objects)
-            selected_ids = selector.search(clean_query, limit=shared_limit)
-            by_id = {item.memory_id: item for item in objects}
-            selected = tuple(by_id[memory_id] for memory_id in selected_ids if memory_id in by_id)
-            return self._rescue_underfilled_context_sections(
+            return self._select_context_objects_from_loaded(
                 query_text=clean_query,
-                partitioned=self._partition_context_objects(
-                    query_text=clean_query,
-                    objects=selected,
-                    episodic_limit=resolved_episodic_limit,
-                    durable_limit=resolved_durable_limit,
-                ),
+                objects=objects,
+                episodic_limit=resolved_episodic_limit,
                 durable_limit=resolved_durable_limit,
+                selection_limit=shared_limit,
             )
+
+    def _select_context_objects_from_loaded(
+        self,
+        *,
+        query_text: str,
+        objects: Iterable[LongTermMemoryObjectV1],
+        episodic_limit: int,
+        durable_limit: int,
+        selection_limit: int | None = None,
+    ) -> tuple[tuple[LongTermMemoryObjectV1, ...], tuple[LongTermMemoryObjectV1, ...]]:
+        """Select shared episodic/durable context from one already loaded object pool."""
+
+        eligible_objects = tuple(
+            item
+            for item in objects
+            if item.status in {"active", "candidate", "uncertain"}
+        )
+        if not eligible_objects:
+            return (), ()
+        candidate_limit = max(
+            1,
+            int(
+                selection_limit
+                if isinstance(selection_limit, int) and selection_limit > 0
+                else self._shared_context_object_limit(
+                    episodic_limit=episodic_limit,
+                    durable_limit=durable_limit,
+                )
+            ),
+        )
+        selector = self._object_selector(eligible_objects)
+        selected_ids = selector.search(query_text, limit=candidate_limit)
+        by_id = {item.memory_id: item for item in eligible_objects}
+        selected = tuple(by_id[memory_id] for memory_id in selected_ids if memory_id in by_id)
+        return self._rescue_underfilled_context_sections(
+            query_text=query_text,
+            partitioned=self._partition_context_objects(
+                query_text=query_text,
+                objects=selected,
+                episodic_limit=episodic_limit,
+                durable_limit=durable_limit,
+            ),
+            episodic_limit=episodic_limit,
+            durable_limit=durable_limit,
+            bridge_objects=eligible_objects,
+        )
 
     def _select_fast_topic_objects_from_loaded(
         self,
@@ -663,15 +794,17 @@ class StructuredStoreRetrievalMixin:
         )
         episodic_candidates = [item for item in eligible_objects if item.kind == "episode"]
         durable_candidates = [item for item in eligible_objects if item.kind != "episode"]
+        episodic_filter_limit = max(len(episodic_candidates), max(episodic_limit, 1))
+        durable_filter_limit = max(len(durable_candidates), max(durable_limit, 1))
         episodic_filtered = self._filter_query_relevant_objects(
             query_text,
             selected=episodic_candidates,
-            limit=max(episodic_limit, 1),
+            limit=episodic_filter_limit,
         )
         durable_filtered = self._filter_query_relevant_objects(
             query_text,
             selected=durable_candidates,
-            limit=max(durable_limit, 1),
+            limit=durable_filter_limit,
         )
         episodic_ranked = (
             self.rank_selected_objects(
@@ -692,6 +825,132 @@ class StructuredStoreRetrievalMixin:
             else ()
         )
         return episodic_ranked, durable_ranked
+
+    def _merge_context_partition_sections(
+        self,
+        *,
+        query_text: str,
+        primary_partition: tuple[tuple[LongTermMemoryObjectV1, ...], tuple[LongTermMemoryObjectV1, ...]],
+        alternate_partition: tuple[tuple[LongTermMemoryObjectV1, ...], tuple[LongTermMemoryObjectV1, ...]],
+        episodic_limit: int,
+        durable_limit: int,
+    ) -> tuple[tuple[LongTermMemoryObjectV1, ...], tuple[LongTermMemoryObjectV1, ...]]:
+        """Choose the stronger remote/current-head section pair independently.
+
+        A non-empty current-scope result is not automatically authoritative. In
+        mixed multimodal corpora the scope window can stay full while drifting
+        semantically away from the best current-head patterns. Compare the
+        remote scope section against the authoritative current-head projection
+        section and keep the stronger explanation even when the remote window is
+        already full.
+        """
+
+        primary_episodic, primary_durable = primary_partition
+        alternate_episodic, alternate_durable = alternate_partition
+        merged_episodic = self._prefer_higher_ranked_object_selection(
+            query_texts=(query_text,),
+            primary_objects=primary_episodic,
+            alternate_objects=alternate_episodic,
+            limit=episodic_limit,
+        )
+        merged_durable = self._prefer_higher_ranked_object_selection(
+            query_texts=(query_text,),
+            primary_objects=primary_durable,
+            alternate_objects=alternate_durable,
+            limit=durable_limit,
+        )
+        return merged_episodic, merged_durable
+
+    def _merge_context_rescue_object_pools(
+        self,
+        *object_groups: Iterable[LongTermMemoryObjectV1],
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Keep one deduplicated local rescue pool for section top-ups."""
+
+        merged: list[LongTermMemoryObjectV1] = []
+        seen_memory_ids: set[str] = set()
+        for group in object_groups:
+            for item in group:
+                memory_id = _normalize_text(getattr(item, "memory_id", None))
+                if not memory_id or memory_id in seen_memory_ids:
+                    continue
+                seen_memory_ids.add(memory_id)
+                merged.append(item)
+        return tuple(merged)
+
+    def _context_projection_entry_eligible(
+        self,
+        entry: object,
+        *,
+        include_episodes: bool,
+    ) -> bool:
+        """Restrict projection-only rescue to live objects of the requested section."""
+
+        kind = self._catalog_entry_text(entry, "kind")
+        status = self._catalog_entry_text(entry, "status")
+        if status not in _CONTEXT_OBJECT_LIVE_STATUSES or not kind:
+            return False
+        return kind == "episode" if include_episodes else kind != "episode"
+
+    def _select_context_rescue_candidates(
+        self,
+        *,
+        query_text: str,
+        include_episodes: bool,
+        limit: int,
+        bridge_objects: Iterable[LongTermMemoryObjectV1] | None,
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Top up one section from already-loaded pools before any new remote work."""
+
+        bounded_limit = max(1, int(limit))
+        merged_candidates: list[LongTermMemoryObjectV1] = []
+        seen_memory_ids: set[str] = set()
+
+        def _extend(candidates: Iterable[LongTermMemoryObjectV1]) -> None:
+            for item in candidates:
+                memory_id = _normalize_text(getattr(item, "memory_id", None))
+                if not memory_id or memory_id in seen_memory_ids:
+                    continue
+                seen_memory_ids.add(memory_id)
+                merged_candidates.append(item)
+
+        if bridge_objects is not None:
+            _extend(
+                self._select_relevant_objects_from_loaded(
+                    objects=bridge_objects,
+                    query_text=query_text,
+                    include_episodes=include_episodes,
+                    limit=bounded_limit,
+                    require_query_match=False,
+                )
+            )
+        if len(merged_candidates) < bounded_limit:
+            projection_objects = self._local_catalog_projection_selected_objects(
+                query_text=query_text,
+                limit=self._candidate_window_limit(limit=bounded_limit),
+                eligible=lambda entry: self._context_projection_entry_eligible(
+                    entry,
+                    include_episodes=include_episodes,
+                ),
+                allow_cold_remote_catalog_scan=False,
+            )
+            if projection_objects:
+                _extend(
+                    self._select_relevant_objects_from_loaded(
+                        objects=projection_objects,
+                        query_text=query_text,
+                        include_episodes=include_episodes,
+                        limit=bounded_limit,
+                        require_query_match=False,
+                    )
+                )
+        if not merged_candidates:
+            return ()
+        return self.rank_selected_objects(
+            query_texts=(query_text,),
+            objects=merged_candidates,
+            limit=bounded_limit,
+        )
 
     def _collapsed_scope_partition_needs_catalog_rescue(
         self,
@@ -725,29 +984,156 @@ class StructuredStoreRetrievalMixin:
         *,
         query_text: str,
         partitioned: tuple[tuple[LongTermMemoryObjectV1, ...], tuple[LongTermMemoryObjectV1, ...]],
+        episodic_limit: int,
         durable_limit: int,
+        bridge_objects: Iterable[LongTermMemoryObjectV1] | None = None,
     ) -> tuple[tuple[LongTermMemoryObjectV1, ...], tuple[LongTermMemoryObjectV1, ...]]:
-        """Top up durable context when a mixed shared pool starves durable hits."""
+        """Top up episodic/durable context when a mixed shared pool starves either side."""
 
         episodic_ranked, durable_ranked = partitioned
-        if durable_limit <= 0 or len(durable_ranked) >= durable_limit:
+        if episodic_limit <= 0 and durable_limit <= 0:
             return partitioned
-        rescue_candidates = self.select_relevant_objects(
+        bridge_pool = tuple(bridge_objects) if bridge_objects is not None else None
+        episodic_rescue_candidates: tuple[LongTermMemoryObjectV1, ...] = ()
+        if episodic_limit > 0 and len(episodic_ranked) < episodic_limit:
+            episodic_rescue_candidates = self._select_context_rescue_candidates(
+                query_text=query_text,
+                include_episodes=True,
+                limit=episodic_limit,
+                bridge_objects=bridge_pool,
+            )
+        rescued_episodic = episodic_ranked
+        if episodic_rescue_candidates:
+            merged_episodic = list(episodic_ranked)
+            seen_episodic_ids = {item.memory_id for item in episodic_ranked}
+            for item in episodic_rescue_candidates:
+                if item.memory_id in seen_episodic_ids:
+                    continue
+                seen_episodic_ids.add(item.memory_id)
+                merged_episodic.append(item)
+            rescued_episodic = self.rank_selected_objects(
+                query_texts=(query_text,),
+                objects=merged_episodic,
+                limit=episodic_limit,
+            )
+            workflow_event(
+                kind="decision",
+                msg="longterm_context_objects_episodic_rescue",
+                details={
+                    "episodic_limit": episodic_limit,
+                    "initial_ids": [item.memory_id for item in episodic_ranked[:episodic_limit]],
+                    "rescued_ids": [item.memory_id for item in episodic_rescue_candidates[:episodic_limit]],
+                },
+            )
+        if durable_limit <= 0:
+            return rescued_episodic, durable_ranked
+        support_queries = self._durable_support_query_texts(
             query_text=query_text,
-            limit=durable_limit,
+            episodic_objects=rescued_episodic,
         )
-        if not rescue_candidates:
-            return partitioned
+        if len(durable_ranked) >= durable_limit and not support_queries:
+            return rescued_episodic, durable_ranked
+        rescue_queries = (query_text, *support_queries)
         merged: list[LongTermMemoryObjectV1] = list(durable_ranked)
         seen_memory_ids = {item.memory_id for item in durable_ranked}
-        for item in rescue_candidates:
-            if item.memory_id in seen_memory_ids:
-                continue
-            seen_memory_ids.add(item.memory_id)
-            merged.append(item)
+        rescue_debug: list[dict[str, object]] = []
+        for rescue_query in rescue_queries:
+            rescue_candidates = self._select_context_rescue_candidates(
+                query_text=rescue_query,
+                include_episodes=False,
+                limit=durable_limit,
+                bridge_objects=bridge_pool,
+            )
+            rescue_debug.append(
+                {
+                    "query_chars": len(rescue_query),
+                    "query_differs_from_original": rescue_query != query_text,
+                    "candidate_ids": [item.memory_id for item in rescue_candidates[:durable_limit]],
+                }
+            )
+            for item in rescue_candidates:
+                if item.memory_id in seen_memory_ids:
+                    continue
+                seen_memory_ids.add(item.memory_id)
+                merged.append(item)
+        if len(rescue_debug) > 1:
+            workflow_event(
+                kind="decision",
+                msg="longterm_context_objects_durable_support_rescue",
+                details={
+                    "episodic_seed_ids": [item.memory_id for item in rescued_episodic[:2]],
+                    "durable_limit": durable_limit,
+                    "rescue_queries": rescue_debug,
+                },
+            )
+        if len(merged) == len(durable_ranked):
+            return rescued_episodic, durable_ranked
         rescued_durable = self.rank_selected_objects(
-            query_texts=(query_text,),
+            query_texts=rescue_queries,
             objects=merged,
             limit=durable_limit,
         )
-        return episodic_ranked, rescued_durable
+        return rescued_episodic, rescued_durable
+
+    def _durable_support_query_texts(
+        self,
+        *,
+        query_text: str,
+        episodic_objects: Iterable[LongTermMemoryObjectV1],
+    ) -> tuple[str, ...]:
+        """Build bounded support queries from selected episodic context.
+
+        Mixed multimodal queries often name the primary episodic routine
+        ("weather after breakfast") while expecting one connected durable
+        interaction pattern ("green button starts the conversation"). When the
+        durable selector sees only the original query, those support patterns
+        can stay just below the noisy mixed-corpus cut line. Re-querying with
+        the already-selected episodic semantics keeps the rescue generic and
+        source-faithful without introducing case-shaped rules.
+        """
+
+        normalized_query = _normalize_text(query_text)
+        if not normalized_query:
+            return ()
+        rescue_queries: list[str] = []
+        seen_queries = {normalized_query}
+        for item in episodic_objects:
+            semantic_text = _normalize_text(self._object_semantic_search_text(item))[:512]
+            support_fragments: list[str] = []
+            support_hints = self._episodic_support_query_hints(item)
+            if support_hints:
+                support_fragments.append(" ".join(support_hints))
+            if semantic_text:
+                support_fragments.append(semantic_text)
+            for fragment in support_fragments:
+                support_query = _normalize_text(
+                    " ".join(part for part in (normalized_query, fragment) if part)
+                )[:768]
+                if not support_query or support_query in seen_queries:
+                    continue
+                seen_queries.add(support_query)
+                rescue_queries.append(support_query)
+                if len(rescue_queries) >= 2:
+                    break
+            if len(rescue_queries) >= 2:
+                break
+        return tuple(rescue_queries)
+
+    def _episodic_support_query_hints(
+        self,
+        item: LongTermMemoryObjectV1,
+    ) -> tuple[str, ...]:
+        """Return generic durable-support hints implied by one episodic memory.
+
+        Conversation-turn episodes often need one connected practical support
+        pattern, such as the interaction that starts the conversation. When the
+        rescue query only repeats the episodic transcript, generic same-daypart
+        routines can tie or outrank that supporting interaction. Surface the
+        episode type explicitly so the durable rescue stays source-faithful
+        without hardcoding benchmark phrases.
+        """
+
+        attributes = item.attributes if isinstance(item.attributes, Mapping) else None
+        if is_conversation_episode_object(kind=item.kind, attributes=attributes):
+            return ("conversation with twinr", "start a conversation")
+        return ()

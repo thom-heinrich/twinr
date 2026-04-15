@@ -1,4 +1,5 @@
 from pathlib import Path
+import stat
 import sys
 import tempfile
 import unittest
@@ -15,6 +16,26 @@ from twinr.ops.process_memory import (
 
 
 class ProcessMemoryTests(unittest.TestCase):
+    def test_store_persists_operator_readable_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(project_root=temp_dir)
+            store = StreamingMemoryAttributionStore.from_config(config)
+
+            with mock.patch("twinr.ops.process_memory.os.getpid", return_value=4242):
+                with mock.patch("twinr.ops.process_memory._read_boot_id", return_value="boot-1"):
+                    with mock.patch("twinr.ops.process_memory._read_process_start_ticks", return_value=777):
+                        with mock.patch(
+                            "twinr.ops.process_memory.ProcessMemoryMetrics.from_proc",
+                            return_value=ProcessMemoryMetrics(vm_rss_kb=240_000, anonymous_kb=180_000),
+                        ):
+                            store.record_phase(
+                                label="streaming_loop.lock_acquired",
+                                owner_label="streaming_loop.lock",
+                                reset=True,
+                            )
+
+            self.assertEqual(stat.S_IMODE(store.path.stat().st_mode), 0o644)
+
     def test_store_selects_largest_anonymous_delta_as_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(project_root=temp_dir)

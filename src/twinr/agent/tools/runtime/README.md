@@ -14,17 +14,23 @@ streaming APIs.
 - gate optional browser automation behind the local browser workspace probe so disabled or missing adapters never leak into the live tool surface
 - route the bounded external service-connect tool through the same thin executor surface as the other realtime tools so voice turns can open supported pairing flows
 - route the bounded WhatsApp-send tool through the same thin executor and availability-gated binding path so voice turns can message remembered contacts without bypassing the running channel service
+- route explicit durable-memory review through the same thin executor and validated binding path as durable-memory writes so later recall does not depend on hidden prompt context alone
 - route smart-home discovery, state-read, control, and sensor-stream tools through the same thin executor surface as the other realtime tools
 - route the optional browser-automation tool through the same thin executor surface as the rest of the realtime tool contract
 - route the shared local household-identity tool through the same thin executor surface as the legacy portrait and voice tools
 - route the RSS/world-intelligence configuration tool through the same thin executor surface as the other persistent tool handlers
 - route the temporary voice-quiet tool through the same thin executor surface as the other live-turn tools so users can suppress transcript-first wake for a bounded runtime window
-- allow the streaming fast lane to execute a supervisor-resolved one-shot runtime-local tool directly only when the structured decision carries an actually executable `runtime_tool_name` plus complete arguments; incomplete direct payloads must fall back to the normal specialist handoff instead of surfacing a live turn error
+- allow the dual-lane runtime to execute a supervisor-resolved one-shot runtime-local tool directly only when the structured decision carries an actually executable `runtime_tool_name` plus complete arguments; incomplete direct payloads must fall back to the normal specialist handoff instead of surfacing a live turn error
+- keep the special `end_conversation` branch on the same
+  `_twinr_accepts_tool_call` opt-in contract as the shared streaming loop so
+  remote bridge handlers can receive full `AgentToolCall` objects while plain
+  local runtime handlers still receive JSON argument dicts
 - dispatch learned-skill control tools and hidden self-coding runtime triggers through the same thin executor surface
 - record one generic success/failure observability event per realtime tool call so operator readback can see which tool ran, how long it took, and whether model fallback metadata was involved
 - convert shared sensitive-confirmation guards into structured `confirmation_required` tool results so live turns can ask for explicit approval instead of collapsing into generic technical-error speech
 - define the synthetic specialist-handoff tool schema and normalize/merge handoff payloads outside the main dual-lane orchestrator
 - run the generic streaming tool loop and the supervisor/specialist handoff loop
+- expose the same bounded specialist/tool loop without reopening supervisor routing, so live voice turns can continue after a missed speculative supervisor decision instead of blocking on a second structured decision roundtrip
 - keep the structured supervisor-decision lane isolated from general tool-agent instructions so routing stays provider- and lane-specific
 - fail closed when the supervisor/specialist runtime cannot produce a verified final answer instead of synthesizing replacement speech on the active streaming path
 - emit speech-lane deltas through a focused callback helper module and serialize tool results safely

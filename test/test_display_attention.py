@@ -11,6 +11,8 @@ from twinr.display.face_cues import DisplayFaceCue
 from twinr.display.face_expressions import DisplayFaceGazeDirection
 from twinr.proactive.runtime.display_attention import (
     DisplayAttentionCuePublisher,
+    display_attention_face_publish_supported,
+    display_attention_refresh_backend_supported,
     derive_display_attention_cue,
     resolve_display_attention_refresh_interval,
 )
@@ -19,6 +21,30 @@ from twinr.proactive.runtime.display_attention import (
 class DisplayAttentionCueTests(unittest.TestCase):
     def test_refresh_interval_uses_faster_default(self) -> None:
         self.assertEqual(resolve_display_attention_refresh_interval(TwinrConfig()), 0.2)
+
+    def test_face_publish_is_disabled_for_hdmi_wayland(self) -> None:
+        self.assertFalse(
+            display_attention_face_publish_supported(
+                config=TwinrConfig(display_driver="hdmi_wayland"),
+            )
+        )
+        self.assertTrue(
+            display_attention_face_publish_supported(
+                config=TwinrConfig(display_driver="hdmi_fbdev"),
+            )
+        )
+
+    def test_refresh_backend_fails_closed_for_hdmi_wayland(self) -> None:
+        self.assertFalse(
+            display_attention_refresh_backend_supported(
+                config=TwinrConfig(display_driver="hdmi_wayland"),
+            )
+        )
+        self.assertTrue(
+            display_attention_refresh_backend_supported(
+                config=TwinrConfig(display_driver="hdmi_fbdev"),
+            )
+        )
 
     def test_derives_user_facing_rightward_gaze_from_left_camera_anchor(self) -> None:
         decision = derive_display_attention_cue(

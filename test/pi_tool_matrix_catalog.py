@@ -45,6 +45,7 @@ MATRIX_GROUP_TOOL_NAMES: dict[str, tuple[str, ...]] = {
     ),
     "memory_profile": (
         "remember_memory",
+        "review_saved_memories",
         "remember_contact",
         "lookup_contact",
         "get_memory_conflicts",

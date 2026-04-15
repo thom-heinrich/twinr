@@ -14,9 +14,9 @@ This module owns the operator workflow that turns the current authoritative
 repo state in ``/home/thh/twinr`` into a restarted and verified Pi acceptance
 runtime under ``/twinr``. It reuses the one-way repo mirror for code sync,
 optionally overwrites the Pi runtime ``.env`` from the leading repo, refreshes
-the editable install in the Pi virtualenv, explicitly syncs optional local
-workspace runtime manifests such as ``browser_automation/runtime_requirements``
-before installing them on the Pi, independently attests the mirrored repo
+the editable install in the Pi virtualenv, installs optional browser-automation
+runtime support only when its allowlisted manifests are part of the same
+authoritative release snapshot, independently attests the mirrored repo
 contents before restart, installs the productive base units plus any
 repo-backed Pi runtime units that are already enabled on the host, supports
 explicit first-rollout activation for optional Pi units, restarts the selected
@@ -28,7 +28,7 @@ from __future__ import annotations
 import base64
 from collections.abc import Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path, PurePosixPath
@@ -43,8 +43,12 @@ from typing import Any, Protocol, Sequence, cast
 
 from twinr.ops.deploy_progress import ProgressCallback, emit_deploy_progress, progress_span
 from twinr.ops.pi_repo_mirror import (
+    CURRENT_RELEASE_MANIFEST_RELATIVE_PATH,
+    PiAuthoritativeReleaseManifest,
+    PiAuthoritativeWorkspaceStatus,
     PiRepoMirrorCycleResult,
     PiRepoMirrorWatchdog,
+    build_authoritative_release_manifest,
     materialize_authoritative_repo_snapshot,
 )
 from twinr.ops.pi_runtime_deploy_remote import (
@@ -216,8 +220,12 @@ class PiRuntimeDeployResult:
     ok: bool
     host: str
     remote_root: str
+    release_id: str
+    source_commit: str
+    workspace_status: PiAuthoritativeWorkspaceStatus
     repo_mirror: PiRepoMirrorCycleResult
     repo_attestation: PiRemoteRepoAttestationResult
+    release_manifest_sync: PiSyncedFileResult
     env_sync: PiSyncedFileResult | None
     editable_install_summary: str | None
     bytecode_refresh_summary: str | None
@@ -298,11 +306,9 @@ def deploy_pi_runtime(
             reinstall runtime dependencies. The default keeps dependency state
             unchanged and updates only the editable package, which avoids
             rebuilding Pi-host packages such as PyQt5 on every deploy.
-            When the local ignored ``browser_automation/`` workspace exposes
-            runtime manifests, the deploy also syncs and installs those
-            requirements after the editable refresh so the Pi can execute the
-            local adapter code without relying on the repo mirror to carry
-            ignored workspace files.
+            When the authoritative release snapshot includes the allowlisted
+            ``browser_automation`` runtime manifests, the deploy also installs
+            that support after the editable refresh.
         install_systemd_units: Whether to copy the service unit files from
             ``/twinr/hardware/ops`` into ``/etc/systemd/system`` and reload systemd.
         verify_env_contract: Whether to run the bounded Pi env-contract probe.
@@ -353,16 +359,6 @@ def deploy_pi_runtime(
         reject_dangerous_root=False,
     )
     remote_python = f"{resolved_remote_root}/.venv/bin/python"
-    install_browser_requirements = _has_nonempty_local_file(
-        resolved_root / _BROWSER_AUTOMATION_RUNTIME_REQUIREMENTS
-    )
-    install_playwright_browsers = _has_nonempty_local_file(
-        resolved_root / _BROWSER_AUTOMATION_PLAYWRIGHT_BROWSERS
-    )
-    install_pi_runtime_requirements = _has_nonempty_local_file(
-        resolved_root / _PI_RUNTIME_REQUIREMENTS
-    )
-
     remote = _PiRemoteExecutor(
         settings=settings,
         subprocess_runner=subprocess_runner,
@@ -372,14 +368,19 @@ def deploy_pi_runtime(
     with tempfile.TemporaryDirectory(prefix="twinr-pi-runtime-deploy-") as snapshot_dir_str:
         snapshot_dir = Path(snapshot_dir_str)
         repo_snapshot_root = snapshot_dir / "authoritative_repo"
-        expected_repo_entries = _run_phase(
+        release_manifest = _run_phase(
             "repo_snapshot",
-            lambda: materialize_authoritative_repo_snapshot(
+            lambda: _build_authoritative_release_snapshot(
                 resolved_root,
                 repo_snapshot_root,
             ),
             progress_callback=progress_callback,
         )
+        release_entry_paths = {entry.relative_path for entry in release_manifest.entries}
+        expected_repo_entries = release_manifest.entries
+        install_browser_requirements = _BROWSER_AUTOMATION_RUNTIME_REQUIREMENTS.as_posix() in release_entry_paths
+        install_playwright_browsers = _BROWSER_AUTOMATION_PLAYWRIGHT_BROWSERS.as_posix() in release_entry_paths
+        install_pi_runtime_requirements = _PI_RUNTIME_REQUIREMENTS.as_posix() in release_entry_paths
         env_source_for_sync = env_source
         if sync_env:
             if not env_source.exists() or not env_source.is_file():
@@ -390,20 +391,6 @@ def deploy_pi_runtime(
                 snapshot_name="authoritative.env",
                 local_root=resolved_root,
                 remote_root=resolved_remote_root,
-            )
-
-        optional_manifest_snapshots: dict[Path, Path] = {}
-        if install_browser_requirements:
-            optional_manifest_snapshots[_BROWSER_AUTOMATION_RUNTIME_REQUIREMENTS] = _snapshot_local_file(
-                source_path=(resolved_root / _BROWSER_AUTOMATION_RUNTIME_REQUIREMENTS).resolve(),
-                snapshot_dir=snapshot_dir,
-                snapshot_name="browser_automation-runtime_requirements.txt",
-            )
-        if install_playwright_browsers:
-            optional_manifest_snapshots[_BROWSER_AUTOMATION_PLAYWRIGHT_BROWSERS] = _snapshot_local_file(
-                source_path=(resolved_root / _BROWSER_AUTOMATION_PLAYWRIGHT_BROWSERS).resolve(),
-                snapshot_dir=snapshot_dir,
-                snapshot_name="browser_automation-playwright_browsers.txt",
             )
 
         deploy_lock_ttl_s = _compute_remote_lock_ttl(timeout_s=timeout_s, service_wait_s=service_wait_s)
@@ -438,12 +425,18 @@ def deploy_pi_runtime(
                     ),
                 )
             else:
-                watchdog = PiRepoMirrorWatchdog.from_env(
-                    project_root=repo_snapshot_root,
-                    pi_env_path=pi_env_path,
-                    remote_root=resolved_remote_root,
-                    timeout_s=timeout_s,
-                    subprocess_runner=subprocess_runner,
+                watchdog = cast(
+                    _MirrorWatchdog,
+                    _retarget_mirror_watchdog_project_root(
+                        PiRepoMirrorWatchdog.from_env(
+                            project_root=repo_snapshot_root,
+                            pi_env_path=pi_env_path,
+                            remote_root=resolved_remote_root,
+                            timeout_s=timeout_s,
+                            subprocess_runner=subprocess_runner,
+                        ),
+                        project_root=repo_snapshot_root,
+                    ),
                 )
 
             repo_mirror = _run_phase(
@@ -461,29 +454,6 @@ def deploy_pi_runtime(
                         local_path=env_source_for_sync,
                         remote_path=env_target,
                         mode="600",
-                    ),
-                    progress_callback=progress_callback,
-                )
-
-            if install_browser_requirements:
-                _run_phase(
-                    "browser_automation_requirements_sync",
-                    lambda: _sync_optional_manifest(
-                        remote=remote,
-                        remote_root=resolved_remote_root,
-                        local_path=optional_manifest_snapshots[_BROWSER_AUTOMATION_RUNTIME_REQUIREMENTS],
-                        manifest_relpath=_BROWSER_AUTOMATION_RUNTIME_REQUIREMENTS,
-                    ),
-                    progress_callback=progress_callback,
-                )
-            if install_playwright_browsers:
-                _run_phase(
-                    "browser_automation_browsers_sync",
-                    lambda: _sync_optional_manifest(
-                        remote=remote,
-                        remote_root=resolved_remote_root,
-                        local_path=optional_manifest_snapshots[_BROWSER_AUTOMATION_PLAYWRIGHT_BROWSERS],
-                        manifest_relpath=_BROWSER_AUTOMATION_PLAYWRIGHT_BROWSERS,
                     ),
                     progress_callback=progress_callback,
                 )
@@ -674,13 +644,27 @@ def deploy_pi_runtime(
                     ),
                     progress_callback=progress_callback,
                 )
+            release_manifest_sync_result = _run_phase(
+                "release_manifest_sync",
+                lambda: _sync_release_manifest(
+                    remote=remote,
+                    remote_root=resolved_remote_root,
+                    release_manifest=release_manifest,
+                    snapshot_dir=snapshot_dir,
+                ),
+                progress_callback=progress_callback,
+            )
 
     return PiRuntimeDeployResult(
         ok=True,
         host=settings.host,
         remote_root=resolved_remote_root,
+        release_id=release_manifest.release_id,
+        source_commit=release_manifest.source_commit,
+        workspace_status=release_manifest.workspace_status,
         repo_mirror=repo_mirror,
         repo_attestation=repo_attestation_result,
+        release_manifest_sync=release_manifest_sync_result,
         env_sync=env_sync_result,
         editable_install_summary=editable_install_summary,
         bytecode_refresh_summary=bytecode_refresh_summary,
@@ -712,28 +696,42 @@ def _run_phase(
             raise PiRuntimeDeployError(phase, str(exc)) from exc
 
 
-def _has_nonempty_local_file(path: Path) -> bool:
-    """Return whether one local deploy manifest exists and contains data."""
+def _build_authoritative_release_snapshot(
+    project_root: Path,
+    snapshot_root: Path,
+) -> PiAuthoritativeReleaseManifest:
+    """Build one deterministic release manifest and materialize its snapshot."""
 
-    return path.is_file() and bool(path.read_bytes().strip())
+    release_manifest = build_authoritative_release_manifest(
+        project_root,
+        generated_at_utc=_utc_now_iso(),
+    )
+    materialize_authoritative_repo_snapshot(
+        project_root,
+        snapshot_root,
+        entries=release_manifest.entries,
+    )
+    return release_manifest
 
 
-def _sync_optional_manifest(
+def _sync_release_manifest(
     *,
     remote: _PiRemoteExecutor,
     remote_root: str,
-    local_path: Path,
-    manifest_relpath: Path,
+    release_manifest: PiAuthoritativeReleaseManifest,
+    snapshot_dir: Path,
 ) -> PiSyncedFileResult:
-    """Sync one optional local manifest into the Pi runtime checkout."""
+    """Persist the last successful Pi release manifest under ops artifacts."""
 
-    if not _has_nonempty_local_file(local_path):
-        raise ValueError(f"optional manifest is missing or empty: {local_path}")
-    remote_manifest_path = f"{remote_root.rstrip('/')}/{manifest_relpath.as_posix()}"
+    manifest_path = snapshot_dir / "current_release_manifest.json"
+    manifest_path.write_text(
+        json.dumps(asdict(release_manifest), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     return _sync_authoritative_file(
         remote=remote,
-        local_path=local_path,
-        remote_path=remote_manifest_path,
+        local_path=manifest_path,
+        remote_path=f"{remote_root.rstrip('/')}/{CURRENT_RELEASE_MANIFEST_RELATIVE_PATH.as_posix()}",
         mode="644",
     )
 
@@ -1432,6 +1430,7 @@ def _retarget_mirror_watchdog_project_root(watchdog: object, *, project_root: Pa
 
     resolved_root = Path(project_root).resolve()
     setattr(watchdog, "project_root", resolved_root)
+    setattr(watchdog, "_authoritative_source_is_snapshot", True)
     invalidate_cache = getattr(watchdog, "_invalidate_nonportable_paths_cache", None)
     if callable(invalidate_cache):
         invalidate_cache()

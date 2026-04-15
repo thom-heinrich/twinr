@@ -251,7 +251,8 @@ class OpsModuleTests(unittest.TestCase):
                 health = json.loads(archive.read("system_health.json"))
                 usage_summary = json.loads(archive.read("usage_summary.json"))
 
-        self.assertEqual(redacted_env["OPENAI_API_KEY"], "sk-t…1234")
+        self.assertTrue(redacted_env["OPENAI_API_KEY"].startswith("[REDACTED:SECRET:"))
+        self.assertTrue(redacted_env["OPENAI_API_KEY"].endswith("]"))
         self.assertEqual(events[-1]["event"], "error")
         self.assertEqual(snapshot["last_response"], "Guten Morgen")
         self.assertNotIn("user_voice_status", snapshot)
@@ -285,6 +286,52 @@ class OpsModuleTests(unittest.TestCase):
         self.assertEqual(by_key["openai_key"].status, "fail")
         self.assertEqual(by_key["printer_queue"].status, "fail")
         self.assertEqual(by_key["pir"].status, "warn")
+
+    def test_run_config_checks_accepts_explicit_rpicam_camera_uri(self) -> None:
+        config = TwinrConfig(camera_device="rpicam://0")
+
+        with patch(
+            "twinr.ops.checks._probe_rpicam_stack",
+            return_value=SimpleNamespace(
+                status="ok",
+                detail="Raspberry Pi camera stack is ready.",
+            ),
+        ):
+            checks = run_config_checks(config)
+
+        by_key = {check.key: check for check in checks}
+        self.assertEqual(by_key["camera"].status, "ok")
+        self.assertIn("camera stack is ready", by_key["camera"].detail)
+
+    def test_run_config_checks_rejects_implicit_camera_backend_alias(self) -> None:
+        config = TwinrConfig(camera_device="auto")
+
+        checks = run_config_checks(config)
+
+        by_key = {check.key: check for check in checks}
+        self.assertEqual(by_key["camera"].status, "fail")
+        self.assertIn("Unsupported camera device configuration", by_key["camera"].detail)
+
+    def test_run_config_checks_rejects_pi_unicam_v4l2_nodes(self) -> None:
+        config = TwinrConfig(camera_device="/dev/video0")
+
+        with patch("twinr.ops.checks.Path.exists", return_value=True):
+            with patch("twinr.ops.checks.Path.is_char_device", return_value=True):
+                with patch("twinr.ops.checks.os.access", return_value=True):
+                    with patch("twinr.ops.checks._resolve_executable", side_effect=lambda value: f"/usr/bin/{value}"):
+                        with patch(
+                            "twinr.ops.checks._run_command",
+                            return_value=SimpleNamespace(
+                                returncode=0,
+                                stdout="Driver name   : unicam\nCard type     : unicam-image\n",
+                                stderr="",
+                            ),
+                        ):
+                            checks = run_config_checks(config)
+
+        by_key = {check.key: check for check in checks}
+        self.assertEqual(by_key["camera"].status, "fail")
+        self.assertIn("rpicam://0", by_key["camera"].detail)
 
     def test_run_config_checks_reports_configured_pir(self) -> None:
         config = TwinrConfig(

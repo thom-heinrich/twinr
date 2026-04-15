@@ -21,6 +21,208 @@ _REMOTE_RECAP_EPISODIC_WINDOW = 48
 class StructuredStoreRemoteSelectionMixin:
     """Own remote-first selection helpers for structured-store queries."""
 
+    def _local_catalog_projection_selected_entries(
+        self,
+        *,
+        snapshot_kind: str,
+        query_text: str,
+        limit: int,
+        eligible: Callable[[object], bool] | None = None,
+        allow_cold_remote_catalog_scan: bool = True,
+    ) -> tuple[object, ...]:
+        """Search the current catalog projection locally without trusting remote semantic rank.
+
+        Current-scope and remote-catalog searches can return semantically drifted
+        candidates under noisy mixed corpora. When the retrieval caller has
+        already proven that those remote hits collapse after local relevance
+        checks, this projection-only selector lets the store cross-check the
+        authoritative current catalog head using the same locally maintained
+        search text that full-snapshot selection uses.
+        """
+
+        clean_query = _normalize_text(query_text)
+        if not clean_query:
+            return ()
+        remote_catalog = self._remote_catalog
+        if remote_catalog is None:
+            return ()
+        local_search = getattr(remote_catalog, "_local_search_catalog_entries", None)
+        if not callable(local_search):
+            return ()
+        entries = self._remote_catalog_entries_for_active_path(
+            snapshot_kind=snapshot_kind,
+            allow_cold_remote_catalog_scan=allow_cold_remote_catalog_scan,
+        )
+        if not entries:
+            return ()
+        try:
+            return tuple(
+                local_search(
+                    snapshot_kind=snapshot_kind,
+                    entries=entries,
+                    query_text=clean_query,
+                    limit=max(1, int(limit)),
+                    eligible=eligible,
+                )
+            )
+        except Exception:
+            if self._remote_is_required():
+                raise
+            return ()
+
+    def _local_catalog_projection_selected_objects(
+        self,
+        *,
+        query_text: str,
+        limit: int,
+        eligible: Callable[[object], bool] | None = None,
+        allow_cold_remote_catalog_scan: bool = True,
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Load locally searched current-head object projections as live objects."""
+
+        entries = self._local_catalog_projection_selected_entries(
+            snapshot_kind="objects",
+            query_text=query_text,
+            limit=limit,
+            eligible=eligible,
+            allow_cold_remote_catalog_scan=allow_cold_remote_catalog_scan,
+        )
+        if not entries:
+            return ()
+        return self._load_remote_objects_from_projection_entries(
+            entries=entries,
+            snapshot_kind="objects",
+        )
+
+    def _prefer_higher_ranked_object_selection(
+        self,
+        *,
+        query_texts: tuple[str, ...],
+        primary_objects: Iterable[LongTermMemoryObjectV1],
+        alternate_objects: Iterable[LongTermMemoryObjectV1],
+        limit: int,
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Return the stronger ranked object set between remote hits and local projection rescue."""
+
+        primary_ranked = self.rank_selected_objects(
+            query_texts=query_texts,
+            objects=primary_objects,
+            limit=limit,
+        )
+        alternate_ranked = self.rank_selected_objects(
+            query_texts=query_texts,
+            objects=alternate_objects,
+            limit=limit,
+        )
+        if not alternate_ranked:
+            return primary_ranked
+        if not primary_ranked:
+            return alternate_ranked
+        query_terms = self._combined_query_terms(query_texts)
+        primary_key = self._object_query_sort_key(
+            item=primary_ranked[0],
+            query_terms=query_terms,
+            original_index=0,
+        )
+        alternate_key = self._object_query_sort_key(
+            item=alternate_ranked[0],
+            query_terms=query_terms,
+            original_index=0,
+        )
+        if alternate_key > primary_key:
+            return alternate_ranked
+        return primary_ranked
+
+    def _remote_catalog_entries_for_active_path(
+        self,
+        *,
+        snapshot_kind: str,
+        allow_cold_remote_catalog_scan: bool,
+    ) -> tuple[object, ...]:
+        """Return active-path catalog entries without forcing a cold full scan."""
+
+        remote_catalog = self._remote_catalog
+        if remote_catalog is None:
+            return ()
+        if allow_cold_remote_catalog_scan:
+            return tuple(remote_catalog.load_catalog_entries(snapshot_kind=snapshot_kind))
+        cached_entries_getter = getattr(remote_catalog, "_cached_catalog_entries", None)
+        if callable(cached_entries_getter):
+            cached_entries = cached_entries_getter(snapshot_kind=snapshot_kind)
+            if cached_entries is not None:
+                return tuple(cached_entries)
+        recent_entries_getter = getattr(remote_catalog, "_recent_catalog_entries", None)
+        if callable(recent_entries_getter):
+            recent_entries = recent_entries_getter(snapshot_kind=snapshot_kind)
+            if recent_entries is not None:
+                return tuple(recent_entries)
+        return ()
+
+    def _load_remote_objects_from_projection_entries(
+        self,
+        *,
+        entries: Iterable[object],
+        snapshot_kind: str,
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Rebuild remote objects directly from catalog-entry projections."""
+
+        remote_catalog = self._remote_catalog
+        if remote_catalog is None:
+            return ()
+        payload_getter = getattr(remote_catalog, "_catalog_entry_item_payload", None)
+        if not callable(payload_getter):
+            return ()
+        ordered_ids: list[str] = []
+        loaded_by_id: dict[str, LongTermMemoryObjectV1] = {}
+        for entry in entries:
+            item_id = getattr(entry, "item_id", None)
+            if not isinstance(item_id, str) or not item_id:
+                continue
+            ordered_ids.append(item_id)
+            payload = payload_getter(snapshot_kind=snapshot_kind, entry=entry)
+            if not isinstance(payload, Mapping):
+                continue
+            try:
+                loaded_by_id[item_id] = LongTermMemoryObjectV1.from_payload(dict(payload))
+            except Exception:
+                _LOG.warning(
+                    "Skipping invalid remote long-term object payload during projection-only load.",
+                    exc_info=True,
+                )
+        return tuple(loaded_by_id[item_id] for item_id in ordered_ids if item_id in loaded_by_id)
+
+    def _load_remote_conflicts_from_projection_entries(
+        self,
+        *,
+        entries: Iterable[object],
+    ) -> tuple[LongTermMemoryConflictV1, ...]:
+        """Rebuild remote conflicts directly from catalog-entry projections."""
+
+        remote_catalog = self._remote_catalog
+        if remote_catalog is None:
+            return ()
+        payload_getter = getattr(remote_catalog, "_catalog_entry_item_payload", None)
+        if not callable(payload_getter):
+            return ()
+        ordered_ids: list[str] = []
+        loaded_by_id: dict[str, LongTermMemoryConflictV1] = {}
+        for entry in entries:
+            item_id = getattr(entry, "item_id", None)
+            if not isinstance(item_id, str) or not item_id:
+                continue
+            ordered_ids.append(item_id)
+            payload = payload_getter(snapshot_kind="conflicts", entry=entry)
+            if not isinstance(payload, Mapping):
+                continue
+            try:
+                loaded_by_id[item_id] = LongTermMemoryConflictV1.from_payload(dict(payload))
+            except Exception:
+                _LOG.warning(
+                    "Skipping invalid remote long-term conflict payload during projection-only load.",
+                    exc_info=True,
+                )
+        return tuple(loaded_by_id[item_id] for item_id in ordered_ids if item_id in loaded_by_id)
+
     def _load_remote_objects_from_entries(
         self,
         *,
@@ -30,12 +232,16 @@ class StructuredStoreRemoteSelectionMixin:
         remote_catalog = self._remote_catalog
         if remote_catalog is None:
             return ()
-        item_ids = [
-            entry.item_id
+        ordered_entries = tuple(
+            entry
             for entry in entries
             if hasattr(entry, "item_id") and isinstance(getattr(entry, "item_id"), str)
-        ]
-        payloads = remote_catalog.load_selection_item_payloads(snapshot_kind=snapshot_kind, item_ids=item_ids)
+        )
+        item_ids = [entry.item_id for entry in ordered_entries]
+        payloads = remote_catalog.load_selection_item_payloads_from_entries(
+            snapshot_kind=snapshot_kind,
+            entries=ordered_entries,
+        )
         loaded: list[LongTermMemoryObjectV1] = []
         for payload in payloads:
             try:
@@ -206,6 +412,8 @@ class StructuredStoreRemoteSelectionMixin:
     def load_conflicts_by_slot_keys(
         self,
         slot_keys: Iterable[str],
+        *,
+        allow_cold_remote_catalog_scan: bool = True,
     ) -> tuple[LongTermMemoryConflictV1, ...]:
         """Load only conflicts for the requested slot keys."""
 
@@ -221,16 +429,24 @@ class StructuredStoreRemoteSelectionMixin:
             try:
                 entries = tuple(
                     entry
-                    for entry in remote_catalog.load_catalog_entries(snapshot_kind="conflicts")
+                    for entry in self._remote_catalog_entries_for_active_path(
+                        snapshot_kind="conflicts",
+                        allow_cold_remote_catalog_scan=allow_cold_remote_catalog_scan,
+                    )
                     if self._catalog_entry_text(entry, "slot_key") in normalized_keys
                 )
-                item_ids = tuple(
-                    entry.item_id
-                    for entry in entries
-                    if isinstance(getattr(entry, "item_id", None), str)
-                )
-                if item_ids:
-                    return self._load_remote_conflicts_from_item_ids(item_ids=item_ids)
+                if entries:
+                    if allow_cold_remote_catalog_scan:
+                        item_ids = tuple(
+                            entry.item_id
+                            for entry in entries
+                            if isinstance(getattr(entry, "item_id", None), str)
+                        )
+                        if item_ids:
+                            return self._load_remote_conflicts_from_item_ids(item_ids=item_ids)
+                    projected = self._load_remote_conflicts_from_projection_entries(entries=entries)
+                    if projected:
+                        return projected
                 if self._remote_is_required():
                     return ()
             except Exception:
@@ -243,6 +459,8 @@ class StructuredStoreRemoteSelectionMixin:
     def load_objects_by_slot_keys(
         self,
         slot_keys: Iterable[str],
+        *,
+        allow_cold_remote_catalog_scan: bool = True,
     ) -> tuple[LongTermMemoryObjectV1, ...]:
         """Load only current objects for the requested slot keys."""
 
@@ -256,16 +474,26 @@ class StructuredStoreRemoteSelectionMixin:
         remote_catalog = self._remote_catalog
         if self._remote_catalog_enabled() and remote_catalog is not None:
             try:
-                selected_ids = tuple(
-                    dict.fromkeys(
-                        entry.item_id
-                        for entry in remote_catalog.load_catalog_entries(snapshot_kind="objects")
-                        if isinstance(getattr(entry, "item_id", None), str)
-                        and self._catalog_entry_text(entry, "slot_key") in normalized_keys
+                entries = tuple(
+                    entry
+                    for entry in self._remote_catalog_entries_for_active_path(
+                        snapshot_kind="objects",
+                        allow_cold_remote_catalog_scan=allow_cold_remote_catalog_scan,
                     )
+                    if isinstance(getattr(entry, "item_id", None), str)
+                    and self._catalog_entry_text(entry, "slot_key") in normalized_keys
                 )
-                if selected_ids:
-                    return self.load_objects_by_ids(selected_ids)
+                if entries:
+                    if allow_cold_remote_catalog_scan:
+                        selected_ids = tuple(dict.fromkeys(entry.item_id for entry in entries))
+                        if selected_ids:
+                            return self.load_objects_by_ids(selected_ids)
+                    projected = self._load_remote_objects_from_projection_entries(
+                        entries=entries,
+                        snapshot_kind="objects",
+                    )
+                    if projected:
+                        return projected
                 if self._remote_is_required():
                     return ()
             except Exception:
@@ -278,6 +506,8 @@ class StructuredStoreRemoteSelectionMixin:
     def load_objects_by_event_ids(
         self,
         event_ids: Iterable[str],
+        *,
+        allow_cold_remote_catalog_scan: bool = True,
     ) -> tuple[LongTermMemoryObjectV1, ...]:
         """Load only current objects whose source provenance mentions one of the event ids."""
 
@@ -292,16 +522,26 @@ class StructuredStoreRemoteSelectionMixin:
         remote_catalog = self._remote_catalog
         if self._remote_catalog_enabled() and remote_catalog is not None:
             try:
-                selected_ids = tuple(
-                    dict.fromkeys(
-                        entry.item_id
-                        for entry in remote_catalog.load_catalog_entries(snapshot_kind="objects")
-                        if isinstance(getattr(entry, "item_id", None), str)
-                        and bool(target_ids.intersection(self._catalog_entry_list(entry, "source_event_ids")))
+                entries = tuple(
+                    entry
+                    for entry in self._remote_catalog_entries_for_active_path(
+                        snapshot_kind="objects",
+                        allow_cold_remote_catalog_scan=allow_cold_remote_catalog_scan,
                     )
+                    if isinstance(getattr(entry, "item_id", None), str)
+                    and bool(target_ids.intersection(self._catalog_entry_list(entry, "source_event_ids")))
                 )
-                if selected_ids:
-                    return self.load_objects_by_ids(selected_ids)
+                if entries:
+                    if allow_cold_remote_catalog_scan:
+                        selected_ids = tuple(dict.fromkeys(entry.item_id for entry in entries))
+                        if selected_ids:
+                            return self.load_objects_by_ids(selected_ids)
+                    projected = self._load_remote_objects_from_projection_entries(
+                        entries=entries,
+                        snapshot_kind="objects",
+                    )
+                    if projected:
+                        return projected
                 if self._remote_is_required():
                     return ()
             except Exception:
@@ -319,22 +559,33 @@ class StructuredStoreRemoteSelectionMixin:
         self,
         *,
         predicate: Callable[[Mapping[str, object]], bool],
+        allow_cold_remote_catalog_scan: bool = True,
     ) -> tuple[LongTermMemoryObjectV1, ...]:
         """Load only current objects whose catalog projection matches ``predicate``."""
 
         remote_catalog = self._remote_catalog
         if self._remote_catalog_enabled() and remote_catalog is not None:
             try:
-                selected_ids = tuple(
-                    dict.fromkeys(
-                        entry.item_id
-                        for entry in remote_catalog.load_catalog_entries(snapshot_kind="objects")
-                        if isinstance(getattr(entry, "item_id", None), str)
-                        and predicate(self._catalog_entry_projection(entry))
+                entries = tuple(
+                    entry
+                    for entry in self._remote_catalog_entries_for_active_path(
+                        snapshot_kind="objects",
+                        allow_cold_remote_catalog_scan=allow_cold_remote_catalog_scan,
                     )
+                    if isinstance(getattr(entry, "item_id", None), str)
+                    and predicate(self._catalog_entry_projection(entry))
                 )
-                if selected_ids:
-                    return self.load_objects_by_ids(selected_ids)
+                if entries:
+                    if allow_cold_remote_catalog_scan:
+                        selected_ids = tuple(dict.fromkeys(entry.item_id for entry in entries))
+                        if selected_ids:
+                            return self.load_objects_by_ids(selected_ids)
+                    projected = self._load_remote_objects_from_projection_entries(
+                        entries=entries,
+                        snapshot_kind="objects",
+                    )
+                    if projected:
+                        return projected
                 if self._remote_is_required():
                     return ()
             except Exception:
@@ -351,6 +602,8 @@ class StructuredStoreRemoteSelectionMixin:
     def load_conflicts_for_memory_ids(
         self,
         memory_ids: Iterable[str],
+        *,
+        allow_cold_remote_catalog_scan: bool = True,
     ) -> tuple[LongTermMemoryConflictV1, ...]:
         """Load only conflicts that reference one of the requested memory ids."""
 
@@ -367,17 +620,25 @@ class StructuredStoreRemoteSelectionMixin:
             try:
                 entries = tuple(
                     entry
-                    for entry in remote_catalog.load_catalog_entries(snapshot_kind="conflicts")
+                    for entry in self._remote_catalog_entries_for_active_path(
+                        snapshot_kind="conflicts",
+                        allow_cold_remote_catalog_scan=allow_cold_remote_catalog_scan,
+                    )
                     if self._catalog_entry_text(entry, "candidate_memory_id") in target_ids
                     or bool(target_ids.intersection(self._catalog_entry_list(entry, "existing_memory_ids")))
                 )
-                item_ids = tuple(
-                    entry.item_id
-                    for entry in entries
-                    if isinstance(getattr(entry, "item_id", None), str)
-                )
-                if item_ids:
-                    return self._load_remote_conflicts_from_item_ids(item_ids=item_ids)
+                if entries:
+                    if allow_cold_remote_catalog_scan:
+                        item_ids = tuple(
+                            entry.item_id
+                            for entry in entries
+                            if isinstance(getattr(entry, "item_id", None), str)
+                        )
+                        if item_ids:
+                            return self._load_remote_conflicts_from_item_ids(item_ids=item_ids)
+                    projected = self._load_remote_conflicts_from_projection_entries(entries=entries)
+                    if projected:
+                        return projected
                 if self._remote_is_required():
                     return ()
             except Exception:
@@ -444,6 +705,8 @@ class StructuredStoreRemoteSelectionMixin:
     def load_objects_referencing_memory_ids(
         self,
         memory_ids: Iterable[str],
+        *,
+        allow_cold_remote_catalog_scan: bool = True,
     ) -> tuple[LongTermMemoryObjectV1, ...]:
         """Load only objects whose reference fields mention one of the requested ids."""
 
@@ -458,19 +721,29 @@ class StructuredStoreRemoteSelectionMixin:
         remote_catalog = self._remote_catalog
         if self._remote_catalog_enabled() and remote_catalog is not None:
             try:
-                selected_ids = tuple(
-                    dict.fromkeys(
-                        entry.item_id
-                        for entry in remote_catalog.load_catalog_entries(snapshot_kind="objects")
-                        if isinstance(getattr(entry, "item_id", None), str)
-                        and (
-                            bool(target_ids.intersection(self._catalog_entry_list(entry, "conflicts_with")))
-                            or bool(target_ids.intersection(self._catalog_entry_list(entry, "supersedes")))
-                        )
+                entries = tuple(
+                    entry
+                    for entry in self._remote_catalog_entries_for_active_path(
+                        snapshot_kind="objects",
+                        allow_cold_remote_catalog_scan=allow_cold_remote_catalog_scan,
+                    )
+                    if isinstance(getattr(entry, "item_id", None), str)
+                    and (
+                        bool(target_ids.intersection(self._catalog_entry_list(entry, "conflicts_with")))
+                        or bool(target_ids.intersection(self._catalog_entry_list(entry, "supersedes")))
                     )
                 )
-                if selected_ids:
-                    return self.load_objects_by_ids(selected_ids)
+                if entries:
+                    if allow_cold_remote_catalog_scan:
+                        selected_ids = tuple(dict.fromkeys(entry.item_id for entry in entries))
+                        if selected_ids:
+                            return self.load_objects_by_ids(selected_ids)
+                    projected = self._load_remote_objects_from_projection_entries(
+                        entries=entries,
+                        snapshot_kind="objects",
+                    )
+                    if projected:
+                        return projected
                 if self._remote_is_required():
                     return ()
             except Exception:
@@ -566,6 +839,7 @@ class StructuredStoreRemoteSelectionMixin:
         if not self._remote_catalog_enabled() or remote_catalog is None:
             return None
         bounded_limit = max(1, limit)
+        candidate_limit = self._candidate_window_limit(limit=bounded_limit)
         clean_query = _normalize_text(query_text)
         recap_query = include_episodes and query_has_conversation_recap_semantics(clean_query)
         query_variants = (
@@ -607,7 +881,7 @@ class StructuredStoreRemoteSelectionMixin:
                 return ()
             entries = remote_catalog.top_catalog_entries(
                 snapshot_kind="objects",
-                limit=bounded_limit if fallback_limit <= 0 else min(bounded_limit, max(1, fallback_limit)),
+                limit=bounded_limit if fallback_limit <= 0 else min(candidate_limit, max(1, fallback_limit)),
                 eligible=eligible,
             )
             return self._load_remote_objects_from_entries(entries=entries, snapshot_kind="objects")
@@ -618,7 +892,7 @@ class StructuredStoreRemoteSelectionMixin:
                 candidate_payloads = remote_catalog.search_current_item_payloads(
                     snapshot_kind="objects",
                     query_text=candidate_query,
-                    limit=bounded_limit,
+                    limit=candidate_limit,
                     eligible=eligible,
                     allow_catalog_fallback=False,
                 )
@@ -639,9 +913,35 @@ class StructuredStoreRemoteSelectionMixin:
                     self._filter_query_relevant_objects(
                         effective_query_text,
                         selected=selected,
-                        limit=bounded_limit,
+                        limit=candidate_limit,
                     )
                 )
+                local_projection_rescue = self._local_catalog_projection_selected_objects(
+                    query_text=effective_query_text,
+                    limit=candidate_limit,
+                    eligible=eligible,
+                )
+                if local_projection_rescue:
+                    rescued_filtered = list(
+                        self._filter_query_relevant_objects(
+                            effective_query_text,
+                            selected=list(local_projection_rescue),
+                            limit=candidate_limit,
+                        )
+                    )
+                    if rescued_filtered and filtered:
+                        return self._prefer_higher_ranked_object_selection(
+                            query_texts=query_variants or (clean_query,),
+                            primary_objects=filtered,
+                            alternate_objects=rescued_filtered,
+                            limit=bounded_limit,
+                        )
+                    if rescued_filtered:
+                        return self.rank_selected_objects(
+                            query_texts=query_variants or (clean_query,),
+                            objects=rescued_filtered,
+                            limit=bounded_limit,
+                        )
                 if filtered:
                     return self.rank_selected_objects(
                         query_texts=query_variants or (clean_query,),
@@ -683,11 +983,44 @@ class StructuredStoreRemoteSelectionMixin:
         entries = remote_catalog.search_catalog_entries(
             snapshot_kind="objects",
             query_text=clean_query,
-            limit=bounded_limit,
+            limit=candidate_limit,
             eligible=eligible,
         )
         selected = list(self._load_remote_objects_from_entries(entries=entries, snapshot_kind="objects"))
-        filtered = list(self._filter_query_relevant_objects(clean_query, selected=selected, limit=bounded_limit))
+        filtered = list(self._filter_query_relevant_objects(clean_query, selected=selected, limit=candidate_limit))
+        if filtered:
+            return self.rank_selected_objects(
+                query_texts=(clean_query,),
+                objects=filtered,
+                limit=bounded_limit,
+            )
+        local_projection_rescue = self._local_catalog_projection_selected_objects(
+            query_text=clean_query,
+            limit=candidate_limit,
+            eligible=eligible,
+            allow_cold_remote_catalog_scan=False,
+        )
+        if local_projection_rescue:
+            rescued_filtered = list(
+                self._filter_query_relevant_objects(
+                    clean_query,
+                    selected=list(local_projection_rescue),
+                    limit=candidate_limit,
+                )
+            )
+            if rescued_filtered and filtered:
+                return self._prefer_higher_ranked_object_selection(
+                    query_texts=(clean_query,),
+                    primary_objects=filtered,
+                    alternate_objects=rescued_filtered,
+                    limit=bounded_limit,
+                )
+            if rescued_filtered:
+                return self.rank_selected_objects(
+                    query_texts=(clean_query,),
+                    objects=rescued_filtered,
+                    limit=bounded_limit,
+                )
         if filtered:
             return self.rank_selected_objects(
                 query_texts=(clean_query,),
@@ -715,6 +1048,7 @@ class StructuredStoreRemoteSelectionMixin:
         """Search one already-loaded object pool without re-entering remote scope lookup."""
 
         bounded_limit = max(1, limit)
+        candidate_limit = self._candidate_window_limit(limit=bounded_limit)
         eligible_objects = tuple(
             sorted(
                 (
@@ -739,10 +1073,24 @@ class StructuredStoreRemoteSelectionMixin:
                 return ()
             return eligible_objects[:bounded_limit]
         selector = self._object_selector(eligible_objects)
-        selected_ids = selector.search(clean_query, limit=bounded_limit)
+        selected_ids: list[str] = []
+        seen_selected_ids: set[str] = set()
+        for candidate_query in self._query_variants_for_loaded_objects(
+            query_text=clean_query,
+            include_episodes=include_episodes,
+        ):
+            for memory_id in selector.search(candidate_query, limit=candidate_limit):
+                if memory_id in seen_selected_ids:
+                    continue
+                seen_selected_ids.add(memory_id)
+                selected_ids.append(memory_id)
+                if len(selected_ids) >= candidate_limit:
+                    break
+            if len(selected_ids) >= candidate_limit:
+                break
         by_id = {item.memory_id: item for item in eligible_objects}
         selected = [by_id[memory_id] for memory_id in selected_ids if memory_id in by_id]
-        filtered = list(self._filter_query_relevant_objects(clean_query, selected=selected, limit=bounded_limit))
+        filtered = list(self._filter_query_relevant_objects(clean_query, selected=selected, limit=candidate_limit))
         if not filtered:
             return ()
         return self.rank_selected_objects(
@@ -810,9 +1158,9 @@ class StructuredStoreRemoteSelectionMixin:
                 limit=bounded_limit,
                 preserve_order=True,
             )
-            payloads = remote_catalog.load_selection_item_payloads(
+            payloads = remote_catalog.load_selection_item_payloads_from_entries(
                 snapshot_kind="conflicts",
-                item_ids=(entry.item_id for entry in entries),
+                entries=entries,
             )
         else:
             try:
@@ -841,9 +1189,9 @@ class StructuredStoreRemoteSelectionMixin:
                     query_text=clean_query,
                     limit=bounded_limit,
                 )
-                payloads = remote_catalog.load_selection_item_payloads(
+                payloads = remote_catalog.load_selection_item_payloads_from_entries(
                     snapshot_kind="conflicts",
-                    item_ids=(entry.item_id for entry in entries),
+                    entries=entries,
                 )
         conflicts = list(self._load_remote_conflicts_from_payloads(payloads=payloads))
         if not clean_query:
@@ -919,6 +1267,7 @@ class StructuredStoreRemoteSelectionMixin:
             if not objects:
                 return ()
             bounded_limit = max(1, limit)
+            candidate_limit = self._candidate_window_limit(limit=bounded_limit)
             clean_query = _normalize_text(query_text)
             if not clean_query:
                 if require_query_match:
@@ -927,13 +1276,13 @@ class StructuredStoreRemoteSelectionMixin:
             selector = self._object_selector(objects)
             selected_ids = selector.search(
                 clean_query,
-                limit=bounded_limit,
+                limit=candidate_limit,
                 category="object",
                 allow_fallback=not require_query_match and fallback_limit > 0,
             )
             by_id = {item.memory_id: item for item in objects}
             selected = [by_id[memory_id] for memory_id in selected_ids if memory_id in by_id]
-            filtered = list(self._filter_query_relevant_objects(clean_query, selected=selected, limit=bounded_limit))
+            filtered = list(self._filter_query_relevant_objects(clean_query, selected=selected, limit=candidate_limit))
             if not filtered and not require_query_match and fallback_limit > 0:
                 return objects[: min(bounded_limit, fallback_limit)]
             return tuple(filtered[:bounded_limit])

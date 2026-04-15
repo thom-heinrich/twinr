@@ -55,7 +55,7 @@ class StreamingSpeculationController:
     # forever by default. Live voice code now uses a bounded best-effort wait.
     # Set `config.streaming_supervisor_prefetch_hard_timeout_ms = None` to
     # restore the legacy unbounded behavior.
-    _DEFAULT_SUPERVISOR_HARD_TIMEOUT_MS = 1200
+    _DEFAULT_SUPERVISOR_HARD_TIMEOUT_MS = 2000
 
     def __init__(self, loop) -> None:
         self._loop = loop

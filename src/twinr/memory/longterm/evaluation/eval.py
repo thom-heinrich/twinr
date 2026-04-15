@@ -26,6 +26,7 @@ from twinr.memory.context_store import (
     PersistentMemoryMarkdownStore,
     PromptContextStore,
 )
+from twinr.memory.longterm.evaluation._graph_seed_contracts import require_successful_contact_seed_write
 from twinr.memory.query_normalization import LongTermQueryProfile
 from twinr.memory.longterm.runtime.service import LongTermMemoryService
 
@@ -68,6 +69,7 @@ class LongTermEvalCaseResult:
     observed_lookup_status: str | None = None
     observed_option_count: int | None = None
     error_message: str | None = None
+    diagnostics: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,13 +424,22 @@ def _seed_contacts(graph_store: TwinrPersonalGraphStore) -> list[_ContactSeed]:
             index = len(contacts) + 1
             phone = f"+49 170 {index:07d}"
             email = f"{given_name.lower()}.{family_name.lower()}@example.com"
-            graph_store.remember_contact(
+            result = graph_store.remember_contact(
                 given_name=given_name,
                 family_name=family_name,
                 phone=phone,
                 email=email,
                 role=role.title(),
                 relation=role,
+            )
+            require_successful_contact_seed_write(
+                result=result,
+                given_name=given_name,
+                family_name=family_name,
+                role=role.title(),
+                phone=phone,
+                email=email,
+                seed_context="synthetic_eval_seed.contacts",
             )
             contacts.append(
                 _ContactSeed(
@@ -465,13 +476,22 @@ def _seed_contacts(graph_store: TwinrPersonalGraphStore) -> list[_ContactSeed]:
         role = roles[index % len(roles)]
         phone = f"+49 151 {index + 500:07d}"
         email = f"{given_name.lower()}.{family_name.lower()}@example.com"
-        graph_store.remember_contact(
+        result = graph_store.remember_contact(
             given_name=given_name,
             family_name=family_name,
             phone=phone,
             email=email,
             role=role.replace("_", " ").title(),
             relation=role,
+        )
+        require_successful_contact_seed_write(
+            result=result,
+            given_name=given_name,
+            family_name=family_name,
+            role=role.replace("_", " ").title(),
+            phone=phone,
+            email=email,
+            seed_context="synthetic_eval_seed.contacts",
         )
         contacts.append(
             _ContactSeed(
@@ -727,6 +747,20 @@ def _coerce_tuple(value: object) -> tuple[object, ...]:
         return (value,)
 
 
+def _context_diagnostics(*, context_blob: str, limit: int = 320) -> dict[str, object]:
+    """Return one bounded provider-context diagnostic snapshot for failed cases."""
+
+    normalized = " ".join(str(context_blob or "").split()).strip()
+    excerpt = normalized[:limit]
+    if len(normalized) > limit:
+        excerpt = excerpt.rstrip() + "..."
+    return {
+        "context_present": bool(normalized),
+        "context_excerpt": excerpt,
+        "context_chars": len(normalized),
+    }
+
+
 def _contact_match_variants(value: object) -> tuple[str, ...]:
     """Return stable contact-match variants for formatted phone/email values.
 
@@ -800,6 +834,12 @@ def _run_eval_case(
             present_forbidden=(),
             observed_lookup_status=observed_lookup_status,
             observed_option_count=observed_option_count,
+            diagnostics={
+                "lookup_status": observed_lookup_status,
+                "option_count": observed_option_count,
+                "matched_contains": list(matched_contains),
+                "missing_contains": list(missing_contains),
+            },
         )
 
     context = service.build_provider_context(case.query_text)
@@ -819,6 +859,7 @@ def _run_eval_case(
         matched_contains=matched_contains,
         missing_contains=missing_contains,
         present_forbidden=present_forbidden,
+        diagnostics=_context_diagnostics(context_blob=context_blob),
     )
 
 

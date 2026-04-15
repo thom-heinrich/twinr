@@ -40,10 +40,11 @@ long-lived watchdog that repeatedly heals drift.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import fcntl
 import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path, PurePosixPath
 import posixpath
@@ -53,6 +54,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Callable, Iterator, Protocol, Sequence
 
@@ -104,6 +106,12 @@ DEFAULT_IGNORED_PATTERNS: tuple[str, ...] = (
     "**/browser_automation/artifacts/",
     "/hardware/bitcraze/twinr_on_device_failsafe/build/",
 )
+
+DEFAULT_OPTIONAL_AUTHORITATIVE_PATHS: tuple[str, ...] = (
+    "browser_automation/runtime_requirements.txt",
+    "browser_automation/playwright_browsers.txt",
+)
+CURRENT_RELEASE_MANIFEST_RELATIVE_PATH = Path("artifacts/stores/ops/current_release_manifest.json")
 
 DEFAULT_REMOTE_LOCK_WAIT_S = 30.0
 _DEFAULT_CONNECT_TIMEOUT_S = 10
@@ -168,6 +176,37 @@ class PiRepoMirrorEntryDigest:
 
 
 @dataclass(frozen=True, slots=True)
+class PiAuthoritativeWorkspaceStatus:
+    """Summarize the local workspace state that produced one release payload."""
+
+    repo_root: str
+    head_commit: str
+    source_dirty: bool
+    tracked_dirty_count: int
+    tracked_deleted_count: int
+    untracked_count: int
+    ignored_count: int
+    sampled_tracked_dirty_paths: tuple[str, ...]
+    sampled_tracked_deleted_paths: tuple[str, ...]
+    sampled_untracked_paths: tuple[str, ...]
+    sampled_ignored_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PiAuthoritativeReleaseManifest:
+    """Describe one deterministic release payload derived from the repo."""
+
+    release_id: str
+    repo_root: str
+    source_commit: str
+    source_dirty: bool
+    generated_at_utc: str | None
+    entry_count: int
+    workspace_status: PiAuthoritativeWorkspaceStatus
+    entries: tuple[PiRepoMirrorEntryDigest, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class PiRepoMirrorRunResult:
     """Summarize a bounded watchdog run."""
 
@@ -199,6 +238,15 @@ class _ScopeContext:
     protected_prefixes: tuple[str, ...]
     nonportable_paths: frozenset[str]
     nonportable_prefixes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _GitStatusPorcelainEntry:
+    """Represent one parsed `git status --porcelain=v1 -z` record."""
+
+    xy: str
+    path: str
+    original_path: str | None = None
 
 
 class _PiConnectionSettingsLike(Protocol):
@@ -352,6 +400,7 @@ class PiRepoMirrorWatchdog:
         self._capabilities: PiRepoMirrorCapabilities | None = None
         self._nonportable_paths_cache: tuple[str, ...] | None = None
         self._nonportable_paths_cache_expires_at = 0.0
+        self._authoritative_source_is_snapshot = False
 
     @classmethod
     def from_env(
@@ -418,29 +467,30 @@ class PiRepoMirrorWatchdog:
             raise ValueError("max_change_lines must be greater than zero")
         started = self._monotonic()
         with self._local_mirror_lock():
-            change_lines = self._run_rsync(dry_run=not apply_sync, checksum=checksum)
-            drift_detected = bool(change_lines)
-            verified_clean: bool | None
-            if not apply_sync:
-                verified_clean = None
-            elif not drift_detected:
-                verified_clean = True
-            elif self.verify_with_checksum_on_sync:
-                verification_changes = self._run_rsync(dry_run=True, checksum=True)
-                if verification_changes:
-                    verification_changes = self._recover_from_post_sync_drift(
-                        verification_changes,
-                        checksum=checksum,
-                    )
-                if verification_changes:
-                    preview = ", ".join(verification_changes[:3])
-                    raise RuntimeError(
-                        "Pi repo mirror did not converge after sync; remaining drift: "
-                        f"{preview}"
-                    )
-                verified_clean = True
-            else:
-                verified_clean = True
+            with self._authoritative_source_root():
+                change_lines = self._run_rsync(dry_run=not apply_sync, checksum=checksum)
+                drift_detected = bool(change_lines)
+                verified_clean: bool | None
+                if not apply_sync:
+                    verified_clean = None
+                elif not drift_detected:
+                    verified_clean = True
+                elif self.verify_with_checksum_on_sync:
+                    verification_changes = self._run_rsync(dry_run=True, checksum=True)
+                    if verification_changes:
+                        verification_changes = self._recover_from_post_sync_drift(
+                            verification_changes,
+                            checksum=checksum,
+                        )
+                    if verification_changes:
+                        preview = ", ".join(verification_changes[:3])
+                        raise RuntimeError(
+                            "Pi repo mirror did not converge after sync; remaining drift: "
+                            f"{preview}"
+                        )
+                    verified_clean = True
+                else:
+                    verified_clean = True
         duration_s = self._monotonic() - started
         return PiRepoMirrorCycleResult(
             host=self.connection_settings.host,
@@ -453,6 +503,35 @@ class PiRepoMirrorWatchdog:
             sampled_change_lines=tuple(change_lines[:max_change_lines]),
             duration_s=duration_s,
         )
+
+    @contextmanager
+    def _authoritative_source_root(self) -> Iterator[Path]:
+        """Yield the exact source tree that is allowed to mirror to the Pi.
+
+        The live watchdog must not treat ignored or untracked workspace debris as
+        authoritative runtime code. Outside deploy-created snapshots we therefore
+        materialize one deterministic tracked-file snapshot per cycle and mirror
+        only that bounded payload.
+        """
+
+        if self._authoritative_source_is_snapshot:
+            yield self.project_root
+            return
+        original_root = self.project_root
+        with tempfile.TemporaryDirectory(prefix="twinr-pi-repo-mirror-") as temp_dir_str:
+            snapshot_root = Path(temp_dir_str) / "authoritative_repo"
+            materialize_authoritative_repo_snapshot(
+                original_root,
+                snapshot_root,
+                protected_patterns=self.protected_patterns,
+            )
+            self.project_root = snapshot_root
+            self._invalidate_nonportable_paths_cache()
+            try:
+                yield snapshot_root
+            finally:
+                self.project_root = original_root
+                self._invalidate_nonportable_paths_cache()
 
     def run(
         self,
@@ -610,7 +689,10 @@ class PiRepoMirrorWatchdog:
             if not message:
                 message = "rsync mirror command failed"
             raise RuntimeError(message)
-        return _parse_rsync_change_lines(completed.stdout)
+        change_lines = _parse_rsync_change_lines(completed.stdout)
+        if checksum:
+            change_lines = _filter_checksum_only_mtime_changes(change_lines)
+        return change_lines
 
     def _build_rsync_args(self, *, dry_run: bool, checksum: bool) -> list[str]:
         capabilities = self._get_capabilities()
@@ -1012,6 +1094,7 @@ def build_authoritative_repo_entry_digests(
     project_root: str | Path,
     *,
     protected_patterns: Sequence[str] = DEFAULT_PROTECTED_PATTERNS,
+    optional_authoritative_paths: Sequence[str] = DEFAULT_OPTIONAL_AUTHORITATIVE_PATHS,
 ) -> tuple[PiRepoMirrorEntryDigest, ...]:
     """Return the authoritative mirrored repo entries with stable digests.
 
@@ -1021,7 +1104,7 @@ def build_authoritative_repo_entry_digests(
     are attested by content digest or symlink target.
     """
 
-    resolved_root = Path(project_root).resolve()
+    resolved_root = _resolve_git_repo_root(Path(project_root).resolve())
     if not resolved_root.exists() or not resolved_root.is_dir():
         raise ValueError(f"project root does not exist: {resolved_root}")
     scope = _build_scope_context(
@@ -1029,33 +1112,28 @@ def build_authoritative_repo_entry_digests(
         _discover_nonportable_paths(resolved_root),
     )
     entries: list[PiRepoMirrorEntryDigest] = []
-    for current_root, dirnames, filenames in os.walk(resolved_root, topdown=True, followlinks=False):
-        current_root_path = Path(current_root)
-        retained_dirnames: list[str] = []
-        for dirname in dirnames:
-            candidate = current_root_path / dirname
-            relative_path = candidate.relative_to(resolved_root).as_posix()
-            if _path_is_excluded_from_authoritative_scope(
-                relative_path=relative_path,
-                is_dir=True,
-                scope=scope,
-            ):
-                continue
-            if candidate.is_symlink():
-                entries.append(_build_repo_entry_digest(candidate, resolved_root))
-                continue
-            retained_dirnames.append(dirname)
-        dirnames[:] = retained_dirnames
-        for filename in filenames:
-            candidate = current_root_path / filename
-            relative_path = candidate.relative_to(resolved_root).as_posix()
-            if _path_is_excluded_from_authoritative_scope(
-                relative_path=relative_path,
-                is_dir=False,
-                scope=scope,
-            ):
-                continue
-            entries.append(_build_repo_entry_digest(candidate, resolved_root))
+    tracked_paths = tuple(_read_git_ls_files(resolved_root))
+    release_paths = list(tracked_paths)
+    tracked_path_set = set(tracked_paths)
+    for relative_path in _normalize_optional_authoritative_paths(optional_authoritative_paths):
+        if relative_path in tracked_path_set:
+            continue
+        candidate = resolved_root / relative_path
+        if not _include_optional_authoritative_path(candidate):
+            continue
+        release_paths.append(relative_path)
+    for relative_path in release_paths:
+        candidate = resolved_root / relative_path
+        if not candidate.exists() and not candidate.is_symlink():
+            continue
+        is_dir = candidate.is_dir() and not candidate.is_symlink()
+        if _path_is_excluded_from_authoritative_scope(
+            relative_path=relative_path,
+            is_dir=is_dir,
+            scope=scope,
+        ):
+            continue
+        entries.append(_build_repo_entry_digest(candidate, resolved_root))
     entries.sort(key=lambda item: item.relative_path)
     return tuple(entries)
 
@@ -1065,6 +1143,7 @@ def materialize_authoritative_repo_snapshot(
     snapshot_root: str | Path,
     *,
     protected_patterns: Sequence[str] = DEFAULT_PROTECTED_PATTERNS,
+    entries: Sequence[PiRepoMirrorEntryDigest] | None = None,
 ) -> tuple[PiRepoMirrorEntryDigest, ...]:
     """Copy the authoritative mirror scope into an immutable local snapshot.
 
@@ -1079,12 +1158,12 @@ def materialize_authoritative_repo_snapshot(
     resolved_snapshot_root = Path(snapshot_root).resolve()
     if not resolved_root.exists() or not resolved_root.is_dir():
         raise ValueError(f"project root does not exist: {resolved_root}")
-    entries = build_authoritative_repo_entry_digests(
+    normalized_entries = tuple(entries) if entries is not None else build_authoritative_repo_entry_digests(
         resolved_root,
         protected_patterns=protected_patterns,
     )
     resolved_snapshot_root.mkdir(parents=True, exist_ok=True)
-    for entry in entries:
+    for entry in normalized_entries:
         source_path = resolved_root / entry.relative_path
         target_path = resolved_snapshot_root / entry.relative_path
         target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1092,7 +1171,96 @@ def materialize_authoritative_repo_snapshot(
             target_path.symlink_to(os.readlink(source_path))
             continue
         shutil.copy2(source_path, target_path)
-    return entries
+    return normalized_entries
+
+
+def collect_authoritative_workspace_status(
+    project_root: str | Path,
+    *,
+    sample_limit: int = 20,
+) -> PiAuthoritativeWorkspaceStatus:
+    """Describe the workspace state behind one tracked-file release payload."""
+
+    resolved_root = _resolve_git_repo_root(Path(project_root).resolve())
+    if sample_limit <= 0:
+        raise ValueError("sample_limit must be greater than zero")
+    head_commit = _run_git_command(resolved_root, "rev-parse", "HEAD").stdout.strip()
+    entries = _parse_git_status_porcelain_v1_z(
+        _run_git_command(
+            resolved_root,
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--ignored=matching",
+            "--untracked-files=all",
+        ).stdout
+    )
+    tracked_dirty_paths: list[str] = []
+    tracked_deleted_paths: list[str] = []
+    untracked_paths: list[str] = []
+    ignored_paths: list[str] = []
+    for entry in entries:
+        if entry.xy == "??":
+            untracked_paths.append(entry.path)
+            continue
+        if entry.xy == "!!":
+            ignored_paths.append(entry.path)
+            continue
+        tracked_dirty_paths.append(entry.path)
+        if "D" in entry.xy:
+            tracked_deleted_paths.append(entry.path)
+    sampled_tracked_dirty_paths = _sample_unique_paths(tracked_dirty_paths, sample_limit)
+    sampled_tracked_deleted_paths = _sample_unique_paths(tracked_deleted_paths, sample_limit)
+    sampled_untracked_paths = _sample_unique_paths(untracked_paths, sample_limit)
+    sampled_ignored_paths = _sample_unique_paths(ignored_paths, sample_limit)
+    tracked_dirty_count = len(dict.fromkeys(tracked_dirty_paths))
+    tracked_deleted_count = len(dict.fromkeys(tracked_deleted_paths))
+    untracked_count = len(dict.fromkeys(untracked_paths))
+    ignored_count = len(dict.fromkeys(ignored_paths))
+    return PiAuthoritativeWorkspaceStatus(
+        repo_root=str(resolved_root),
+        head_commit=head_commit,
+        source_dirty=bool(tracked_dirty_count or untracked_count or ignored_count),
+        tracked_dirty_count=tracked_dirty_count,
+        tracked_deleted_count=tracked_deleted_count,
+        untracked_count=untracked_count,
+        ignored_count=ignored_count,
+        sampled_tracked_dirty_paths=sampled_tracked_dirty_paths,
+        sampled_tracked_deleted_paths=sampled_tracked_deleted_paths,
+        sampled_untracked_paths=sampled_untracked_paths,
+        sampled_ignored_paths=sampled_ignored_paths,
+    )
+
+
+def build_authoritative_release_manifest(
+    project_root: str | Path,
+    *,
+    protected_patterns: Sequence[str] = DEFAULT_PROTECTED_PATTERNS,
+    optional_authoritative_paths: Sequence[str] = DEFAULT_OPTIONAL_AUTHORITATIVE_PATHS,
+    sample_limit: int = 20,
+    generated_at_utc: str | None = None,
+) -> PiAuthoritativeReleaseManifest:
+    """Build one deterministic release manifest for Pi deploy/audit workflows."""
+
+    workspace_status = collect_authoritative_workspace_status(
+        project_root,
+        sample_limit=sample_limit,
+    )
+    entries = build_authoritative_repo_entry_digests(
+        project_root,
+        protected_patterns=protected_patterns,
+        optional_authoritative_paths=optional_authoritative_paths,
+    )
+    return PiAuthoritativeReleaseManifest(
+        release_id=_compute_authoritative_release_id(entries),
+        repo_root=workspace_status.repo_root,
+        source_commit=workspace_status.head_commit,
+        source_dirty=workspace_status.source_dirty,
+        generated_at_utc=generated_at_utc,
+        entry_count=len(entries),
+        workspace_status=workspace_status,
+        entries=entries,
+    )
 
 
 def _build_repo_entry_digest(path: Path, project_root: Path) -> PiRepoMirrorEntryDigest:
@@ -1105,11 +1273,136 @@ def _build_repo_entry_digest(path: Path, project_root: Path) -> PiRepoMirrorEntr
             kind="symlink",
             link_target=os.readlink(path),
         )
+    if not path.is_file():
+        raise RuntimeError(
+            f"authoritative release path must be a regular file or symlink: {relative_path}"
+        )
     return PiRepoMirrorEntryDigest(
         relative_path=relative_path,
         kind="file",
         sha256=_sha256_for_file(path),
     )
+
+
+def _compute_authoritative_release_id(entries: Sequence[PiRepoMirrorEntryDigest]) -> str:
+    """Return one stable content digest for the authoritative release payload."""
+
+    encoded = json.dumps(
+        [asdict(entry) for entry in entries],
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _resolve_git_repo_root(project_root: Path) -> Path:
+    """Resolve and validate the git repository root for one project path."""
+
+    completed = _run_git_command(project_root, "rev-parse", "--show-toplevel")
+    repo_root = Path((completed.stdout or "").strip()).resolve()
+    if not repo_root.exists() or not repo_root.is_dir():
+        raise ValueError(f"git repo root does not exist: {repo_root}")
+    return repo_root
+
+
+def _run_git_command(project_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run one git command and fail closed on non-repo or parse errors."""
+
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=project_root,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if completed.returncode != 0:
+        message = (completed.stderr or completed.stdout or "").strip()
+        if not message:
+            message = f"git {' '.join(args)} failed"
+        raise ValueError(message)
+    return completed
+
+
+def _read_git_ls_files(project_root: Path) -> tuple[str, ...]:
+    """Return tracked worktree-relative paths that define release authority."""
+
+    stdout = _run_git_command(project_root, "ls-files", "-z").stdout
+    return tuple(
+        path
+        for path in stdout.split("\0")
+        if path
+    )
+
+
+def _normalize_optional_authoritative_paths(paths: Sequence[str]) -> tuple[str, ...]:
+    """Return unique repo-relative optional authoritative paths."""
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_path in paths:
+        candidate = PurePosixPath(str(raw_path or "").strip())
+        if not str(candidate):
+            continue
+        if candidate.is_absolute():
+            raise ValueError(f"optional authoritative path must be repo-relative: {candidate}")
+        normalized_path = posixpath.normpath(candidate.as_posix())
+        if normalized_path in {"", "."}:
+            continue
+        if normalized_path.startswith("../"):
+            raise ValueError(f"optional authoritative path escapes repo root: {candidate}")
+        if normalized_path in seen:
+            continue
+        normalized.append(normalized_path)
+        seen.add(normalized_path)
+    return tuple(normalized)
+
+
+def _include_optional_authoritative_path(candidate: Path) -> bool:
+    """Return whether one optional extra path belongs in the release payload."""
+
+    if candidate.is_symlink():
+        return True
+    if not candidate.exists() or not candidate.is_file():
+        return False
+    return candidate.stat().st_size > 0
+
+
+def _parse_git_status_porcelain_v1_z(text: str) -> tuple[_GitStatusPorcelainEntry, ...]:
+    """Parse machine-readable porcelain-v1 status output."""
+
+    records = [record for record in str(text or "").split("\0") if record]
+    entries: list[_GitStatusPorcelainEntry] = []
+    index = 0
+    while index < len(records):
+        record = records[index]
+        if len(record) < 4 or record[2] != " ":
+            raise RuntimeError(f"unexpected git status porcelain record: {record!r}")
+        xy = record[:2]
+        path = record[3:]
+        original_path = None
+        index += 1
+        if xy[0] in {"R", "C"} or xy[1] in {"R", "C"}:
+            if index >= len(records):
+                raise RuntimeError(f"missing rename/copy source for git status record: {record!r}")
+            original_path = records[index]
+            index += 1
+        entries.append(
+            _GitStatusPorcelainEntry(
+                xy=xy,
+                path=path,
+                original_path=original_path,
+            )
+        )
+    return tuple(entries)
+
+
+def _sample_unique_paths(paths: Sequence[str], limit: int) -> tuple[str, ...]:
+    """Return the first unique paths up to one bounded sample limit."""
+
+    return tuple(dict.fromkeys(str(path or "").strip() for path in paths if str(path or "").strip()))[:limit]
 
 
 def _sha256_for_file(path: Path) -> str:
@@ -1274,6 +1567,19 @@ def _parse_rsync_change_lines(text: str) -> list[str]:
     return lines
 
 
+def _filter_checksum_only_mtime_changes(change_lines: Sequence[str]) -> list[str]:
+    """Drop pure timestamp churn once checksum mode already proved equal content."""
+
+    filtered_lines: list[str] = []
+    for raw_line in change_lines:
+        line = str(raw_line or "").strip()
+        itemized_prefix, _, _ = line.partition(" ")
+        if re.fullmatch(r"\.[fdL]\.\.t\.\.\.\.\.\.", itemized_prefix):
+            continue
+        filtered_lines.append(line)
+    return filtered_lines
+
+
 def _stale_directory_deletion_targets(change_lines: Sequence[str]) -> tuple[str, ...]:
     """Return delete-only directory drift candidates from rsync itemized lines."""
 
@@ -1346,7 +1652,9 @@ def _coerce_optional_int(value: object, *, fallback: object | None = None) -> in
     candidate = value if value not in (None, "") else fallback
     if candidate in (None, ""):
         return None
-    return int(candidate)
+    if isinstance(candidate, int):
+        return candidate
+    return int(str(candidate))
 
 
 def _first_connection_setting(connection_settings: object, names: Sequence[str]) -> object | None:
@@ -1367,12 +1675,17 @@ def _optional_nonempty(value: object) -> str | None:
 
 
 __all__ = [
+    "CURRENT_RELEASE_MANIFEST_RELATIVE_PATH",
     "DEFAULT_PROTECTED_PATTERNS",
+    "PiAuthoritativeReleaseManifest",
+    "PiAuthoritativeWorkspaceStatus",
     "PiRepoMirrorCapabilities",
     "PiRepoMirrorEntryDigest",
     "PiRepoMirrorCycleResult",
     "PiRepoMirrorRunResult",
     "PiRepoMirrorWatchdog",
+    "build_authoritative_release_manifest",
     "build_authoritative_repo_entry_digests",
+    "collect_authoritative_workspace_status",
     "materialize_authoritative_repo_snapshot",
 ]

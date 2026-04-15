@@ -127,6 +127,80 @@ class RemoteMemoryWatchdogCompanionTests(unittest.TestCase):
             ],
         )
 
+    def test_configured_systemd_unit_never_raw_spawns_after_failed_start_request(self) -> None:
+        config = TwinrConfig(
+            project_root="/twinr",
+            long_term_memory_enabled=True,
+            long_term_memory_mode="remote_primary",
+            long_term_memory_remote_required=True,
+        )
+        emitted: list[str] = []
+
+        with mock.patch(
+            "twinr.ops.remote_memory_watchdog_companion.loop_lock_owner",
+            return_value=None,
+        ), mock.patch(
+            "twinr.ops.remote_memory_watchdog_companion.subprocess.run",
+            return_value=mock.Mock(returncode=1),
+        ) as run_mock, mock.patch(
+            "twinr.ops.remote_memory_watchdog_companion.subprocess.Popen",
+        ) as popen_mock:
+            owner = ensure_remote_memory_watchdog_process(
+                config,
+                env_file="/twinr/.env",
+                emit=emitted.append,
+            )
+
+        self.assertIsNone(owner)
+        run_mock.assert_called_once()
+        popen_mock.assert_not_called()
+        self.assertEqual(
+            emitted,
+            [
+                "remote_memory_watchdog=systemd_start_exit:1:twinr-remote-memory-watchdog.service",
+                "remote_memory_watchdog=systemd_required_no_spawn:twinr-remote-memory-watchdog.service",
+            ],
+        )
+
+    def test_configured_systemd_unit_never_raw_spawns_while_start_is_pending(self) -> None:
+        config = TwinrConfig(
+            project_root="/twinr",
+            long_term_memory_enabled=True,
+            long_term_memory_mode="remote_primary",
+            long_term_memory_remote_required=True,
+        )
+        emitted: list[str] = []
+
+        with mock.patch(
+            "twinr.ops.remote_memory_watchdog_companion.loop_lock_owner",
+            return_value=None,
+        ), mock.patch(
+            "twinr.ops.remote_memory_watchdog_companion.subprocess.run",
+            return_value=mock.Mock(returncode=0),
+        ) as run_mock, mock.patch(
+            "twinr.ops.remote_memory_watchdog_companion.subprocess.Popen",
+        ) as popen_mock, mock.patch(
+            "twinr.ops.remote_memory_watchdog_companion.time.sleep",
+            return_value=None,
+        ):
+            owner = ensure_remote_memory_watchdog_process(
+                config,
+                env_file="/twinr/.env",
+                emit=emitted.append,
+                startup_timeout_s=0.2,
+            )
+
+        self.assertIsNone(owner)
+        run_mock.assert_called_once()
+        popen_mock.assert_not_called()
+        self.assertEqual(
+            emitted,
+            [
+                "remote_memory_watchdog=systemd_start_requested:twinr-remote-memory-watchdog.service",
+                "remote_memory_watchdog=systemd_start_pending",
+            ],
+        )
+
     def test_spawn_disallowed_skips_raw_spawn_when_systemd_unit_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

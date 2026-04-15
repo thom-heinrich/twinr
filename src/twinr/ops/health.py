@@ -1,3 +1,10 @@
+# CHANGELOG: 2026-04-11
+# BUG-1: Ops health now exposes fail-closed visible-display fields from the
+# BUG-1: authoritative rendered-state artifact instead of letting callers infer
+# BUG-1: panel content from heartbeat/service liveness alone.
+# BUG-2: Health escalates to `warn` when heartbeat evidence proves a newer
+# BUG-2: completed render than the persisted rendered-state artifact, making
+# BUG-2: display-truth drift explicit instead of silently reporting stale UI.
 # CHANGELOG: 2026-04-04
 # BUG-1: Fixed memory-health flapping around the low-headroom boundary. A single
 # near-threshold `MemAvailable` sample no longer flips the visible system state
@@ -57,6 +64,7 @@ import warnings
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot
+from twinr.display.render_state import assess_visible_display_state
 from twinr.ops.events import TwinrOpsEventStore
 from twinr.ops.locks import loop_lock_owner
 from twinr.ops.paths import resolve_ops_paths_for_config
@@ -189,6 +197,12 @@ class TwinrSystemHealth:
     pi_throttled_raw: str | None = None
     pi_throttled_flags: tuple[str, ...] = ()
     services: tuple[ServiceHealth, ...] = ()
+    display_visible_state: str | None = None
+    display_visible_operator_status: str | None = None
+    display_visible_state_verdict: str | None = None
+    display_visible_state_reason: str | None = None
+    display_visible_state_source: str | None = None
+    display_visible_rendered_at: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
@@ -303,6 +317,7 @@ def collect_system_health(
         if snapshot is not None
         else None
     )
+    display_visible = assess_visible_display_state(config)
 
     pi_state = _read_pi_throttled_state()
     cpu_temperature_c = _read_cpu_temperature_c()
@@ -313,6 +328,7 @@ def collect_system_health(
         memory_owner_anonymous_mb,
         memory_owner_rss_delta_mb,
         memory_owner_anonymous_delta_mb,
+        streaming_process_swap_used_mb,
     ) = _read_streaming_memory_owner(config)
 
     status = "ok"
@@ -338,6 +354,7 @@ def collect_system_health(
         memory_pressure_full_10s_pct=memory_pressure_full_10s_pct,
         swap_total_mb=swap_total_mb,
         swap_used_percent=swap_used_percent,
+        streaming_process_swap_used_mb=streaming_process_swap_used_mb,
     )
     if memory_status is not None:
         status = _escalate_status(status, memory_status)
@@ -360,6 +377,8 @@ def collect_system_health(
         status = _escalate_status(status, pi_status)
 
     if runtime_error:
+        status = _escalate_status(status, "warn")
+    if display_visible.verdict == "drift":
         status = _escalate_status(status, "warn")
 
     return TwinrSystemHealth(
@@ -399,6 +418,12 @@ def collect_system_health(
         pi_throttled_raw=pi_state.raw_hex,
         pi_throttled_flags=pi_state.flags,
         services=services,
+        display_visible_state=display_visible.visible_runtime_status,
+        display_visible_operator_status=display_visible.visible_operator_status,
+        display_visible_state_verdict=display_visible.verdict,
+        display_visible_state_reason=display_visible.reason,
+        display_visible_state_source=display_visible.source,
+        display_visible_rendered_at=display_visible.rendered_at,
     )
 
 
@@ -498,16 +523,16 @@ def _read_memory() -> tuple[int | None, int | None, float | None, int | None, in
 
 def _read_streaming_memory_owner(
     config: TwinrConfig,
-) -> tuple[str | None, str | None, int | None, int | None, int | None, int | None]:
+) -> tuple[str | None, str | None, int | None, int | None, int | None, int | None, int | None]:
     """Return the latest live streaming-memory owner summary when available."""
 
     owner_pid = loop_lock_owner(config, "streaming-loop")
     owner_pid_int = _normalize_optional_int(owner_pid)
     if owner_pid_int is None:
-        return (None, None, None, None, None, None)
+        return (None, None, None, None, None, None, None)
     snapshot = load_current_streaming_memory_snapshot(config, expected_pid=owner_pid_int)
     if snapshot is None:
-        return (None, None, None, None, None, None)
+        return (None, None, None, None, None, None, None)
     current_metrics = snapshot.current_metrics
     preferred_rss_kb = current_metrics.preferred_rss_kb()
     preferred_anonymous_kb = current_metrics.preferred_anonymous_kb()
@@ -518,6 +543,7 @@ def _read_streaming_memory_owner(
         _kb_to_mb(preferred_anonymous_kb),
         _kb_to_mb(snapshot.owner_rss_delta_kb),
         _kb_to_mb(snapshot.owner_anonymous_delta_kb),
+        _kb_to_mb(current_metrics.vm_swap_kb),
     )
 
 
@@ -549,6 +575,7 @@ def assess_memory_pressure_status(
     memory_pressure_full_10s_pct: float | None = None,
     swap_total_mb: int | None = None,
     swap_used_percent: float | None = None,
+    streaming_process_swap_used_mb: int | None = None,
 ) -> str | None:
     """Classify memory pressure for operator-facing health surfaces.
 
@@ -566,6 +593,7 @@ def assess_memory_pressure_status(
         memory_pressure_full_10s_pct=memory_pressure_full_10s_pct,
         swap_total_mb=swap_total_mb,
         swap_used_percent=swap_used_percent,
+        streaming_process_swap_used_mb=streaming_process_swap_used_mb,
     )
     return _stabilize_memory_pressure_status(
         candidate_status=candidate_status,
@@ -581,6 +609,7 @@ def _assess_memory_pressure_candidate(
     memory_pressure_full_10s_pct: float | None = None,
     swap_total_mb: int | None = None,
     swap_used_percent: float | None = None,
+    streaming_process_swap_used_mb: int | None = None,
 ) -> str | None:
     """Return the raw current-sample memory status before hysteresis."""
 
@@ -600,6 +629,7 @@ def _assess_memory_pressure_candidate(
     swap_status = _assess_swap_pressure_status(
         swap_total_mb=swap_total_mb,
         swap_used_percent=swap_used_percent,
+        streaming_process_swap_used_mb=streaming_process_swap_used_mb,
     )
     if swap_status is not None:
         candidate_status = _escalate_status(candidate_status or "ok", swap_status)
@@ -610,14 +640,15 @@ def _assess_swap_pressure_status(
     *,
     swap_total_mb: int | None,
     swap_used_percent: float | None,
+    streaming_process_swap_used_mb: int | None = None,
 ) -> str | None:
-    """Treat sustained swap saturation as degraded memory health on Pi hosts."""
+    """Treat swap saturation as degraded only when Twinr itself is swapped out."""
 
     if swap_total_mb is None or swap_total_mb <= 0:
         return None
     if swap_used_percent is None:
         return None
-    if swap_used_percent >= _SWAP_WARN_USED_PERCENT:
+    if swap_used_percent >= _SWAP_WARN_USED_PERCENT and (streaming_process_swap_used_mb or 0) > 0:
         return "warn"
     return None
 

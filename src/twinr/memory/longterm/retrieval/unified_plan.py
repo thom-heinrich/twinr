@@ -13,6 +13,7 @@ from collections import defaultdict, deque
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 
+from twinr.agent.workflows.forensics import workflow_decision
 from twinr.memory.chonkydb.schema import TwinrGraphDocumentV1, TwinrGraphEdgeV1, TwinrGraphNodeV1
 from twinr.memory.context_store import PersistentMemoryEntry
 from twinr.memory.longterm.core.models import LongTermConflictQueueItemV1, LongTermMidtermPacketV1
@@ -63,6 +64,12 @@ _DOMINANT_FAMILY_RATIO = 1.25
 _DOMINANT_FAMILY_MARGIN = 0.2
 _TOP_EPISODIC_SUPPORT_LIMIT = 1
 _FOCAL_GRAPH_NODE_TYPES = frozenset({"person", "user", "place", "plan", "event"})
+_EXACT_GRAPH_ATTRIBUTE_NODE_TYPES = frozenset({"email", "phone", "address"})
+_QUERY_ATTRIBUTE_FAMILY_TOKENS: dict[str, frozenset[str]] = {
+    "email": frozenset({"email", "mail"}),
+    "phone": frozenset({"phone", "telefon", "telefonnummer", "rufnummer", "number", "nummer"}),
+    "address": frozenset({"address", "adresse"}),
+}
 
 
 def _normalize_text(value: object | None) -> str:
@@ -472,6 +479,21 @@ def _component_score(candidates: Sequence[_Candidate], indices: Iterable[int]) -
     )
 
 
+def _candidate_is_priority_graph_direct_match(candidate: _Candidate) -> bool:
+    """Return whether one direct graph hit should anchor focus selection.
+
+    Graph-only entity questions must treat a direct non-user focal graph hit as
+    real focus evidence. Otherwise generic midterm packets can win the focus
+    component race and pollute graph-only selections such as "Anna Becker
+    email" with unrelated continuity context.
+    """
+
+    if not candidate.direct_match or candidate.family != "graph" or candidate.candidate_type != "graph_node":
+        return False
+    node_type = _normalize_text(candidate.metadata.get("node_type"))
+    return node_type in _FOCAL_GRAPH_NODE_TYPES and node_type != "user"
+
+
 def _focus_component_ids(candidates: Sequence[_Candidate]) -> set[int]:
     if not candidates:
         return set()
@@ -479,7 +501,7 @@ def _focus_component_ids(candidates: Sequence[_Candidate]) -> set[int]:
     direct_match_components = {
         component_by_index[index]
         for index, candidate in enumerate(candidates)
-        if candidate.direct_match and candidate.family != "graph"
+        if candidate.direct_match and (candidate.family != "graph" or _candidate_is_priority_graph_direct_match(candidate))
     }
     if direct_match_components:
         return direct_match_components
@@ -506,6 +528,121 @@ def _candidate_sort_key(candidate: _Candidate) -> tuple[float, float, int, str, 
         candidate.original_rank,
         candidate.source,
         candidate.candidate_id,
+    )
+
+
+def _exact_graph_entity_ids(candidates: Sequence[_Candidate]) -> tuple[str, ...]:
+    """Return direct non-user focal graph nodes that define exact entity focus."""
+
+    return tuple(
+        dict.fromkeys(
+            candidate.candidate_id
+            for candidate in candidates
+            if candidate.family == "graph"
+            and candidate.candidate_type == "graph_node"
+            and candidate.direct_match
+            and _normalize_text(candidate.metadata.get("node_type")) in _FOCAL_GRAPH_NODE_TYPES
+            and _normalize_text(candidate.metadata.get("node_type")) != "user"
+        )
+    )
+
+
+def _exact_graph_attribute_families(candidates: Sequence[_Candidate]) -> tuple[str, ...]:
+    """Return direct graph attribute families that indicate an exact attribute query."""
+
+    families: list[str] = []
+    for candidate in candidates:
+        if candidate.family != "graph" or not candidate.direct_match:
+            continue
+        if candidate.candidate_type == "graph_node":
+            node_type = _normalize_text(candidate.metadata.get("node_type"))
+            if node_type in _EXACT_GRAPH_ATTRIBUTE_NODE_TYPES:
+                families.append(node_type)
+        elif (
+            candidate.candidate_type == "graph_edge"
+            and _normalize_text(candidate.metadata.get("edge_type")) == "general_has_contact_method"
+        ):
+            families.append("contact")
+    return tuple(dict.fromkeys(family for family in families if family))
+
+
+def _query_attribute_families(query_terms: Sequence[str]) -> tuple[str, ...]:
+    """Infer explicit contact-attribute families from the normalized query terms.
+
+    Exact graph contact lookups often match only the owning person node while
+    the attribute type itself is expressed only in the user query text, for
+    example "How can I reach Anna Becker by email?" or "Wie lautet Anna Beckers
+    E-Mail-Adresse?". When that happens, the unified planner still needs a
+    strict entity+attribute precision gate so unrelated durable/continuity
+    support cannot leak into a graph-only answer.
+    """
+
+    query_term_set = {term for term in query_terms if term}
+    families: list[str] = []
+    if query_term_set & _QUERY_ATTRIBUTE_FAMILY_TOKENS["email"]:
+        families.append("email")
+    if query_term_set & _QUERY_ATTRIBUTE_FAMILY_TOKENS["phone"]:
+        families.append("phone")
+    if "email" not in families and query_term_set & _QUERY_ATTRIBUTE_FAMILY_TOKENS["address"]:
+        families.append("address")
+    return tuple(families)
+
+
+def _candidate_matches_exact_graph_entity(
+    candidate: _Candidate,
+    *,
+    entity_ids: Sequence[str],
+) -> bool:
+    """Return whether one non-graph candidate is explicitly anchored to the exact entity."""
+
+    if candidate.family == "graph":
+        return True
+    entity_id_set = {entity_id for entity_id in entity_ids if entity_id}
+    if not entity_id_set:
+        return False
+    return any(
+        _is_explainable_join_anchor(anchor) and anchor.partition(":")[2] in entity_id_set
+        for anchor in candidate.anchors
+    )
+
+
+def _candidate_matches_exact_graph_attribute_family(
+    candidate: _Candidate,
+    *,
+    attribute_families: Sequence[str],
+) -> bool:
+    """Return whether one candidate still speaks about the exact requested attribute family."""
+
+    family_terms = {family for family in attribute_families if family}
+    if not family_terms:
+        return False
+    lookup_terms = set(candidate.lookup_terms)
+    return bool(lookup_terms & family_terms)
+
+
+def _candidate_allowed_by_exact_graph_precision(
+    candidate: _Candidate,
+    *,
+    entity_ids: Sequence[str],
+    attribute_families: Sequence[str],
+) -> bool:
+    """Gate non-graph support for exact graph entity+attribute queries.
+
+    Exact graph contact questions may still keep same-entity continuity support,
+    but practical/conflict support must also match the requested attribute
+    family. This prevents unrelated Corinna/Janina phone/contact facts from
+    leaking into exact graph answers about Anna email lookups.
+    """
+
+    if candidate.family == "graph":
+        return True
+    if not _candidate_matches_exact_graph_entity(candidate, entity_ids=entity_ids):
+        return False
+    if candidate.family == "continuity":
+        return True
+    return _candidate_matches_exact_graph_attribute_family(
+        candidate,
+        attribute_families=attribute_families,
     )
 
 
@@ -562,6 +699,73 @@ def _focus_is_generic_subject(focus_anchors: Sequence[str]) -> bool:
     return bool(focus_anchors) and all(anchor.startswith("subject_ref:user:") for anchor in focus_anchors)
 
 
+def _focus_anchors_contributed_only_by_family(
+    candidates: Sequence[_Candidate],
+    *,
+    focus_anchors: Sequence[str],
+    family: str,
+) -> bool:
+    """Return whether every explainable focus anchor currently comes from one family.
+
+    Some multimodal routine queries surface the right durable pattern upstream,
+    but the strongest explainable anchor belongs only to a conversation-turn
+    episode (`thread_ref:*`). If unified focus treats that continuity anchor as
+    authoritative too early, all practical multimodal patterns look
+    disconnected and get pruned as `out_of_focus_component` even though the
+    query is asking for a durable routine answer. Detect that continuity-only
+    shape so the planner can rescue strong anchorless practical candidates
+    before mode selection hardens around the episodic component.
+    """
+
+    if not focus_anchors:
+        return False
+    saw_supported_anchor = False
+    for anchor in focus_anchors:
+        contributor_families = {
+            candidate.family
+            for candidate in candidates
+            if anchor in candidate.anchors
+        }
+        if not contributor_families:
+            continue
+        saw_supported_anchor = True
+        if contributor_families != {family}:
+            return False
+    return saw_supported_anchor
+
+
+def _focus_anchors_lack_family_contributors(
+    candidates: Sequence[_Candidate],
+    *,
+    focus_anchors: Sequence[str],
+    family: str,
+) -> bool:
+    """Return whether the current focus anchors have no contributors from ``family``.
+
+    Graph-heavy or continuity-heavy focus selection can still become
+    semantically misleading when those anchors are disconnected from every
+    practical multimodal candidate. In that shape, downstream selection should
+    not let those focus anchors erase strong practical evidence that matches the
+    user query better than the graph noise does.
+    """
+
+    if not focus_anchors:
+        return False
+    saw_supported_anchor = False
+    for anchor in focus_anchors:
+        contributor_families = {
+            candidate.family
+            for candidate in candidates
+            if anchor in candidate.anchors
+        }
+        if not contributor_families:
+            continue
+        saw_supported_anchor = True
+        if family in contributor_families:
+            return False
+    return saw_supported_anchor
+
+
 def _candidate_specific_terms(
     candidate: _Candidate,
     *,
@@ -586,13 +790,128 @@ def _candidate_in_focus(candidate: _Candidate, *, focus_anchors: Sequence[str]) 
     return any(anchor in focus_anchor_set for anchor in candidate.anchors)
 
 
+def _candidate_anchor_matches(
+    candidate: _Candidate,
+    *,
+    anchor_targets: Sequence[str],
+) -> tuple[str, ...]:
+    """Return the explainable anchors a candidate shares with one target set."""
+
+    if not anchor_targets:
+        return ()
+    anchor_target_set = set(anchor_targets)
+    return tuple(
+        anchor
+        for anchor in candidate.anchors
+        if anchor in anchor_target_set and _is_focus_semantic_anchor(anchor)
+    )
+
+
+def _support_anchor_targets(
+    candidates: Sequence[_Candidate],
+    *,
+    focus_anchors: Sequence[str],
+) -> tuple[str, ...]:
+    """Return the anchor set continuity support must align with.
+
+    Practical queries should only keep continuity support that stays attached to
+    the same explainable entity/component as the selected practical or graph
+    evidence. Otherwise generic continuity packets or anchorless episodic turns
+    can outscore the actually relevant anchored memory and silently displace it.
+    """
+
+    targets: list[str] = []
+    seen: set[str] = set()
+    for anchor in focus_anchors:
+        if not _is_focus_semantic_anchor(anchor) or anchor in seen:
+            continue
+        seen.add(anchor)
+        targets.append(anchor)
+    for candidate in candidates:
+        if candidate.source == "episodic":
+            continue
+        for anchor in candidate.anchors:
+            if not _is_focus_semantic_anchor(anchor) or anchor in seen:
+                continue
+            seen.add(anchor)
+            targets.append(anchor)
+    return tuple(targets)
+
+
+def _candidate_support_anchor_matches(
+    candidate: _Candidate,
+    *,
+    focus_anchors: Sequence[str],
+    support_anchors: Sequence[str],
+) -> tuple[str, ...]:
+    """Return the effective anchor matches that justify continuity support."""
+
+    matches = _candidate_anchor_matches(candidate, anchor_targets=focus_anchors)
+    if matches:
+        return matches
+    return _candidate_anchor_matches(candidate, anchor_targets=support_anchors)
+
+
+def _candidate_has_required_support_alignment(
+    candidate: _Candidate,
+    *,
+    focus_anchors: Sequence[str],
+    support_anchors: Sequence[str],
+) -> bool:
+    """Return whether continuity support stays attached to the semantic focus.
+
+    Once graph or practical evidence established a semantic anchor, continuity
+    support must stay connected to that same anchor. Otherwise generic episodic
+    reminders such as "current number" can leak into phone/address recall just
+    because they share generic query words.
+    """
+
+    if _candidate_support_anchor_matches(
+        candidate,
+        focus_anchors=focus_anchors,
+        support_anchors=support_anchors,
+    ):
+        return True
+    if not focus_anchors and not support_anchors and _has_explainable_anchor(candidate.anchors):
+        return True
+    return False
+
+
+def _annotate_support_anchor_alignment(
+    candidates: Sequence[_Candidate],
+    *,
+    focus_anchors: Sequence[str],
+    support_anchors: Sequence[str],
+) -> tuple[_Candidate, ...]:
+    """Attach anchor-alignment evidence to candidate metadata for debugging.
+
+    Retry21 left only a few hard cases. Their fix has to stay inspectable from
+    the unified query plan alone, so the candidate payload should expose whether
+    a continuity support candidate matched the selected focus anchors or was
+    dropped because it floated in on generic query terms.
+    """
+
+    annotated: list[_Candidate] = []
+    for candidate in candidates:
+        focus_matches = _candidate_anchor_matches(candidate, anchor_targets=focus_anchors)
+        support_matches = _candidate_anchor_matches(candidate, anchor_targets=support_anchors)
+        metadata = dict(candidate.metadata)
+        metadata["focus_anchor_matches"] = list(focus_matches)
+        metadata["support_anchor_matches"] = list(support_matches)
+        metadata["support_anchor_aligned"] = bool(focus_matches or support_matches)
+        annotated.append(replace(candidate, metadata=metadata))
+    return tuple(annotated)
+
+
 def _dominant_mode(
     candidates: Sequence[_Candidate],
     *,
     focus_terms: Sequence[str],
     generic_subject_focus: bool,
+    query_score_fallback_families: Sequence[str] = (),
 ) -> tuple[str, dict[str, float]]:
     raw_family_scores = {"practical": 0.0, "continuity": 0.0, "graph": 0.0}
+    query_score_fallback_family_set = {family for family in query_score_fallback_families if family}
     for candidate in candidates:
         if candidate.family not in raw_family_scores:
             continue
@@ -600,6 +919,8 @@ def _dominant_mode(
             score = candidate.query_score
         else:
             score = _candidate_specific_score(candidate, focus_terms=focus_terms)
+            if score <= 0.0 and candidate.family in query_score_fallback_family_set:
+                score = candidate.query_score
         raw_family_scores[candidate.family] = max(raw_family_scores[candidate.family], score)
 
     family_scores = {
@@ -647,7 +968,7 @@ def _select_graph_candidates(candidates: Sequence[_Candidate]) -> tuple[_Candida
                 for candidate in focal_nodes
                 if _normalize_text(candidate.metadata.get("node_type")) != "user"
             ]
-            return tuple(sorted(non_user_focal_nodes or focal_nodes, key=_candidate_sort_key))
+            return tuple(sorted(non_user_focal_nodes or focal_nodes, key=_candidate_sort_key)[:1])
         direct_nodes = [
             candidate
             for candidate in direct_matches
@@ -667,11 +988,105 @@ def _select_graph_candidates(candidates: Sequence[_Candidate]) -> tuple[_Candida
     return tuple(sorted(graph_candidates, key=_candidate_sort_key)[:1])
 
 
+def _support_anchor_matches(candidate: _Candidate, *, metadata_field: str) -> tuple[str, ...]:
+    return _as_text_tuple(candidate.metadata.get(metadata_field))
+
+
+def _support_alignment_strength(candidate: _Candidate) -> int:
+    return len(_support_anchor_matches(candidate, metadata_field="focus_anchor_matches")) + len(
+        _support_anchor_matches(candidate, metadata_field="support_anchor_matches")
+    )
+
+
+def _support_focus_term_overlap(
+    candidate: _Candidate,
+    *,
+    focus_terms: Sequence[str],
+) -> int:
+    if not focus_terms:
+        return 0
+    focus_term_set = set(focus_terms)
+    return sum(1 for term in candidate.matched_query_terms if term in focus_term_set)
+
+
+def _continuity_support_candidate_eligible(
+    candidate: _Candidate,
+    *,
+    mode: str,
+    focus_terms: Sequence[str],
+    focus_anchors: Sequence[str],
+    support_anchors: Sequence[str],
+    practical_focus_starved: bool,
+) -> bool:
+    anchor_aligned = _candidate_has_required_support_alignment(
+        candidate,
+        focus_anchors=focus_anchors,
+        support_anchors=support_anchors,
+    )
+    if candidate.source == "midterm":
+        return bool(
+            anchor_aligned
+            or (
+                mode == "continuity"
+                and not (focus_anchors or support_anchors)
+                and candidate.query_score > 0.0
+            )
+            or candidate.direct_match
+            or _candidate_specific_score(candidate, focus_terms=focus_terms) > 0.0
+            or candidate.query_score > 0.0
+        )
+    if candidate.source != "episodic":
+        return False
+    if anchor_aligned and candidate.query_score > 0.0:
+        return True
+    if candidate.query_score > 0.0:
+        if mode == "continuity" and not (focus_anchors or support_anchors):
+            return True
+        if _support_focus_term_overlap(candidate, focus_terms=focus_terms) > 0:
+            return True
+        if mode in {"practical", "mixed"} and (
+            practical_focus_starved or not (focus_anchors or support_anchors)
+        ):
+            # Some routine-style queries have strong practical evidence but no
+            # explainable entity anchors. In that shape, keep the best
+            # lexically grounded episodic continuity item instead of dropping
+            # all episodic support as "anchorless". The same rescue is needed
+            # when graph-only or continuity-only focus anchors carry no
+            # practical contributors and would otherwise starve multimodal
+            # routine evidence.
+            return True
+    if mode not in {"practical", "mixed"}:
+        return False
+    return bool(
+        anchor_aligned
+        and _support_alignment_strength(candidate) > 0
+        and _has_explainable_anchor(candidate.anchors)
+    )
+
+
+def _continuity_support_sort_key(
+    candidate: _Candidate,
+    *,
+    focus_terms: Sequence[str],
+) -> tuple[float, float, float, int, str, str]:
+    return (
+        -float(_support_alignment_strength(candidate)),
+        -_candidate_specific_score(candidate, focus_terms=focus_terms),
+        -candidate.query_score,
+        candidate.original_rank,
+        candidate.source,
+        candidate.candidate_id,
+    )
+
+
 def _select_support_candidates(
     candidates: Sequence[_Candidate],
     *,
     mode: str,
     focus_terms: Sequence[str],
+    focus_anchors: Sequence[str],
+    support_anchors: Sequence[str],
+    practical_focus_starved: bool,
 ) -> tuple[_Candidate, ...]:
     if not candidates:
         return ()
@@ -684,39 +1099,228 @@ def _select_support_candidates(
         return ()
     continuity_candidates = sorted(continuity_candidates, key=_candidate_sort_key)
     if mode == "continuity":
-        kept = [
+        kept: list[_Candidate] = []
+        midterm_candidates = sorted(
+            [
+                candidate
+                for candidate in continuity_candidates
+                if candidate.source == "midterm"
+                and _continuity_support_candidate_eligible(
+                candidate,
+                mode=mode,
+                focus_terms=focus_terms,
+                focus_anchors=focus_anchors,
+                support_anchors=support_anchors,
+                practical_focus_starved=practical_focus_starved,
+            )
+        ],
+        key=lambda candidate: _continuity_support_sort_key(candidate, focus_terms=focus_terms),
+    )
+        continuity_episodic_candidates = tuple(
             candidate
             for candidate in continuity_candidates
-            if candidate.direct_match or _candidate_specific_score(candidate, focus_terms=focus_terms) > 0.0
-        ]
-        practical_support = [
+            if candidate.source == "episodic"
+            and _continuity_support_candidate_eligible(
+                candidate,
+                mode=mode,
+                focus_terms=focus_terms,
+                focus_anchors=focus_anchors,
+                support_anchors=support_anchors,
+                practical_focus_starved=practical_focus_starved,
+            )
+        )
+        ranked_continuity_episodic_candidates = sorted(
+            continuity_episodic_candidates,
+            key=lambda candidate: _continuity_support_sort_key(candidate, focus_terms=focus_terms),
+        )
+        kept.extend(midterm_candidates)
+        kept.extend(ranked_continuity_episodic_candidates[:_TOP_EPISODIC_SUPPORT_LIMIT])
+        return tuple(kept)
+    selected_support: list[_Candidate] = []
+    selected_episodic_candidates = sorted(
+        (
+            candidate
+            for candidate in continuity_candidates
+            if candidate.source == "episodic"
+            and _continuity_support_candidate_eligible(
+                candidate,
+                mode=mode,
+                focus_terms=focus_terms,
+                focus_anchors=focus_anchors,
+                support_anchors=support_anchors,
+                practical_focus_starved=practical_focus_starved,
+            )
+        ),
+        key=lambda candidate: _continuity_support_sort_key(candidate, focus_terms=focus_terms),
+    )
+    selected_midterm_candidates = sorted(
+        (
+            candidate
+            for candidate in continuity_candidates
+            if candidate.source == "midterm"
+            and _continuity_support_candidate_eligible(
+                candidate,
+                mode=mode,
+                focus_terms=focus_terms,
+                focus_anchors=focus_anchors,
+                support_anchors=support_anchors,
+                practical_focus_starved=practical_focus_starved,
+            )
+        ),
+        key=lambda candidate: _continuity_support_sort_key(candidate, focus_terms=focus_terms),
+    )
+    selected_support.extend(selected_midterm_candidates)
+    selected_support.extend(selected_episodic_candidates[:_TOP_EPISODIC_SUPPORT_LIMIT])
+    return tuple(selected_support)
+
+
+def _select_connected_practical_support_candidates(
+    candidates: Sequence[_Candidate],
+    *,
+    focus_terms: Sequence[str],
+    focus_anchors: Sequence[str],
+) -> tuple[_Candidate, ...]:
+    if focus_anchors:
+        return ()
+    practical_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.family == "practical"
+        and bool(candidate.support_sources)
+        and (
+            candidate.direct_match
+            or candidate.query_score > 0.0
+            or _candidate_specific_score(candidate, focus_terms=focus_terms) > 0.0
+        )
+    ]
+    if not practical_candidates:
+        anchorless_candidates = [
             candidate
             for candidate in candidates
             if candidate.family == "practical"
-            and candidate.query_score > 0.0
-            and any(source in {"episodic", "midterm"} for source in candidate.support_sources)
+            and not _has_explainable_anchor(candidate.anchors)
+            and (
+                candidate.direct_match
+                or candidate.query_score > 0.0
+                or _candidate_specific_score(candidate, focus_terms=focus_terms) > 0.0
+            )
         ]
-        kept.extend(sorted(practical_support, key=_candidate_sort_key)[:1])
-        return tuple(kept)
-    kept: list[_Candidate] = []
-    episodic_candidates = [
+        if not anchorless_candidates:
+            return ()
+        return tuple(sorted(anchorless_candidates, key=_candidate_sort_key)[:1])
+    return tuple(sorted(practical_candidates, key=_candidate_sort_key))
+
+
+def _select_anchorless_practical_support_candidates(
+    candidates: Sequence[_Candidate],
+    *,
+    focus_terms: Sequence[str],
+    focus_anchors: Sequence[str],
+) -> tuple[_Candidate, ...]:
+    """Rescue one strong practical support item when no semantic anchors exist.
+
+    Routine-style multimodal queries such as weather/button or camera/inspection
+    often carry a clear episodic focus but no explainable entity anchor shared
+    with the supporting durable pattern. In that shape, component pruning can
+    drop the best practical support object purely because it sits outside the
+    direct-match episodic component. Keep at most one strong practical support
+    candidate in those anchorless cases so mixed context can stay connected
+    without reopening broad off-topic durable recall.
+    """
+
+    if focus_anchors:
+        return ()
+    practical_candidates = [
         candidate
-        for candidate in continuity_candidates
-        if candidate.source == "episodic" and candidate.query_score > 0.0
-    ]
-    midterm_candidates = [
-        candidate
-        for candidate in continuity_candidates
-        if candidate.source == "midterm"
+        for candidate in candidates
+        if candidate.family == "practical"
+        and not _has_explainable_anchor(candidate.anchors)
         and (
             candidate.direct_match
-            or _candidate_specific_score(candidate, focus_terms=focus_terms) > 0.0
             or candidate.query_score > 0.0
+            or _candidate_specific_score(candidate, focus_terms=focus_terms) > 0.0
         )
     ]
-    kept.extend(midterm_candidates)
-    kept.extend(episodic_candidates[:_TOP_EPISODIC_SUPPORT_LIMIT])
-    return tuple(kept)
+    if not practical_candidates:
+        return ()
+    return tuple(sorted(practical_candidates, key=_candidate_sort_key)[:1])
+
+
+def _anchorless_practical_focus_rescue_candidates(
+    candidates: Sequence[_Candidate],
+    *,
+    focus_terms: Sequence[str],
+) -> tuple[_Candidate, ...]:
+    """Return strong anchorless practical candidates that should remain in focus.
+
+    This rescue is narrower than the generic anchorless support lane: it only
+    applies when continuity-only explainable anchors would otherwise evict the
+    already selected practical multimodal patterns from focus entirely.
+    """
+
+    practical_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.family == "practical"
+        and not _has_explainable_anchor(candidate.anchors)
+        and (
+            candidate.direct_match
+            or candidate.query_score > 0.0
+            or _candidate_specific_score(candidate, focus_terms=focus_terms) > 0.0
+        )
+    ]
+    if not practical_candidates:
+        return ()
+    return tuple(sorted(practical_candidates, key=_candidate_sort_key))
+
+
+def _practical_focus_rescue_candidates(
+    candidates: Sequence[_Candidate],
+    *,
+    focus_terms: Sequence[str],
+) -> tuple[_Candidate, ...]:
+    """Return strong practical candidates when non-practical focus starves them.
+
+    When the current explainable focus anchors come entirely from graph or
+    continuity evidence, practical multimodal patterns can be semantically
+    right for the query yet score as zero against the focus-anchor terms. Use
+    the user-query terms instead and keep the strongest practical candidates in
+    focus so the planner can compare them fairly.
+    """
+
+    practical_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.family == "practical"
+        and (
+            candidate.direct_match
+            or candidate.query_score > 0.0
+            or _candidate_specific_score(candidate, focus_terms=focus_terms) > 0.0
+        )
+    ]
+    if not practical_candidates:
+        return ()
+    return tuple(sorted(practical_candidates, key=_candidate_sort_key))
+
+
+def _continuity_support_debug_entry(
+    candidate: _Candidate,
+    *,
+    focus_terms: Sequence[str],
+) -> dict[str, object]:
+    return {
+        "source": candidate.source,
+        "id": candidate.candidate_id,
+        "label": candidate.label,
+        "query_score": candidate.query_score,
+        "specific_score": _candidate_specific_score(candidate, focus_terms=focus_terms),
+        "selected": candidate.selected,
+        "drop_reason": candidate.drop_reason,
+        "direct_match": candidate.direct_match,
+        "focus_anchor_matches": list(_support_anchor_matches(candidate, metadata_field="focus_anchor_matches")),
+        "support_anchor_matches": list(_support_anchor_matches(candidate, metadata_field="support_anchor_matches")),
+        "support_alignment_strength": _support_alignment_strength(candidate),
+    }
 
 
 def _select_practical_candidates(
@@ -864,14 +1468,18 @@ def build_unified_retrieval_selection(
                     for normalized in (_normalize_text(item) for item in raw_access_path)
                     if normalized
                 )
+            raw_matched_node_ids = graph_plan_fragment.get("matched_node_ids")
+            matched_node_iterable = raw_matched_node_ids if isinstance(raw_matched_node_ids, (list, tuple, set)) else ()
             matched_node_ids = {
                 normalized
-                for normalized in (_normalize_text(item) for item in graph_plan_fragment.get("matched_node_ids", ()))
+                for normalized in (_normalize_text(item) for item in matched_node_iterable)
                 if normalized
             }
+            raw_matched_edge_ids = graph_plan_fragment.get("matched_edge_ids")
+            matched_edge_iterable = raw_matched_edge_ids if isinstance(raw_matched_edge_ids, (list, tuple, set)) else ()
             matched_edge_ids = {
                 normalized
-                for normalized in (_normalize_text(item) for item in graph_plan_fragment.get("matched_edge_ids", ()))
+                for normalized in (_normalize_text(item) for item in matched_edge_iterable)
                 if normalized
             }
         else:
@@ -1042,18 +1650,199 @@ def build_unified_retrieval_selection(
     enriched_candidates = _enrich_candidates(all_candidates, query_terms=query_terms)
     component_by_index = _connected_components(enriched_candidates)
     focus_component_ids = _focus_component_ids(enriched_candidates)
-
-    focus_candidates = tuple(
-        candidate
-        for index, candidate in enumerate(enriched_candidates)
-        if (
-            component_by_index.get(index) in focus_component_ids
-            or (
-                not _has_explainable_anchor(candidate.anchors)
-                and candidate.query_score > 0.0
+    exact_graph_entity_ids = _exact_graph_entity_ids(enriched_candidates)
+    exact_graph_attribute_families = tuple(
+        dict.fromkeys(
+            (
+                *_exact_graph_attribute_families(enriched_candidates),
+                *_query_attribute_families(query_terms),
             )
         )
     )
+    exact_graph_precision_active = bool(
+        exact_graph_entity_ids and exact_graph_attribute_families
+    )
+    exact_graph_support_keys = {
+        (candidate.source, candidate.candidate_id)
+        for candidate in enriched_candidates
+        if candidate.family != "graph"
+        and _candidate_allowed_by_exact_graph_precision(
+            candidate,
+            entity_ids=exact_graph_entity_ids,
+            attribute_families=exact_graph_attribute_families,
+        )
+    }
+    exact_graph_requires_graph_only = exact_graph_precision_active and not exact_graph_support_keys
+
+    base_focus_candidates = tuple(
+        candidate
+        for index, candidate in enumerate(enriched_candidates)
+        if component_by_index.get(index) in focus_component_ids
+        and (
+            not exact_graph_precision_active
+            or candidate.family == "graph"
+            or (candidate.source, candidate.candidate_id) in exact_graph_support_keys
+        )
+    )
+    provisional_focus_anchors = _focus_semantic_anchors(base_focus_candidates, query_terms=query_terms)
+    provisional_generic_subject_focus = _focus_is_generic_subject(provisional_focus_anchors)
+    continuity_only_focus_anchors = _focus_anchors_contributed_only_by_family(
+        base_focus_candidates,
+        focus_anchors=provisional_focus_anchors,
+        family="continuity",
+    )
+    graph_only_focus_anchors = _focus_anchors_contributed_only_by_family(
+        base_focus_candidates,
+        focus_anchors=provisional_focus_anchors,
+        family="graph",
+    )
+    practical_focus_starved = _focus_anchors_lack_family_contributors(
+        base_focus_candidates,
+        focus_anchors=provisional_focus_anchors,
+        family="practical",
+    )
+    continuity_anchorless_practical_rescue = _anchorless_practical_focus_rescue_candidates(
+        enriched_candidates,
+        focus_terms=query_terms,
+    )
+    starved_practical_focus_rescue = _practical_focus_rescue_candidates(
+        enriched_candidates,
+        focus_terms=query_terms,
+    )
+    rescued_anchorless_candidates: tuple[_Candidate, ...] = ()
+    allow_anchorless_focus_rescue = not provisional_focus_anchors or provisional_generic_subject_focus
+    if allow_anchorless_focus_rescue:
+        rescued_anchorless_candidates = tuple(
+            candidate
+            for candidate in enriched_candidates
+            if not _has_explainable_anchor(candidate.anchors)
+            and candidate.query_score > 0.0
+            and (
+                not exact_graph_precision_active
+                or candidate.family == "graph"
+                or (candidate.source, candidate.candidate_id) in exact_graph_support_keys
+            )
+        )
+    elif continuity_only_focus_anchors and continuity_anchorless_practical_rescue:
+        rescued_anchorless_candidates = tuple(
+            candidate
+            for candidate in continuity_anchorless_practical_rescue
+            if not exact_graph_precision_active
+            or candidate.family == "graph"
+            or (candidate.source, candidate.candidate_id) in exact_graph_support_keys
+        )
+    elif practical_focus_starved and starved_practical_focus_rescue:
+        rescued_anchorless_candidates = tuple(
+            {
+                (candidate.source, candidate.candidate_id): candidate
+                for candidate in (
+                    *starved_practical_focus_rescue,
+                    *(
+                        candidate
+                        for candidate in enriched_candidates
+                        if candidate.source == "episodic"
+                        and not _has_explainable_anchor(candidate.anchors)
+                        and candidate.query_score > 0.0
+                        and (
+                            not exact_graph_precision_active
+                            or (candidate.source, candidate.candidate_id) in exact_graph_support_keys
+                        )
+                    ),
+                )
+                if not exact_graph_precision_active
+                or candidate.family == "graph"
+                or (candidate.source, candidate.candidate_id) in exact_graph_support_keys
+            }.values()
+        )
+    else:
+        rescued_anchorless_candidates = tuple(
+            candidate
+            for candidate in enriched_candidates
+            if candidate.source == "episodic"
+            and not _has_explainable_anchor(candidate.anchors)
+            and candidate.query_score > 0.0
+            and (
+                not exact_graph_precision_active
+                or (candidate.source, candidate.candidate_id) in exact_graph_support_keys
+            )
+        )
+    focus_candidates = tuple(
+        {
+            (candidate.source, candidate.candidate_id): candidate
+            for candidate in (*base_focus_candidates, *rescued_anchorless_candidates)
+        }.values()
+    )
+    if continuity_only_focus_anchors and rescued_anchorless_candidates:
+        workflow_decision(
+            msg="twinr_unified_anchorless_practical_focus_rescue",
+            question="Should continuity-only explainable focus anchors suppress strong anchorless practical multimodal evidence?",
+            selected={
+                "id": "rescue_anchorless_practical_focus",
+                "summary": "Keep strong anchorless practical candidates in focus when the only explainable anchors belong to continuity episodes.",
+                "selected_ids": [
+                    f"{candidate.source}:{candidate.candidate_id}"
+                    for candidate in rescued_anchorless_candidates
+                ],
+            },
+            options=[
+                {
+                    "id": f"{candidate.source}:{candidate.candidate_id}",
+                    "summary": candidate.label,
+                    "score_components": {
+                        "query_score": candidate.query_score,
+                        "specific_score": _candidate_specific_score(candidate, focus_terms=query_terms),
+                        "support_sources": len(candidate.support_sources),
+                    },
+                    "constraints_violated": [],
+                }
+                for candidate in rescued_anchorless_candidates[:8]
+            ],
+            context={
+                "focus_anchors": list(provisional_focus_anchors),
+                "continuity_only_focus_anchors": continuity_only_focus_anchors,
+            },
+            confidence="high",
+            guardrails=[
+                "Continuity-only thread anchors must not erase already selected multimodal routine patterns.",
+                "Only anchorless practical candidates with positive lexical or direct evidence may be rescued.",
+            ],
+        )
+    if practical_focus_starved and starved_practical_focus_rescue:
+        workflow_decision(
+            msg="twinr_unified_practical_focus_starvation_rescue",
+            question="Should non-practical focus anchors suppress strong practical multimodal evidence?",
+            selected={
+                "id": "rescue_practical_focus",
+                "summary": "Keep strong practical candidates in focus when the current focus anchors have no practical contributors.",
+                "selected_ids": [
+                    f"{candidate.source}:{candidate.candidate_id}"
+                    for candidate in starved_practical_focus_rescue
+                ],
+            },
+            options=[
+                {
+                    "id": f"{candidate.source}:{candidate.candidate_id}",
+                    "summary": candidate.label,
+                    "score_components": {
+                        "query_score": candidate.query_score,
+                        "specific_score": _candidate_specific_score(candidate, focus_terms=query_terms),
+                        "support_sources": len(candidate.support_sources),
+                    },
+                    "constraints_violated": [],
+                }
+                for candidate in starved_practical_focus_rescue[:8]
+            ],
+            context={
+                "focus_anchors": list(provisional_focus_anchors),
+                "graph_only_focus_anchors": graph_only_focus_anchors,
+                "practical_focus_starved": practical_focus_starved,
+            },
+            confidence="high",
+            guardrails=[
+                "Graph-only or continuity-only anchors must not erase practical multimodal evidence when they carry no practical contributors.",
+                "Only practical candidates with positive lexical or direct evidence may be rescued.",
+            ],
+        )
     focus_anchors = _focus_semantic_anchors(focus_candidates, query_terms=query_terms)
     generic_subject_focus = _focus_is_generic_subject(focus_anchors)
     if generic_subject_focus:
@@ -1061,6 +1850,10 @@ def build_unified_retrieval_selection(
             candidate
             for candidate in enriched_candidates
             if candidate.family == "practical" and not _has_explainable_anchor(candidate.anchors)
+            and (
+                not exact_graph_precision_active
+                or (candidate.source, candidate.candidate_id) in exact_graph_support_keys
+            )
         ]
         if rescued_practical:
             focus_candidates = tuple(
@@ -1069,27 +1862,72 @@ def build_unified_retrieval_selection(
                     for candidate in (*focus_candidates, *rescued_practical)
                 }.values()
             )
+    support_anchors = _support_anchor_targets(
+        focus_candidates,
+        focus_anchors=focus_anchors,
+    )
+    focus_candidates = _annotate_support_anchor_alignment(
+        focus_candidates,
+        focus_anchors=focus_anchors,
+        support_anchors=support_anchors,
+    )
     focus_terms = _focus_query_terms(focus_anchors)
+    effective_selection_terms = focus_terms
+    query_score_fallback_families: tuple[str, ...] = ()
+    if (
+        practical_focus_starved
+        and starved_practical_focus_rescue
+        and not exact_graph_requires_graph_only
+    ):
+        query_score_fallback_families = ("practical",)
     selection_mode, family_scores = _dominant_mode(
         focus_candidates,
-        focus_terms=focus_terms,
+        focus_terms=effective_selection_terms,
         generic_subject_focus=generic_subject_focus,
+        query_score_fallback_families=query_score_fallback_families,
     )
+    forced_mixed_due_to_practical_starvation = False
+    if (
+        selection_mode == "continuity"
+        and practical_focus_starved
+        and starved_practical_focus_rescue
+        and any(candidate.family == "continuity" and candidate.query_score > 0.0 for candidate in focus_candidates)
+        and any(candidate.family == "practical" and candidate.query_score > 0.0 for candidate in focus_candidates)
+    ):
+        # Graph/plan-only anchors may explain the episodic half of a mixed
+        # query, but they must not zero out the rescued practical half once the
+        # planner already proved that strong practical candidates exist outside
+        # those anchors. Keep the final mode at least mixed so combined
+        # multimodal queries can carry both durable and episodic evidence.
+        selection_mode = "mixed"
+        forced_mixed_due_to_practical_starvation = True
+    if exact_graph_requires_graph_only:
+        selection_mode = "graph_only"
 
     selected_candidates: list[_Candidate] = list(_select_graph_candidates(focus_candidates))
     if selection_mode in {"practical", "mixed"}:
         selected_candidates.extend(
             _select_practical_candidates(
                 focus_candidates,
-                focus_terms=focus_terms,
+                focus_terms=effective_selection_terms,
                 allow_upstream_rank_fallback=generic_subject_focus,
+            )
+        )
+        selected_candidates.extend(
+            _select_anchorless_practical_support_candidates(
+                enriched_candidates,
+                focus_terms=query_terms,
+                focus_anchors=focus_anchors,
             )
         )
         selected_candidates.extend(
             _select_support_candidates(
                 focus_candidates,
                 mode=selection_mode,
-                focus_terms=focus_terms,
+                focus_terms=effective_selection_terms,
+                focus_anchors=focus_anchors,
+                support_anchors=support_anchors,
+                practical_focus_starved=practical_focus_starved,
             )
         )
     elif selection_mode == "continuity":
@@ -1097,7 +1935,17 @@ def build_unified_retrieval_selection(
             _select_support_candidates(
                 focus_candidates,
                 mode="continuity",
+                focus_terms=effective_selection_terms,
+                focus_anchors=focus_anchors,
+                support_anchors=support_anchors,
+                practical_focus_starved=practical_focus_starved,
+            )
+        )
+        selected_candidates.extend(
+            _select_connected_practical_support_candidates(
+                focus_candidates,
                 focus_terms=focus_terms,
+                focus_anchors=focus_anchors,
             )
         )
 
@@ -1113,6 +1961,25 @@ def build_unified_retrieval_selection(
         key = (candidate.source, candidate.candidate_id)
         if key in selected_by_key:
             continue
+        if (
+            exact_graph_precision_active
+            and candidate.family != "graph"
+            and key not in exact_graph_support_keys
+        ):
+            dropped_reason_by_key[key] = "vetoed_by_exact_graph_precision_gate"
+            continue
+        if candidate.family == "continuity" and candidate.query_score > 0.0:
+            anchor_aligned = bool(
+                _candidate_support_anchor_matches(
+                    candidate,
+                    focus_anchors=focus_anchors,
+                    support_anchors=support_anchors,
+                )
+            )
+            if not anchor_aligned:
+                if focus_anchors or support_anchors or not _has_explainable_anchor(candidate.anchors):
+                    dropped_reason_by_key[key] = "missing_focus_anchor"
+                    continue
         if component_by_index.get(index) not in focus_component_ids:
             dropped_reason_by_key[key] = "out_of_focus_component"
             continue
@@ -1127,8 +1994,15 @@ def build_unified_retrieval_selection(
             continue
         dropped_reason_by_key[key] = "low_specific_relevance"
 
+    annotated_candidates_by_key = {
+        (candidate.source, candidate.candidate_id): candidate
+        for candidate in focus_candidates
+    }
     marked_candidates = _mark_selection(
-        enriched_candidates,
+        tuple(
+            annotated_candidates_by_key.get((candidate.source, candidate.candidate_id), candidate)
+            for candidate in enriched_candidates
+        ),
         selected_keys=set(selected_by_key),
         dropped_reason_by_key=dropped_reason_by_key,
     )
@@ -1142,6 +2016,59 @@ def build_unified_retrieval_selection(
         for candidate in marked_candidates
         if not candidate.selected
     )
+    continuity_support_candidates = tuple(
+        candidate
+        for candidate in marked_candidates
+        if candidate.family == "continuity"
+    )
+    continuity_support_debug = tuple(
+        _continuity_support_debug_entry(candidate, focus_terms=effective_selection_terms)
+        for candidate in continuity_support_candidates
+    )
+    if continuity_support_debug:
+        workflow_decision(
+            msg="twinr_unified_continuity_support_selection",
+            question="Which continuity candidates should remain attached to the selected focus anchors?",
+            selected={
+                "id": "anchor_aligned_continuity_support",
+                "summary": "Keep only anchor-aligned continuity evidence and allow one anchored episodic carry-through for practical queries.",
+                "selected_ids": [
+                    f"{candidate.source}:{candidate.candidate_id}"
+                    for candidate in continuity_support_candidates
+                    if candidate.selected
+                ],
+            },
+            options=[
+                {
+                    "id": f"{candidate['source']}:{candidate['id']}",
+                    "summary": str(candidate["label"]),
+                    "score_components": {
+                        "query_score": candidate["query_score"],
+                        "specific_score": candidate["specific_score"],
+                        "support_alignment_strength": candidate["support_alignment_strength"],
+                        "direct_match": candidate["direct_match"],
+                    },
+                    "constraints_violated": []
+                    if bool(candidate["selected"])
+                    else ([str(candidate["drop_reason"])] if candidate["drop_reason"] else ["not_selected"]),
+                }
+                for candidate in continuity_support_debug[:8]
+            ],
+            context={
+                "mode": selection_mode,
+                "focus_anchors": list(focus_anchors),
+                "support_anchors": list(support_anchors),
+                "continuity_candidate_count": len(continuity_support_debug),
+            },
+            confidence="high",
+            guardrails=[
+                "Continuity support must stay attached to the selected semantic focus.",
+                "Practical queries may carry one anchor-backed episodic continuity item even when lexical overlap is weak.",
+            ],
+            kpi_impact_estimate={
+                "top_episodic_support_limit": _TOP_EPISODIC_SUPPORT_LIMIT,
+            },
+        )
 
     score_by_candidate_id = {
         (candidate.source, candidate.candidate_id): candidate.query_score
@@ -1232,7 +2159,7 @@ def build_unified_retrieval_selection(
         query_terms=query_terms,
         focus_anchors=focus_anchors,
     )
-    query_plan = {
+    query_plan: dict[str, object] = {
         "schema": "twinr_unified_retrieval_plan_v1",
         "mode": "internal_unified_selection",
         "query_texts": list(query_texts),
@@ -1287,12 +2214,48 @@ def build_unified_retrieval_selection(
             "mode": selection_mode,
             "query_terms": list(query_terms),
             "focus_anchors": list(focus_anchors),
+            "provisional_focus_anchors": list(provisional_focus_anchors),
             "focus_query_terms": list(focus_terms),
+            "effective_selection_terms": list(effective_selection_terms),
             "focus_component_ids": sorted(focus_component_ids),
             "family_scores": family_scores,
+            "continuity_only_focus_anchors": continuity_only_focus_anchors,
+            "graph_only_focus_anchors": graph_only_focus_anchors,
+            "practical_focus_starved": practical_focus_starved,
+            "exact_graph_precision_gate": exact_graph_precision_active,
+            "exact_graph_precision_entity_ids": list(exact_graph_entity_ids),
+            "exact_graph_precision_attribute_families": list(exact_graph_attribute_families),
+            "exact_graph_precision_support_ids": sorted(
+                f"{source}:{candidate_id}"
+                for source, candidate_id in exact_graph_support_keys
+            ),
+            "family_mode_query_score_fallback": bool(query_score_fallback_families),
+            "family_mode_query_score_fallback_families": list(query_score_fallback_families),
+            "forced_mixed_due_to_practical_starvation": forced_mixed_due_to_practical_starvation,
+            "anchorless_practical_focus_rescue_ids": [
+                f"{candidate.source}:{candidate.candidate_id}"
+                for candidate in rescued_anchorless_candidates
+                if candidate.family == "practical"
+                and not _has_explainable_anchor(candidate.anchors)
+            ],
+            "practical_focus_rescue_ids": [
+                f"{candidate.source}:{candidate.candidate_id}"
+                for candidate in rescued_anchorless_candidates
+                if candidate.family == "practical"
+            ],
             "candidate_count_before_prune": len(enriched_candidates),
             "candidate_count_after_prune": len(kept_candidates),
             "dropped_candidate_count": len(dropped_candidates),
+        },
+        "continuity_support": {
+            "schema": "twinr_unified_continuity_support_v1",
+            "mode": selection_mode,
+            "selected_ids": [
+                f"{candidate.source}:{candidate.candidate_id}"
+                for candidate in continuity_support_candidates
+                if candidate.selected
+            ],
+            "candidates": list(continuity_support_debug),
         },
         "graph_query_plan": graph_plan_fragment,
     }

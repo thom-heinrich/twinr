@@ -75,7 +75,7 @@ class GestureAckLaneTests(unittest.TestCase):
                 observation=_authoritative_observation(
                     token=1,
                     fine=SocialFineHandGesture.THUMBS_UP,
-                    fine_confidence=0.52,
+                    fine_confidence=0.68,
                 ),
             )
             held = lane.observe(
@@ -83,7 +83,7 @@ class GestureAckLaneTests(unittest.TestCase):
                 observation=_authoritative_observation(
                     token=1,
                     fine=SocialFineHandGesture.THUMBS_UP,
-                    fine_confidence=0.48,
+                    fine_confidence=0.69,
                 ),
             )
 
@@ -92,7 +92,7 @@ class GestureAckLaneTests(unittest.TestCase):
         self.assertFalse(held.active)
         self.assertEqual(held.reason, "live_gesture_already_active")
 
-    def test_lane_accepts_pi_tuned_thumb_confidence_band(self) -> None:
+    def test_lane_uses_conservative_runtime_calibration_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             lane = GestureAckLane.from_config(TwinrConfig(project_root=temp_dir))
 
@@ -101,7 +101,7 @@ class GestureAckLaneTests(unittest.TestCase):
                 observation=_authoritative_observation(
                     token=1,
                     fine=SocialFineHandGesture.THUMBS_UP,
-                    fine_confidence=0.48,
+                    fine_confidence=0.68,
                 ),
             )
             thumbs_down = lane.observe(
@@ -109,7 +109,7 @@ class GestureAckLaneTests(unittest.TestCase):
                 observation=_authoritative_observation(
                     token=2,
                     fine=SocialFineHandGesture.THUMBS_DOWN,
-                    fine_confidence=0.446,
+                    fine_confidence=0.78,
                 ),
             )
 
@@ -118,7 +118,7 @@ class GestureAckLaneTests(unittest.TestCase):
         self.assertTrue(thumbs_down.active)
         self.assertEqual(thumbs_down.symbol.value, "thumbs_down")
 
-    def test_lane_still_blocks_weak_thumbs_below_pi_floor(self) -> None:
+    def test_lane_blocks_weak_thumbs_below_runtime_calibration_floor(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             lane = GestureAckLane.from_config(TwinrConfig(project_root=temp_dir))
 
@@ -127,7 +127,7 @@ class GestureAckLaneTests(unittest.TestCase):
                 observation=_authoritative_observation(
                     token=1,
                     fine=SocialFineHandGesture.THUMBS_UP,
-                    fine_confidence=0.47,
+                    fine_confidence=0.67,
                 ),
             )
             weak_thumbs_down = lane.observe(
@@ -135,7 +135,7 @@ class GestureAckLaneTests(unittest.TestCase):
                 observation=_authoritative_observation(
                     token=2,
                     fine=SocialFineHandGesture.THUMBS_DOWN,
-                    fine_confidence=0.36,
+                    fine_confidence=0.56,
                 ),
             )
 
@@ -143,6 +143,37 @@ class GestureAckLaneTests(unittest.TestCase):
         self.assertEqual(weak_thumbs_up.reason, "no_supported_live_gesture")
         self.assertFalse(weak_thumbs_down.active)
         self.assertEqual(weak_thumbs_down.reason, "no_supported_live_gesture")
+
+    def test_lane_explicit_global_override_can_lower_supported_fine_gesture_floor(self) -> None:
+        lane = GestureAckLane.from_config(
+            {
+                "gesture_ack_lane": {
+                    "min_fine_confidence": 0.44,
+                }
+            }
+        )
+
+        thumbs_up = lane.observe(
+            observed_at=10.0,
+            observation=_authoritative_observation(
+                token=1,
+                fine=SocialFineHandGesture.THUMBS_UP,
+                fine_confidence=0.48,
+            ),
+        )
+        thumbs_down = lane.observe(
+            observed_at=11.0,
+            observation=_authoritative_observation(
+                token=2,
+                fine=SocialFineHandGesture.THUMBS_DOWN,
+                fine_confidence=0.446,
+            ),
+        )
+
+        self.assertTrue(thumbs_up.active)
+        self.assertEqual(thumbs_up.symbol.value, "thumbs_up")
+        self.assertTrue(thumbs_down.active)
+        self.assertEqual(thumbs_down.symbol.value, "thumbs_down")
 
     def test_lane_applies_repeat_hold_across_new_tokens_for_same_symbol(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -156,7 +187,7 @@ class GestureAckLaneTests(unittest.TestCase):
                     observation=_authoritative_observation(
                         token=1,
                         fine=SocialFineHandGesture.PEACE_SIGN,
-                        fine_confidence=0.60,
+                        fine_confidence=0.78,
                     ),
                 )
                 cooldown = lane.observe(
@@ -164,7 +195,7 @@ class GestureAckLaneTests(unittest.TestCase):
                     observation=_authoritative_observation(
                         token=2,
                         fine=SocialFineHandGesture.PEACE_SIGN,
-                        fine_confidence=0.61,
+                        fine_confidence=0.79,
                     ),
                 )
                 still_same = lane.observe(
@@ -172,7 +203,7 @@ class GestureAckLaneTests(unittest.TestCase):
                     observation=_authoritative_observation(
                         token=2,
                         fine=SocialFineHandGesture.PEACE_SIGN,
-                        fine_confidence=0.61,
+                        fine_confidence=0.79,
                     ),
                 )
                 replay = lane.observe(
@@ -180,7 +211,7 @@ class GestureAckLaneTests(unittest.TestCase):
                     observation=_authoritative_observation(
                         token=3,
                         fine=SocialFineHandGesture.PEACE_SIGN,
-                        fine_confidence=0.62,
+                        fine_confidence=0.80,
                     ),
                 )
 

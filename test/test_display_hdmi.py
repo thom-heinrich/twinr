@@ -36,6 +36,7 @@ from twinr.display.hdmi_default_scene import HdmiStatusPanelModel
 from twinr.display.hdmi_wayland import HdmiWaylandDisplay
 from twinr.display.presentation_cues import DisplayPresentationCardCue, DisplayPresentationCue
 from twinr.display.service_connect_cues import DisplayServiceConnectCue
+from twinr.display.wake_cues import DisplayWakeCue
 from twinr.display.wayland_env import apply_wayland_environment, resolve_wayland_socket
 
 
@@ -227,6 +228,32 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         self.assertGreater(dark_pixels, 300000)
         self.assertGreater(face_bright, 9000)
         self.assertLess(panel_bright, 2000)
+
+    def test_render_status_image_uses_dark_blue_background_for_listening_and_speculative_waiting(
+        self,
+    ) -> None:
+        display = self.make_display()
+
+        listening = display.render_status_image(
+            status="listening",
+            headline="Listening",
+            details=("Internet ok",),
+            state_fields=(("Status", "Listening"),),
+            log_sections=(),
+            animation_frame=0,
+        )
+        speculative = display.render_status_image(
+            status="waiting",
+            headline="Waiting",
+            details=("Internet ok",),
+            state_fields=(("Status", "Waiting"),),
+            log_sections=(),
+            animation_frame=0,
+            wake_cue=DisplayWakeCue(source="voice_orchestrator"),
+        )
+
+        self.assertEqual(listening.getpixel((10, 10)), (8, 28, 92))
+        self.assertEqual(speculative.getpixel((10, 10)), (8, 28, 92))
 
     def test_prompt_mode_panel_has_no_left_accent_bar_and_uses_one_large_text_scale(self) -> None:
         renderer = HdmiDefaultSceneRenderer(tools=_FakeSceneTools())
@@ -2000,6 +2027,87 @@ class HdmiWaylandDisplayTests(unittest.TestCase):
         self.assertEqual(len(native_calls), 2)
         self.assertTrue(all(bool(call["replace"]) for call in native_calls))
         self.assertIn("frame_px=2x2", str(native_calls[0]["owner_detail"]))
+
+    def test_show_status_records_runtime_trace_boundaries_for_native_raster_path(self) -> None:
+        class _FakeApp:
+            def __init__(self) -> None:
+                self.process_events_calls = 0
+
+            def processEvents(self) -> None:
+                self.process_events_calls += 1
+
+        class _FakeWindow:
+            def __init__(self) -> None:
+                self.ensure_visible_calls = 0
+                self.frames: list[tuple[bytes, int, int]] = []
+
+            def ensure_visible(self) -> None:
+                self.ensure_visible_calls += 1
+
+            def set_frame(self, rgba_bytes: bytes, width: int, height: int) -> None:
+                self.frames.append((rgba_bytes, width, height))
+
+            def frame_telemetry(self) -> str:
+                return "window_kind=qrasterwindow window_px=320x240 frame_px=320x240"
+
+            def isExposed(self) -> bool:
+                return True
+
+        display = HdmiWaylandDisplay(
+            width=320,
+            height=240,
+            wayland_display="wayland-0",
+            wayland_runtime_dir="/run/user/1000",
+            runtime_trace_enabled=True,
+        )
+        fake_app = _FakeApp()
+        fake_window = _FakeWindow()
+        display._qt_app = fake_app
+        display._qt_window = fake_window
+        display._qt_binding_name = "pyqt5"
+
+        with mock.patch.object(HdmiWaylandDisplay, "_load_qt", return_value=(object(), object(), object())):
+            with mock.patch.object(HdmiWaylandDisplay, "_ensure_qt_window", return_value=fake_window):
+                with mock.patch("twinr.display.hdmi_wayland._supports_native_raster_window", return_value=True):
+                    display.show_status(
+                        "listening",
+                        headline="Listening",
+                        state_fields=(
+                            ("Status", "Listening"),
+                            ("Internet", "ok"),
+                            ("AI", "ok"),
+                            ("System", "ok"),
+                            ("Zeit", "12:34"),
+                        ),
+                    )
+
+        trace = display.consume_runtime_trace()
+
+        self.assertIsNotNone(trace)
+        assert trace is not None
+        self.assertEqual(trace["status"], "listening")
+        self.assertEqual(trace["driver"], "hdmi_wayland")
+        self.assertEqual(trace["surface_source"], "status")
+        self.assertEqual(trace["headline"], "Listening")
+        self.assertTrue(bool(trace["native_raster_window"]))
+        self.assertFalse(bool(trace["surface_host"]))
+        self.assertTrue(bool(trace["window_exposed_after_process_events"]))
+        self.assertEqual(trace["qt_binding"], "pyqt5")
+        self.assertEqual(fake_app.process_events_calls, 1)
+        self.assertEqual(fake_window.ensure_visible_calls, 1)
+        self.assertEqual(len(fake_window.frames), 1)
+        for start_key, end_key in (
+            ("show_status_started_monotonic_ns", "show_status_completed_monotonic_ns"),
+            ("render_status_image_started_monotonic_ns", "render_status_image_completed_monotonic_ns"),
+            ("show_image_started_monotonic_ns", "show_image_completed_monotonic_ns"),
+            ("process_events_started_monotonic_ns", "process_events_completed_monotonic_ns"),
+        ):
+            self.assertLessEqual(int(trace[start_key]), int(trace[end_key]))
+        self.assertEqual(
+            int(trace["backend_presented_monotonic_ns"]),
+            int(trace["process_events_completed_monotonic_ns"]),
+        )
+        self.assertIsNone(display.consume_runtime_trace())
 
     def test_resolve_wayland_socket_prefers_configured_runtime_dir(self) -> None:
         with mock.patch.dict("os.environ", {}, clear=True):

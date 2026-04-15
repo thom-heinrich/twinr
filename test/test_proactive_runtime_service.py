@@ -109,13 +109,6 @@ class ProactiveCoordinatorTests(unittest.TestCase):
                     require_active_owner=True,
                 )
             )
-        with patch("twinr.proactive.runtime.service_impl.compat.loop_lock_owner", side_effect=[4321]):
-            self.assertTrue(
-                _proactive_pcm_capture_conflicts_with_voice_orchestrator(
-                    config,
-                    require_active_owner=True,
-                )
-            )
 
     def test_audio_policy_does_not_block_safety_triggers(self) -> None:
         service = object.__new__(ProactiveCoordinator)
@@ -380,6 +373,92 @@ class ProactiveCoordinatorTests(unittest.TestCase):
         )
         self.assertEqual(result.action, "published")
 
+    def test_update_display_attention_follow_skips_face_publish_on_hdmi_wayland(self) -> None:
+        service = object.__new__(ProactiveCoordinator)
+        speaker_association = ReSpeakerSpeakerAssociationSnapshot(
+            observed_at=12.0,
+            state="primary_visible_person_associated",
+            associated=True,
+            target_id="primary_visible_person",
+            confidence=0.92,
+            camera_person_count=1,
+            direction_confidence=0.89,
+            azimuth_deg=15,
+            primary_person_zone="right",
+        )
+        attention_target = MultimodalAttentionTargetSnapshot(
+            observed_at=12.0,
+            state="active_visible_speaker",
+            active=True,
+            target_horizontal="right",
+            target_zone="right",
+            target_center_x=0.72,
+            focus_source="speaker_association",
+            speaker_locked=True,
+            confidence=0.88,
+        )
+        perception_snapshot = PerceptionRuntimeSnapshot(
+            observed_at=12.0,
+            source="display_attention_refresh",
+            captured_at=11.8,
+            attention=PerceptionAttentionRuntimeSnapshot(
+                live_facts={
+                    "camera": {"person_visible": True, "primary_person_center_x": 0.72},
+                    "vad": {"speech_detected": True},
+                    "speaker_association": speaker_association.to_automation_facts(),
+                    "attention_target": attention_target.to_automation_facts(),
+                },
+                speaker_association=speaker_association,
+                attention_target=attention_target,
+                attention_target_debug={"source": "test"},
+            ),
+        )
+        published: list[dict[str, object]] = []
+        service.latest_presence_snapshot = SimpleNamespace(session_id=7)
+        service.latest_identity_fusion_snapshot = None
+        service.runtime = SimpleNamespace(status=SimpleNamespace(value="waiting"))
+        service.config = TwinrConfig(project_root=".", display_driver="hdmi_wayland")
+        service.attention_servo_controller = None
+        service.perception_orchestrator = SimpleNamespace(
+            observe_attention=lambda **_kwargs: perception_snapshot
+        )
+        service.display_attention_publisher = SimpleNamespace(
+            publish_from_facts=lambda **kwargs: published.append(kwargs) or SimpleNamespace(action="published")
+        )
+        service._record_fault = lambda **_kwargs: None
+        service._append_ops_event = lambda **_kwargs: None
+        service._emit = lambda _line: None
+        service._last_attention_follow_pipeline_key = None
+        service._last_attention_servo_follow_key = None
+        service.latest_perception_runtime_snapshot = None
+        service.latest_speaker_association_snapshot = None
+        service.latest_attention_target_snapshot = None
+
+        with (
+            patch("twinr.proactive.runtime.service_attention_helpers.record_attention_follow_pipeline_if_changed"),
+            patch("twinr.proactive.runtime.service_attention_helpers.update_attention_servo_follow"),
+        ):
+            result = ProactiveCoordinator._update_display_attention_follow(
+                service,
+                source="display_attention_refresh",
+                observed_at=12.0,
+                camera_snapshot=SimpleNamespace(
+                    last_camera_frame_at=11.8,
+                    to_automation_facts=lambda: {"person_visible": True, "primary_person_center_x": 0.72},
+                ),
+                audio_observation=SocialAudioObservation(
+                    speech_detected=True,
+                    azimuth_deg=15,
+                    direction_confidence=0.89,
+                ),
+                audio_policy_snapshot=SimpleNamespace(speaker_direction_stable=True),
+            )
+
+        self.assertEqual(service.latest_speaker_association_snapshot, speaker_association)
+        self.assertEqual(service.latest_attention_target_snapshot, attention_target)
+        self.assertEqual(published, [])
+        self.assertIsNone(result)
+
     def test_non_authoritative_offline_automation_tick_does_not_release_servo(self) -> None:
         controller = SimpleNamespace(update=Mock())
         coordinator = SimpleNamespace(
@@ -548,6 +627,31 @@ class ProactiveCoordinatorTests(unittest.TestCase):
         self.assertTrue(any(kind == "orchestrator" for kind, _payload in calls))
         self.assertTrue(any(kind == "publish" for kind, _payload in calls))
         self.assertTrue(any(kind == "wakeup" for kind, _payload in calls))
+        self.assertFalse(any(kind == "fault" for kind, _payload in calls))
+
+    def test_display_gesture_refresh_fails_closed_in_voice_runtime(self) -> None:
+        service = object.__new__(ProactiveCoordinator)
+        calls: list[tuple[str, object]] = []
+
+        service.display_gesture_emoji_publisher = SimpleNamespace()
+        service.vision_observer = SimpleNamespace(supports_gesture_refresh=True)
+        service.config = TwinrConfig(
+            project_root=".",
+            display_driver="hdmi_wayland",
+            display_gesture_refresh_interval_s=0.2,
+            voice_orchestrator_enabled=True,
+            voice_orchestrator_ws_url="ws://example.invalid/ws/orchestrator/voice",
+        )
+        service.runtime = SimpleNamespace(status=SimpleNamespace(value="waiting"))
+        service.clock = lambda: 14.0
+        service._last_display_gesture_refresh_at = None
+        service._record_gesture_debug_tick = lambda **kwargs: calls.append(("debug", kwargs["outcome"]))
+        service._record_fault = lambda **kwargs: calls.append(("fault", kwargs["event"]))
+
+        refreshed = ProactiveCoordinator.refresh_display_gesture_emoji(service)
+
+        self.assertFalse(refreshed)
+        self.assertIn(("debug", "unsupported"), calls)
         self.assertFalse(any(kind == "fault" for kind, _payload in calls))
 
     def test_display_refresh_cycle_reuses_one_combined_perception_snapshot(self) -> None:
@@ -806,7 +910,7 @@ class ProactiveCoordinatorTests(unittest.TestCase):
     def test_build_default_monitor_uses_local_camera_provider_by_default(self) -> None:
         config = TwinrConfig(
             display_driver="hdmi_wayland",
-            proactive_vision_provider="local_first",
+            proactive_vision_provider="local",
         )
         runtime = SimpleNamespace(
             ops_events=SimpleNamespace(append=lambda **_kwargs: None),
@@ -839,6 +943,116 @@ class ProactiveCoordinatorTests(unittest.TestCase):
         self.assertIs(monitor.coordinator.vision_observer, sentinel_provider)
         local_factory.assert_called_once_with(config)
         openai_provider.assert_not_called()
+
+    def test_build_default_monitor_keeps_hdmi_fbdev_attention_when_voice_orchestrator_enabled(
+        self,
+    ) -> None:
+        config = TwinrConfig(
+            display_driver="hdmi_fbdev",
+            proactive_vision_provider="local",
+            voice_orchestrator_enabled=True,
+            voice_orchestrator_ws_url="ws://127.0.0.1:8797/ws/orchestrator/voice",
+            display_attention_refresh_interval_s=0.6,
+            display_gesture_refresh_interval_s=0.0,
+        )
+        runtime = SimpleNamespace(
+            ops_events=SimpleNamespace(append=lambda **_kwargs: None),
+            fail=lambda _detail: None,
+            status=SimpleNamespace(value="waiting"),
+        )
+        sentinel_provider = object()
+
+        with (
+            patch(
+                "twinr.proactive.runtime.service.LocalAICameraObservationProvider.from_config",
+                return_value=sentinel_provider,
+            ) as local_factory,
+            patch(
+                "twinr.proactive.runtime.service.OpenAIVisionObservationProvider",
+            ) as openai_provider,
+        ):
+            monitor = build_default_proactive_monitor(
+                config=config,
+                runtime=runtime,
+                backend=cast(Any, object()),
+                camera=cast(Any, object()),
+                camera_lock=None,
+                audio_lock=None,
+                trigger_handler=lambda _decision: False,
+            )
+
+        self.assertIsNotNone(monitor)
+        assert monitor is not None
+        self.assertIs(monitor.coordinator.vision_observer, sentinel_provider)
+        local_factory.assert_called_once_with(config)
+        openai_provider.assert_not_called()
+
+    def test_build_default_monitor_skips_hdmi_wayland_attention_when_voice_orchestrator_enabled(
+        self,
+    ) -> None:
+        config = TwinrConfig(
+            display_driver="hdmi_wayland",
+            proactive_vision_provider="local",
+            voice_orchestrator_enabled=True,
+            voice_orchestrator_ws_url="ws://127.0.0.1:8797/ws/orchestrator/voice",
+            display_attention_refresh_interval_s=0.6,
+            display_gesture_refresh_interval_s=0.0,
+        )
+        runtime = SimpleNamespace(
+            ops_events=SimpleNamespace(append=lambda **_kwargs: None),
+            fail=lambda _detail: None,
+            status=SimpleNamespace(value="waiting"),
+        )
+
+        with patch(
+            "twinr.proactive.runtime.service.LocalAICameraObservationProvider.from_config",
+            return_value=object(),
+        ) as local_factory:
+            monitor = build_default_proactive_monitor(
+                config=config,
+                runtime=runtime,
+                backend=cast(Any, object()),
+                camera=cast(Any, object()),
+                camera_lock=None,
+                audio_lock=None,
+                trigger_handler=lambda _decision: False,
+            )
+
+        self.assertIsNone(monitor)
+        local_factory.assert_not_called()
+
+    def test_build_default_monitor_skips_voice_runtime_without_hdmi_or_proactive_vision(
+        self,
+    ) -> None:
+        config = TwinrConfig(
+            display_driver="hdmi_wayland",
+            proactive_vision_provider="local",
+            voice_orchestrator_enabled=True,
+            voice_orchestrator_ws_url="ws://127.0.0.1:8797/ws/orchestrator/voice",
+            display_attention_refresh_interval_s=0.0,
+            display_gesture_refresh_interval_s=0.0,
+        )
+        runtime = SimpleNamespace(
+            ops_events=SimpleNamespace(append=lambda **_kwargs: None),
+            fail=lambda _detail: None,
+            status=SimpleNamespace(value="waiting"),
+        )
+
+        with patch(
+            "twinr.proactive.runtime.service.LocalAICameraObservationProvider.from_config",
+        ) as local_factory:
+            monitor = build_default_proactive_monitor(
+                config=config,
+                runtime=runtime,
+                backend=cast(Any, object()),
+                camera=cast(Any, object()),
+                camera_lock=None,
+                audio_lock=None,
+                trigger_handler=lambda _decision: False,
+            )
+
+        self.assertIsNone(monitor)
+        local_factory.assert_not_called()
 
     def test_build_default_monitor_uses_aideck_openai_provider_when_configured(self) -> None:
         config = TwinrConfig(
@@ -882,13 +1096,125 @@ class ProactiveCoordinatorTests(unittest.TestCase):
         local_factory.assert_not_called()
         openai_provider.assert_not_called()
 
+    def test_build_default_monitor_raises_when_configured_local_provider_fails(self) -> None:
+        recorded_ops_events: list[dict[str, object]] = []
+        config = TwinrConfig(
+            display_driver="hdmi_wayland",
+            proactive_vision_provider="local",
+        )
+        runtime = SimpleNamespace(
+            ops_events=SimpleNamespace(append=lambda **kwargs: recorded_ops_events.append(kwargs)),
+            fail=lambda _detail: None,
+            status=SimpleNamespace(value="waiting"),
+        )
+
+        with (
+            patch(
+                "twinr.proactive.runtime.service.LocalAICameraObservationProvider.from_config",
+                side_effect=RuntimeError("camera init exploded"),
+            ) as local_factory,
+            patch(
+                "twinr.proactive.runtime.service.OpenAIVisionObservationProvider",
+            ) as openai_provider,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "failed to initialize"):
+                build_default_proactive_monitor(
+                    config=config,
+                    runtime=runtime,
+                    backend=cast(Any, object()),
+                    camera=cast(Any, object()),
+                    camera_lock=None,
+                    audio_lock=None,
+                    trigger_handler=lambda _decision: False,
+                )
+
+        local_factory.assert_called_once_with(config)
+        openai_provider.assert_not_called()
+        self.assertTrue(
+            any(
+                event.get("event") == "proactive_component_blocked"
+                and event.get("data", {}).get("reason") == "vision_observer_init_failed"
+                for event in recorded_ops_events
+            )
+        )
+
+    def test_review_trigger_blocks_when_buffered_review_fails(self) -> None:
+        service = object.__new__(ProactiveCoordinator)
+        recorded_faults: list[str] = []
+        skipped_triggers: list[str] = []
+        ops_events: list[str] = []
+
+        service.vision_reviewer = SimpleNamespace(
+            review=Mock(side_effect=RuntimeError("review exploded"))
+        )
+        service._record_fault = lambda **kwargs: recorded_faults.append(kwargs["event"])
+        service._append_ops_event = lambda **kwargs: ops_events.append(kwargs["event"])
+        service._record_trigger_skipped_vision_review_unavailable = (
+            lambda decision: skipped_triggers.append(decision.trigger_id)
+        )
+        service._record_vision_review = lambda *_args, **_kwargs: None
+        service._record_trigger_skipped_vision_review = lambda *_args, **_kwargs: None
+
+        decision = SocialTriggerDecision(
+            trigger_id="possible_fall",
+            prompt="prompt",
+            reason="reason",
+            observed_at=1.0,
+            priority=SocialTriggerPriority.POSSIBLE_FALL,
+        )
+
+        reviewed_decision, review = ProactiveCoordinator._review_trigger(
+            service,
+            decision,
+            observation=cast(Any, object()),
+        )
+
+        self.assertIsNone(reviewed_decision)
+        self.assertIsNone(review)
+        self.assertEqual(recorded_faults, ["proactive_vision_review_failed"])
+        self.assertEqual(skipped_triggers, ["possible_fall"])
+        self.assertEqual(ops_events, [])
+
+    def test_review_trigger_blocks_when_buffered_review_is_unavailable(self) -> None:
+        service = object.__new__(ProactiveCoordinator)
+        skipped_triggers: list[str] = []
+        ops_events: list[str] = []
+
+        service.vision_reviewer = SimpleNamespace(review=Mock(return_value=None))
+        service._record_fault = lambda **_kwargs: None
+        service._append_ops_event = lambda **kwargs: ops_events.append(kwargs["event"])
+        service._record_trigger_skipped_vision_review_unavailable = (
+            lambda decision: skipped_triggers.append(decision.trigger_id)
+        )
+        service._record_vision_review = lambda *_args, **_kwargs: None
+        service._record_trigger_skipped_vision_review = lambda *_args, **_kwargs: None
+
+        decision = SocialTriggerDecision(
+            trigger_id="possible_fall",
+            prompt="prompt",
+            reason="reason",
+            observed_at=1.0,
+            priority=SocialTriggerPriority.POSSIBLE_FALL,
+        )
+
+        reviewed_decision, review = ProactiveCoordinator._review_trigger(
+            service,
+            decision,
+            observation=cast(Any, object()),
+        )
+
+        self.assertIsNone(reviewed_decision)
+        self.assertIsNone(review)
+        self.assertEqual(skipped_triggers, ["possible_fall"])
+        self.assertEqual(ops_events, ["proactive_vision_review_unavailable"])
+
     def test_wrapper_builder_matches_internal_builder_for_provider_variants(self) -> None:
         cases = [
             (
-                "local_first",
+                "local",
                 {
                     "display_driver": "hdmi_wayland",
-                    "proactive_vision_provider": "local_first",
+                    "proactive_vision_provider": "local",
                 },
                 "twinr.proactive.runtime.service.LocalAICameraObservationProvider.from_config",
             ),

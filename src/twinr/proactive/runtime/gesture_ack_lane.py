@@ -9,6 +9,7 @@
 # IMP-2: Prefer authoritative rising-edge metadata when available to reduce duplicate emits on tracker/token churn.
 # IMP-3: Rate-limit repeated forensics ledger entries and sanitize trace fields for edge-device robustness.
 # BUG-6: Reject user-facing HDMI emoji emits when the authoritative gesture stream lacks current hand evidence or only resolves through stale/slow rescue sources.
+# BUG-7: Keep runtime gesture calibration authoritative for HDMI acknowledgements; do not weaken conservative defaults against legacy fallback floors.
 
 """Consume authoritative gesture-stream activations for HDMI emoji acknowledgement."""
 
@@ -18,7 +19,8 @@ import math
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, SupportsFloat, SupportsIndex, cast
+from enum import Enum
+from typing import Any, SupportsFloat, SupportsIndex, TypeVar, cast
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.workflows.forensics import workflow_decision
@@ -57,6 +59,7 @@ _DEFAULT_MIN_COARSE_CONFIDENCE = 0.50
 _DEFAULT_STALE_ACTIVATION_AFTER_S = 2.00
 _DEFAULT_TRACE_REPEAT_INTERVAL_S = 0.75
 _DEFAULT_TRACE_STRING_MAX_LEN = 96
+_EnumT = TypeVar("_EnumT", bound=Enum)
 
 
 @dataclass(frozen=True, slots=True)
@@ -588,7 +591,10 @@ def _resolve_fine_hand_min_confidence_by_gesture(
             fallback_hold_s=fallback_policy.hold_s,
             fallback_min_visible_s=fallback_policy.min_visible_s,
         )
-        resolved[gesture] = min(calibrated_policy.min_confidence, fallback_policy.min_confidence)
+        # Runtime calibration is the authoritative gate. The HDMI fallback policy
+        # only fills gaps for missing config, it must not silently weaken the
+        # conservative defaults that keep ambiguous hand postures from surfacing.
+        resolved[gesture] = calibrated_policy.min_confidence
     return resolved
 
 
@@ -650,8 +656,8 @@ def _coerce_supported_coarse_gestures(
 def _coerce_supported_gestures(
     value: object,
     *,
-    enum_type: type,
-) -> frozenset[object] | None:
+    enum_type: type[_EnumT],
+) -> frozenset[_EnumT] | None:
     if value is None:
         return None
     if isinstance(value, str):
@@ -661,7 +667,7 @@ def _coerce_supported_gestures(
     else:
         return None
 
-    resolved: list[object] = []
+    resolved: list[_EnumT] = []
     for raw_item in raw_items:
         gesture = _coerce_enum_member(enum_type, raw_item)
         if gesture is not None:
@@ -669,7 +675,7 @@ def _coerce_supported_gestures(
     return frozenset(resolved)
 
 
-def _coerce_enum_member(enum_type: type, value: object) -> object | None:
+def _coerce_enum_member(enum_type: type[_EnumT], value: object) -> _EnumT | None:
     if value is None:
         return None
     try:

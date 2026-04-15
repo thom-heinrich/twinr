@@ -16,6 +16,7 @@ from .constants import (
     SUPPORTED_DISPLAY_DRIVERS,
     GPIO_DISPLAY_DRIVERS,
     DEFAULT_OPENAI_MAIN_MODEL,
+    DEFAULT_OPENAI_SEARCH_MODEL,
     DEFAULT_VOICE_ACTIVATION_PHRASES,
 )
 from .loading import load_twinr_config
@@ -133,7 +134,7 @@ class TwinrConfig:
     streaming_final_lane_watchdog_timeout_ms: int = 4000
     streaming_final_lane_hard_timeout_ms: int = 15000
     streaming_search_final_lane_watchdog_timeout_ms: int = 6000
-    streaming_search_final_lane_hard_timeout_ms: int = 30000
+    streaming_search_final_lane_hard_timeout_ms: int = 90000
     realtime_sensitive_tools_require_identity: bool = True
     realtime_sensitive_tools_start_authorized: bool = False
     realtime_sensitive_tool_fragments: tuple[str, ...] = ()
@@ -145,6 +146,7 @@ class TwinrConfig:
     streaming_supervisor_prefetch_enabled: bool = True
     streaming_supervisor_prefetch_min_chars: int = 8
     streaming_supervisor_prefetch_wait_ms: int = 80
+    streaming_supervisor_prefetch_hard_timeout_ms: int | None = 2000
     streaming_specialist_model: str | None = None
     streaming_specialist_reasoning_effort: str | None = "low"
     local_semantic_router_mode: str = "off"
@@ -190,7 +192,7 @@ class TwinrConfig:
     audio_follow_up_speech_start_chunks: int = 1
     audio_follow_up_ignore_ms: int = 0
     openai_enable_web_search: bool = False
-    openai_search_model: str = ""
+    openai_search_model: str = DEFAULT_OPENAI_SEARCH_MODEL
     openai_web_search_context_size: str = "medium"
     openai_search_max_output_tokens: int = 1024
     openai_search_retry_max_output_tokens: int = 1536
@@ -240,6 +242,7 @@ class TwinrConfig:
     voice_orchestrator_remote_asr_mode: str = "active_listening"
     voice_orchestrator_remote_asr_retry_attempts: int = 1
     voice_orchestrator_remote_asr_retry_backoff_s: float = 0.35
+    voice_orchestrator_send_timeout_s: float = 2.0
     voice_orchestrator_intent_stage1_window_bonus_ms: int = 400
     voice_orchestrator_intent_min_wake_duration_relief_ms: int = 100
     voice_orchestrator_intent_follow_up_timeout_bonus_s: float = 1.5
@@ -296,7 +299,7 @@ class TwinrConfig:
     portrait_match_temporal_max_observations: int = 12
     openai_vision_detail: str = "auto"
     proactive_enabled: bool = False
-    proactive_vision_provider: str = "local_first"
+    proactive_vision_provider: str = "local"
     proactive_remote_camera_base_url: str | None = None
     proactive_remote_camera_timeout_s: float = 4.0
     proactive_local_camera_detection_network_path: str = (
@@ -434,6 +437,7 @@ class TwinrConfig:
     long_term_memory_remote_runtime_check_mode: str = "direct"
     long_term_memory_remote_watchdog_startup_wait_s: float = 30.0
     long_term_memory_remote_watchdog_interval_s: float = 1.0
+    long_term_memory_remote_watchdog_probe_mode: str = "auto"
     long_term_memory_remote_watchdog_probe_timeout_s: float = 15.0
     long_term_memory_remote_watchdog_startup_probe_timeout_s: float = 180.0
     long_term_memory_remote_watchdog_history_limit: int = 3600
@@ -548,6 +552,8 @@ class TwinrConfig:
     display_wayland_runtime_dir: str | None = None
     display_face_cue_path: str = "artifacts/stores/ops/display_face_cue.json"
     display_face_cue_ttl_s: float = 4.0
+    display_wake_cue_path: str = "artifacts/stores/ops/display_wake_cue.json"
+    display_wake_cue_ttl_s: float = 4.5
     display_emoji_cue_path: str = "artifacts/stores/ops/display_emoji.json"
     display_emoji_cue_ttl_s: float = 6.0
     display_ambient_impulse_path: str = (
@@ -628,6 +634,7 @@ class TwinrConfig:
     attention_servo_rest_max_jerk_us_per_s3: float = 450.0
     attention_servo_min_command_delta_us: int = 8
     attention_servo_visible_retarget_tolerance_us: int = 40
+    attention_servo_visible_retarget_cooldown_s: float = 0.0
     attention_servo_soft_limit_margin_us: int = 70
     attention_servo_idle_release_s: float = 1.0
     attention_servo_settled_release_s: float = 0.0

@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from twinr.agent.base_agent import TwinrConfig
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot
 from twinr.display.heartbeat import DisplayHeartbeatStore, build_display_heartbeat
+from twinr.display.render_state import DisplayRenderStateStore
 from twinr.ops import health as health_mod
 from twinr.ops.process_memory import ProcessMemoryMetrics, StreamingMemorySnapshot
 
@@ -210,6 +211,147 @@ class OpsHealthTests(unittest.TestCase):
         self.assertEqual(display.count, 1)
         self.assertIn("display-companion", display.detail)
 
+    def test_collect_system_health_reports_visible_display_state_from_render_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=str(root),
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+            )
+            snapshot = RuntimeSnapshot(status="waiting")
+            render_state_store = DisplayRenderStateStore.from_config(config)
+            render_state_store.save(
+                layout="default",
+                runtime_status="error",
+                headline="Systemfehler",
+                details=("Remote memory down",),
+                state_fields=(("System", "ERROR"),),
+                health_status="fail",
+                snapshot_status="error",
+                snapshot_stale=False,
+                snapshot_error=None,
+                runtime_error="Remote memory unavailable",
+                operator_status="error",
+                operator_reason_codes=("health_status_fail",),
+                operator_reason_detail="System health reported fail.",
+                presented_monotonic_ns=1_000_000_000,
+            )
+            DisplayHeartbeatStore.from_config(config).save(
+                build_display_heartbeat(
+                    runtime_status="waiting",
+                    phase="idle",
+                    seq=7,
+                    updated_monotonic_ns=1_500_000_000,
+                    last_render_completed_monotonic_ns=1_000_000_000,
+                )
+            )
+            services = (
+                health_mod.ServiceHealth(
+                    key="web",
+                    label="Web UI",
+                    running=True,
+                    count=1,
+                    detail="pid=111 python --run-web",
+                ),
+                health_mod.ServiceHealth(
+                    key="conversation_loop",
+                    label="Conversation loop",
+                    running=True,
+                    count=1,
+                    detail="pid=123 python --run-streaming-loop",
+                ),
+                health_mod.ServiceHealth(
+                    key="display",
+                    label="Display loop",
+                    running=True,
+                    count=1,
+                    detail="pid=124 display-companion",
+                ),
+            )
+
+            health = self.collect_health_with_services(
+                config,
+                snapshot=snapshot,
+                services=services,
+                root=root,
+            )
+
+        self.assertEqual(health.display_visible_state, "error")
+        self.assertEqual(health.display_visible_operator_status, "error")
+        self.assertEqual(health.display_visible_state_verdict, "proved")
+        self.assertEqual(health.display_visible_state_reason, "render_state_loaded")
+        self.assertEqual(health.display_visible_state_source, "render_state")
+
+    def test_collect_system_health_warns_when_display_render_state_drift_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=str(root),
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+            )
+            snapshot = RuntimeSnapshot(status="waiting")
+            render_state_store = DisplayRenderStateStore.from_config(config)
+            render_state_store.save(
+                layout="default",
+                runtime_status="error",
+                headline="Systemfehler",
+                details=("Remote memory down",),
+                state_fields=(("System", "ERROR"),),
+                health_status="fail",
+                snapshot_status="error",
+                snapshot_stale=False,
+                snapshot_error=None,
+                runtime_error="Remote memory unavailable",
+                operator_status="error",
+                operator_reason_codes=("health_status_fail",),
+                operator_reason_detail="System health reported fail.",
+                presented_monotonic_ns=1_000_000_000,
+            )
+            DisplayHeartbeatStore.from_config(config).save(
+                build_display_heartbeat(
+                    runtime_status="waiting",
+                    phase="idle",
+                    seq=8,
+                    updated_monotonic_ns=5_000_000_000,
+                    last_render_completed_monotonic_ns=5_000_000_000,
+                )
+            )
+            services = (
+                health_mod.ServiceHealth(
+                    key="web",
+                    label="Web UI",
+                    running=True,
+                    count=1,
+                    detail="pid=111 python --run-web",
+                ),
+                health_mod.ServiceHealth(
+                    key="conversation_loop",
+                    label="Conversation loop",
+                    running=True,
+                    count=1,
+                    detail="pid=123 python --run-streaming-loop",
+                ),
+                health_mod.ServiceHealth(
+                    key="display",
+                    label="Display loop",
+                    running=True,
+                    count=1,
+                    detail="pid=124 display-companion",
+                ),
+            )
+
+            health = self.collect_health_with_services(
+                config,
+                snapshot=snapshot,
+                services=services,
+                root=root,
+            )
+
+        self.assertEqual(health.status, "warn")
+        self.assertEqual(health.display_visible_state, "error")
+        self.assertEqual(health.display_visible_state_verdict, "drift")
+        self.assertEqual(health.display_visible_state_reason, "heartbeat_render_newer_than_render_state")
+
     def test_collect_system_health_keeps_ok_when_memavailable_has_headroom(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -298,7 +440,7 @@ class OpsHealthTests(unittest.TestCase):
 
         self.assertEqual(health.status, "warn")
 
-    def test_collect_system_health_warns_when_swap_is_saturated_despite_memavailable_headroom(self) -> None:
+    def test_collect_system_health_warns_when_streaming_process_pages_are_swapped_out(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config = TwinrConfig(
@@ -329,20 +471,106 @@ class OpsHealthTests(unittest.TestCase):
                     detail="pid=123 display-companion",
                 ),
             )
-
-            health = self.collect_health_with_services(
-                config,
-                snapshot=snapshot,
-                services=services,
-                root=root,
-                memory_total_mb=3796,
-                memory_available_mb=545,
-                memory_used_percent=85.6,
-                swap_total_mb=199,
-                swap_used_percent=100.0,
+            memory_snapshot = StreamingMemorySnapshot(
+                schema_version=1,
+                captured_at="2026-04-07T00:00:00+00:00",
+                pid=123,
+                boot_id="boot-1",
+                pid_start_ticks=456,
+                current_metrics=ProcessMemoryMetrics(
+                    vm_rss_kb=412_000,
+                    anonymous_kb=286_000,
+                    vm_swap_kb=32_768,
+                ),
+                owner_label="voice_orchestrator.sender_loop",
+                owner_detail="phase=voice_orchestrator.sender_loop rss_mb=402 anonymous_mb=279 rss_delta_mb=153 anonymous_delta_mb=84",
+                owner_rss_delta_kb=156_672,
+                owner_anonymous_delta_kb=86_016,
+                phases=(),
             )
 
+            with mock.patch.object(health_mod, "loop_lock_owner", return_value=123):
+                with mock.patch.object(health_mod, "load_current_streaming_memory_snapshot", return_value=memory_snapshot):
+                    health = self.collect_health_with_services(
+                        config,
+                        snapshot=snapshot,
+                        services=services,
+                        root=root,
+                        memory_total_mb=3796,
+                        memory_available_mb=2724,
+                        memory_used_percent=28.2,
+                        swap_total_mb=199,
+                        swap_used_percent=75.6,
+                    )
+
         self.assertEqual(health.status, "warn")
+        self.assertEqual(health.memory_pressure_status, "warn")
+
+    def test_collect_system_health_ignores_cold_non_twinr_swap_when_headroom_is_healthy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=str(root),
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+            )
+            snapshot = RuntimeSnapshot(status="waiting")
+            services = (
+                health_mod.ServiceHealth(
+                    key="web",
+                    label="Web UI",
+                    running=True,
+                    count=1,
+                    detail="pid=111 python --run-web",
+                ),
+                health_mod.ServiceHealth(
+                    key="conversation_loop",
+                    label="Conversation loop",
+                    running=True,
+                    count=1,
+                    detail="pid=123 python --run-streaming-loop",
+                ),
+                health_mod.ServiceHealth(
+                    key="display",
+                    label="Display loop",
+                    running=True,
+                    count=1,
+                    detail="pid=123 display-companion",
+                ),
+            )
+            memory_snapshot = StreamingMemorySnapshot(
+                schema_version=1,
+                captured_at="2026-04-07T00:00:00+00:00",
+                pid=123,
+                boot_id="boot-1",
+                pid_start_ticks=456,
+                current_metrics=ProcessMemoryMetrics(
+                    vm_rss_kb=412_000,
+                    anonymous_kb=286_000,
+                    vm_swap_kb=0,
+                ),
+                owner_label="voice_orchestrator.sender_loop",
+                owner_detail="phase=voice_orchestrator.sender_loop rss_mb=402 anonymous_mb=279 rss_delta_mb=153 anonymous_delta_mb=84",
+                owner_rss_delta_kb=156_672,
+                owner_anonymous_delta_kb=86_016,
+                phases=(),
+            )
+
+            with mock.patch.object(health_mod, "loop_lock_owner", return_value=123):
+                with mock.patch.object(health_mod, "load_current_streaming_memory_snapshot", return_value=memory_snapshot):
+                    health = self.collect_health_with_services(
+                        config,
+                        snapshot=snapshot,
+                        services=services,
+                        root=root,
+                        memory_total_mb=3796,
+                        memory_available_mb=2724,
+                        memory_used_percent=28.2,
+                        swap_total_mb=199,
+                        swap_used_percent=75.6,
+                    )
+
+        self.assertEqual(health.status, "ok")
+        self.assertIsNone(health.memory_pressure_status)
 
     def test_collect_system_health_exposes_streaming_memory_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -476,6 +704,7 @@ class OpsHealthTests(unittest.TestCase):
                     memory_used_percent=85.6,
                     swap_total_mb=199,
                     swap_used_percent=100.0,
+                    streaming_process_swap_used_mb=32,
                 ),
                 "warn",
             )
@@ -485,6 +714,7 @@ class OpsHealthTests(unittest.TestCase):
                     memory_used_percent=61.0,
                     swap_total_mb=199,
                     swap_used_percent=100.0,
+                    streaming_process_swap_used_mb=32,
                 ),
                 "warn",
             )
@@ -493,7 +723,8 @@ class OpsHealthTests(unittest.TestCase):
                     memory_available_mb=900,
                     memory_used_percent=61.0,
                     swap_total_mb=199,
-                    swap_used_percent=0.0,
+                    swap_used_percent=100.0,
+                    streaming_process_swap_used_mb=0,
                 ),
                 "warn",
             )
@@ -503,6 +734,7 @@ class OpsHealthTests(unittest.TestCase):
                     memory_used_percent=61.0,
                     swap_total_mb=199,
                     swap_used_percent=0.0,
+                    streaming_process_swap_used_mb=0,
                 )
             )
 

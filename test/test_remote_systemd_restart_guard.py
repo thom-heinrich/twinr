@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import subprocess
 import unittest
+from typing import Any, cast
 from unittest.mock import Mock, patch
 
 from twinr.ops.remote_chonkydb_repair import (
+    BackendQuerySurfaceReadinessContract,
     ChonkyDBHttpProbeResult,
     ChonkyDBRemoteServiceState,
     RemoteChonkyDBOpsSettings,
@@ -125,11 +127,24 @@ class RemoteSystemdRestartGuardTests(unittest.TestCase):
         executor.run_sudo_ssh.side_effect = [
             _completed(
                 '{"changed": true, "path": '
-                '"/etc/systemd/system/caia-twinr-chonkydb-alt.service.d/'
-                'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-temp-manual-restart-override.conf"}'
+                '"/run/caia/maintenance/twinr_host_control.permit"}'
             ),
+            _completed(
+                '{"changed": true, "path": '
+                '"/etc/systemd/system/caia-twinr-chonkydb-alt.service.d/'
+                '10-refuse-manual-restart.conf"}'
+            ),
+            _completed("RefuseManualStart=no\nRefuseManualStop=no\n"),
             _completed('{"ok": true, "phase": "start", "actions": ["stop", "kill_all_sigkill", "start"]}'),
-            _completed('{"changed": true, "path": "/tmp/removed.conf"}'),
+            _completed(
+                '{"changed": true, "path": '
+                '"/etc/systemd/system/caia-twinr-chonkydb-alt.service.d/10-refuse-manual-restart.conf"}'
+            ),
+            _completed("RefuseManualStart=yes\nRefuseManualStop=yes\n"),
+            _completed(
+                '{"changed": true, "path": '
+                '"/run/caia/maintenance/twinr_host_control.permit"}'
+            ),
         ]
 
         guarded_restart_remote_service(
@@ -138,27 +153,48 @@ class RemoteSystemdRestartGuardTests(unittest.TestCase):
         )
 
         scripts = [call.args[0] for call in executor.run_sudo_ssh.call_args_list]
-        self.assertIn("temp-manual-restart-override.conf", scripts[0])
-        self.assertIn("'systemctl', 'stop', service_name", scripts[1])
-        self.assertIn("'systemctl', 'kill', '--kill-who=all', '--signal=SIGKILL', service_name", scripts[1])
-        self.assertIn("'systemctl', 'start', service_name", scripts[1])
-        self.assertIn("reset-failed", scripts[1])
-        self.assertIn("caia-twinr-chonkydb-alt.service", scripts[1])
-        self.assertIn("temp-manual-restart-override.conf", scripts[2])
+        self.assertIn("/run/caia/maintenance/twinr_host_control.permit", scripts[0])
+        self.assertIn("ALLOW_TWINR_HOST_CONTROL", scripts[0])
+        self.assertIn("10-refuse-manual-restart.conf", scripts[1])
+        self.assertIn("path.unlink()", scripts[1])
+        self.assertIn("systemctl show", scripts[2])
+        self.assertIn("RefuseManualStart", scripts[2])
+        self.assertIn("'systemctl', 'stop', service_name", scripts[3])
+        self.assertIn("'systemctl', 'kill', '--kill-who=all', '--signal=SIGKILL', service_name", scripts[3])
+        self.assertIn("'systemctl', 'start', service_name", scripts[3])
+        self.assertIn("reset-failed", scripts[3])
+        self.assertIn("caia-twinr-chonkydb-alt.service", scripts[3])
+        self.assertIn("10-refuse-manual-restart.conf", scripts[4])
+        self.assertIn("RefuseManualStart=yes", scripts[4])
+        self.assertIn("systemctl show", scripts[5])
+        self.assertIn("/run/caia/maintenance/twinr_host_control.permit", scripts[6])
 
     def test_guarded_restart_raises_on_nonzero_remote_command_and_still_removes_override(self) -> None:
         executor = Mock()
         executor.run_sudo_ssh.side_effect = [
             _completed(
                 '{"changed": true, "path": '
-                '"/etc/systemd/system/caia-twinr-chonkydb-alt.service.d/'
-                'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-temp-manual-restart-override.conf"}'
+                '"/run/caia/maintenance/twinr_host_control.permit"}'
             ),
+            _completed(
+                '{"changed": true, "path": '
+                '"/etc/systemd/system/caia-twinr-chonkydb-alt.service.d/'
+                '10-refuse-manual-restart.conf"}'
+            ),
+            _completed("RefuseManualStart=no\nRefuseManualStop=no\n"),
             _failed_completed(
                 stdout='{"ok": false, "phase": "kill_timeout"}',
                 stderr="systemctl stop timed out",
             ),
-            _completed('{"changed": true, "path": "/tmp/removed.conf"}'),
+            _completed(
+                '{"changed": true, "path": '
+                '"/etc/systemd/system/caia-twinr-chonkydb-alt.service.d/10-refuse-manual-restart.conf"}'
+            ),
+            _completed("RefuseManualStart=yes\nRefuseManualStop=yes\n"),
+            _completed(
+                '{"changed": true, "path": '
+                '"/run/caia/maintenance/twinr_host_control.permit"}'
+            ),
         ]
 
         with self.assertRaisesRegex(RuntimeError, "remote_guarded_restart_failed"):
@@ -168,9 +204,54 @@ class RemoteSystemdRestartGuardTests(unittest.TestCase):
             )
 
         scripts = [call.args[0] for call in executor.run_sudo_ssh.call_args_list]
-        self.assertIn("temp-manual-restart-override.conf", scripts[0])
-        self.assertIn("'systemctl', 'stop', service_name", scripts[1])
-        self.assertIn("temp-manual-restart-override.conf", scripts[2])
+        self.assertIn("/run/caia/maintenance/twinr_host_control.permit", scripts[0])
+        self.assertIn("10-refuse-manual-restart.conf", scripts[1])
+        self.assertIn("systemctl show", scripts[2])
+        self.assertIn("'systemctl', 'stop', service_name", scripts[3])
+        self.assertIn("10-refuse-manual-restart.conf", scripts[4])
+        self.assertIn("systemctl show", scripts[5])
+        self.assertIn("/run/caia/maintenance/twinr_host_control.permit", scripts[6])
+
+    def test_guarded_restart_fails_fast_when_manual_restart_flags_stay_closed(self) -> None:
+        executor = Mock()
+        executor.run_sudo_ssh.side_effect = [
+            _completed(
+                '{"changed": true, "path": '
+                '"/run/caia/maintenance/twinr_host_control.permit"}'
+            ),
+            _completed(
+                '{"changed": true, "path": '
+                '"/etc/systemd/system/caia-twinr-chonkydb-alt.service.d/'
+                '10-refuse-manual-restart.conf"}'
+            ),
+            _completed("RefuseManualStart=yes\nRefuseManualStop=yes\n"),
+            _completed(
+                '{"changed": true, "path": '
+                '"/etc/systemd/system/caia-twinr-chonkydb-alt.service.d/10-refuse-manual-restart.conf"}'
+            ),
+            _completed("RefuseManualStart=yes\nRefuseManualStop=yes\n"),
+            _completed(
+                '{"changed": true, "path": '
+                '"/run/caia/maintenance/twinr_host_control.permit"}'
+            ),
+        ]
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "remote_manual_restart_override_not_verified",
+        ):
+            guarded_restart_remote_service(
+                executor=executor,
+                service_name="caia-twinr-chonkydb-alt.service",
+            )
+
+        scripts = [call.args[0] for call in executor.run_sudo_ssh.call_args_list]
+        self.assertIn("/run/caia/maintenance/twinr_host_control.permit", scripts[0])
+        self.assertIn("10-refuse-manual-restart.conf", scripts[1])
+        self.assertIn("systemctl show", scripts[2])
+        self.assertIn("10-refuse-manual-restart.conf", scripts[3])
+        self.assertIn("systemctl show", scripts[4])
+        self.assertIn("/run/caia/maintenance/twinr_host_control.permit", scripts[5])
 
 
 class RemoteChonkyDBRepairProtectionIntegrationTests(unittest.TestCase):
@@ -243,6 +324,14 @@ class RemoteChonkyDBRepairProtectionIntegrationTests(unittest.TestCase):
                 ),
             ),
             patch(
+                "twinr.ops.remote_chonkydb_repair.fetch_backend_query_surface_readiness_contract",
+                return_value=BackendQuerySurfaceReadinessContract(
+                    fulltext_rebuild_on_open=False,
+                    warmup_fulltext_gate=False,
+                    warmup_wait_for_ready=False,
+                ),
+            ),
+            patch(
                 "twinr.ops.remote_chonkydb_repair.inspect_backend_data_ownership",
                 return_value=None,
             ),
@@ -263,7 +352,12 @@ class RemoteChonkyDBRepairProtectionIntegrationTests(unittest.TestCase):
         mock_protection.assert_called_once()
         self.assertTrue(result.ok)
         self.assertTrue(result.restart_protection.verified)
-        self.assertTrue(result.to_dict()["restart_protection"]["protection_changed"])
+        payload = cast(dict[str, Any], result.to_dict())
+        restart_protection = cast(
+            dict[str, Any],
+            payload["restart_protection"],
+        )
+        self.assertTrue(bool(restart_protection["protection_changed"]))
 
 
 if __name__ == "__main__":

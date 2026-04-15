@@ -58,6 +58,8 @@ MAX_PCM_FRAME_BYTES = 96_000
 MAX_EVENT_ID_LENGTH = 128
 MAX_SESSION_ID_LENGTH = 128
 MAX_TRACE_ID_LENGTH = 128
+MAX_WAIT_ID_LENGTH = 128
+MAX_ITEM_ID_LENGTH = 128
 MAX_BACKEND_LENGTH = 64
 MAX_MESSAGE_TYPE_LENGTH = 64
 MAX_STATE_LENGTH = 64
@@ -75,6 +77,7 @@ ALLOWED_AUDIO_TRANSPORTS = frozenset({AUDIO_TRANSPORT_JSON_B64})
 ALLOWED_TURN_DETECTION_MODES = frozenset({"manual", "server_vad", "semantic_vad"})
 ALLOWED_NOISE_REDUCTION_PROFILES = frozenset({"off", "near_field", "far_field"})
 ALLOWED_EMBEDDING_METRICS = frozenset({"cosine", "dot", "l2"})
+_WAIT_TOKEN_STATES = frozenset({"listening", "follow_up_open"})
 
 
 class VoiceContractError(ValueError):
@@ -424,6 +427,7 @@ class OrchestratorVoiceHelloRequest:
     initial_state: str = "waiting"
     detail: str | None = None
     follow_up_allowed: bool = False
+    wait_id: str | None = None
     attention_state: str | None = None
     interaction_intent_state: str | None = None
     person_visible: bool | None = None
@@ -467,6 +471,13 @@ class OrchestratorVoiceHelloRequest:
         _require_text(
             self.initial_state, field="initial_state", max_length=MAX_STATE_LENGTH
         )
+        _validate_short_text(self.wait_id, field="wait_id", max_length=MAX_WAIT_ID_LENGTH)
+        if self.initial_state in _WAIT_TOKEN_STATES and self.wait_id is None:
+            raise VoiceContractError(f"wait_id is required while initial_state={self.initial_state!r}")
+        if self.initial_state not in _WAIT_TOKEN_STATES and self.wait_id is not None:
+            raise VoiceContractError(
+                f"wait_id is only allowed while initial_state is one of {sorted(_WAIT_TOKEN_STATES)!r}"
+            )
         _validate_short_text(self.trace_id, field="trace_id", max_length=MAX_TRACE_ID_LENGTH)
         _validate_short_text(self.detail, field="detail", max_length=MAX_DETAIL_LENGTH)
         _validate_short_text(
@@ -577,6 +588,8 @@ class OrchestratorVoiceHelloRequest:
             payload["trace_id"] = self.trace_id
         if self.detail is not None:
             payload["detail"] = self.detail
+        if self.wait_id is not None:
+            payload["wait_id"] = self.wait_id
         if self.attention_state is not None:
             payload["attention_state"] = self.attention_state
         if self.interaction_intent_state is not None:
@@ -645,6 +658,9 @@ class OrchestratorVoiceHelloRequest:
             ),
             follow_up_allowed=_coerce_bool(
                 payload_dict.get("follow_up_allowed"), default=False
+            ),
+            wait_id=_coerce_optional_text(
+                payload_dict.get("wait_id"), max_length=MAX_WAIT_ID_LENGTH
             ),
             attention_state=_coerce_optional_text(
                 payload_dict.get("attention_state"), max_length=MAX_STATE_LENGTH
@@ -740,6 +756,7 @@ class OrchestratorVoiceRuntimeStateEvent:
     state: str
     detail: str | None = None
     follow_up_allowed: bool = False
+    wait_id: str | None = None
     attention_state: str | None = None
     interaction_intent_state: str | None = None
     person_visible: bool | None = None
@@ -759,6 +776,13 @@ class OrchestratorVoiceRuntimeStateEvent:
 
     def validate(self) -> None:
         _require_text(self.state, field="state", max_length=MAX_STATE_LENGTH)
+        _validate_short_text(self.wait_id, field="wait_id", max_length=MAX_WAIT_ID_LENGTH)
+        if self.state in _WAIT_TOKEN_STATES and self.wait_id is None:
+            raise VoiceContractError(f"wait_id is required while state={self.state!r}")
+        if self.state not in _WAIT_TOKEN_STATES and self.wait_id is not None:
+            raise VoiceContractError(
+                f"wait_id is only allowed while state is one of {sorted(_WAIT_TOKEN_STATES)!r}"
+            )
         _validate_short_text(self.detail, field="detail", max_length=MAX_DETAIL_LENGTH)
         _validate_short_text(
             self.attention_state, field="attention_state", max_length=MAX_STATE_LENGTH
@@ -804,6 +828,8 @@ class OrchestratorVoiceRuntimeStateEvent:
             payload["type"] = "voice_runtime_state"
         if self.detail is not None:
             payload["detail"] = self.detail
+        if self.wait_id is not None:
+            payload["wait_id"] = self.wait_id
         if self.attention_state is not None:
             payload["attention_state"] = self.attention_state
         if self.interaction_intent_state is not None:
@@ -849,6 +875,9 @@ class OrchestratorVoiceRuntimeStateEvent:
             ),
             follow_up_allowed=_coerce_bool(
                 payload_dict.get("follow_up_allowed"), default=False
+            ),
+            wait_id=_coerce_optional_text(
+                payload_dict.get("wait_id"), max_length=MAX_WAIT_ID_LENGTH
             ),
             attention_state=_coerce_optional_text(
                 payload_dict.get("attention_state"), max_length=MAX_STATE_LENGTH
@@ -1268,6 +1297,77 @@ class OrchestratorVoiceReadyEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class OrchestratorVoiceWakeSpeculativeEvent:
+    """Represent one speculative remote voice activation match."""
+
+    matched_phrase: str | None
+    backend: str
+    ttl_ms: int
+    detector_label: str | None = None
+    score: float | None = None
+    event_id: str | None = None
+    sent_at_unix_ms: int | None = None
+
+    def validate(self) -> None:
+        _validate_short_text(
+            self.matched_phrase, field="matched_phrase", max_length=MAX_TEXT_LENGTH
+        )
+        _validate_short_text(
+            self.detector_label, field="detector_label", max_length=MAX_CHANNEL_NAME_LENGTH
+        )
+        _require_text(self.backend, field="backend", max_length=MAX_BACKEND_LENGTH)
+        _validate_ratio(self.score, field="score")
+        _validate_short_text(self.event_id, field="event_id", max_length=MAX_EVENT_ID_LENGTH)
+        _validate_timestamp_ms(self.sent_at_unix_ms, field="sent_at_unix_ms")
+        if self.ttl_ms <= 0:
+            raise VoiceContractError("ttl_ms must be positive")
+
+    def to_payload(self) -> dict[str, Any]:
+        self.validate()
+        payload: dict[str, Any] = {
+            "type": "wake_speculative",
+            "backend": self.backend,
+            "ttl_ms": int(self.ttl_ms),
+        }
+        if self.matched_phrase is not None:
+            payload["matched_phrase"] = self.matched_phrase
+        if self.detector_label is not None:
+            payload["detector_label"] = self.detector_label
+        if self.score is not None:
+            payload["score"] = float(self.score)
+        return _with_common_metadata(
+            payload,
+            event_id=self.event_id,
+            sent_at_unix_ms=self.sent_at_unix_ms,
+        )
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> "OrchestratorVoiceWakeSpeculativeEvent":
+        payload_dict = _coerce_dict(payload)
+        event_id, sent_at_unix_ms = _parse_common_metadata(payload_dict)
+        event = cls(
+            matched_phrase=_coerce_optional_text(
+                payload_dict.get("matched_phrase"),
+                max_length=MAX_TEXT_LENGTH,
+            ),
+            backend=_coerce_text(payload_dict.get("backend")) or "unknown",
+            ttl_ms=_parse_positive_int(
+                payload_dict.get("ttl_ms"),
+                field="ttl_ms",
+            ),
+            detector_label=_coerce_optional_text(
+                payload_dict.get("detector_label"),
+                max_length=MAX_CHANNEL_NAME_LENGTH,
+            ),
+            score=_coerce_optional_ratio(payload_dict.get("score")),
+            event_id=event_id,
+            sent_at_unix_ms=sent_at_unix_ms,
+        )
+        event.validate()
+        return event
+
+
+@dataclass(frozen=True, slots=True)
 class OrchestratorVoiceWakeConfirmedEvent:
     """Represent one confirmed remote voice activation match."""
 
@@ -1342,12 +1442,16 @@ class OrchestratorVoiceTranscriptCommittedEvent:
 
     transcript: str
     source: str = "listening"
+    wait_id: str | None = None
+    item_id: str | None = None
     event_id: str | None = None
     sent_at_unix_ms: int | None = None
 
     def validate(self) -> None:
         _require_text(self.transcript, field="transcript", max_length=MAX_TEXT_LENGTH)
         _require_text(self.source, field="source", max_length=MAX_STATE_LENGTH)
+        _require_text(self.wait_id, field="wait_id", max_length=MAX_WAIT_ID_LENGTH)
+        _require_text(self.item_id, field="item_id", max_length=MAX_ITEM_ID_LENGTH)
         _validate_short_text(self.event_id, field="event_id", max_length=MAX_EVENT_ID_LENGTH)
         _validate_timestamp_ms(self.sent_at_unix_ms, field="sent_at_unix_ms")
 
@@ -1357,6 +1461,8 @@ class OrchestratorVoiceTranscriptCommittedEvent:
             "type": "transcript_committed",
             "transcript": self.transcript,
             "source": self.source,
+            "wait_id": self.wait_id,
+            "item_id": self.item_id,
         }
         return _with_common_metadata(
             payload,
@@ -1375,6 +1481,16 @@ class OrchestratorVoiceTranscriptCommittedEvent:
                 max_length=MAX_TEXT_LENGTH,
             ),
             source=_coerce_text(payload_dict.get("source")) or "listening",
+            wait_id=_require_text(
+                payload_dict.get("wait_id"),
+                field="wait_id",
+                max_length=MAX_WAIT_ID_LENGTH,
+            ),
+            item_id=_require_text(
+                payload_dict.get("item_id"),
+                field="item_id",
+                max_length=MAX_ITEM_ID_LENGTH,
+            ),
             event_id=event_id,
             sent_at_unix_ms=sent_at_unix_ms,
         )
@@ -1387,17 +1503,27 @@ class OrchestratorVoiceFollowUpClosedEvent:
     """Signal that the server closed the current remote follow-up window."""
 
     reason: str
+    wait_id: str | None = None
+    item_id: str | None = None
     event_id: str | None = None
     sent_at_unix_ms: int | None = None
 
     def validate(self) -> None:
         _require_text(self.reason, field="reason", max_length=MAX_REASON_LENGTH)
+        _require_text(self.wait_id, field="wait_id", max_length=MAX_WAIT_ID_LENGTH)
+        _validate_short_text(self.item_id, field="item_id", max_length=MAX_ITEM_ID_LENGTH)
         _validate_short_text(self.event_id, field="event_id", max_length=MAX_EVENT_ID_LENGTH)
         _validate_timestamp_ms(self.sent_at_unix_ms, field="sent_at_unix_ms")
 
     def to_payload(self) -> dict[str, Any]:
         self.validate()
-        payload = {"type": "follow_up_closed", "reason": self.reason}
+        payload = {
+            "type": "follow_up_closed",
+            "reason": self.reason,
+            "wait_id": self.wait_id,
+        }
+        if self.item_id is not None:
+            payload["item_id"] = self.item_id
         return _with_common_metadata(
             payload,
             event_id=self.event_id,
@@ -1410,6 +1536,14 @@ class OrchestratorVoiceFollowUpClosedEvent:
         event_id, sent_at_unix_ms = _parse_common_metadata(payload_dict)
         event = cls(
             reason=_coerce_text(payload_dict.get("reason")) or "timeout",
+            wait_id=_require_text(
+                payload_dict.get("wait_id"),
+                field="wait_id",
+                max_length=MAX_WAIT_ID_LENGTH,
+            ),
+            item_id=_coerce_optional_text(
+                payload_dict.get("item_id"), max_length=MAX_ITEM_ID_LENGTH
+            ),
             event_id=event_id,
             sent_at_unix_ms=sent_at_unix_ms,
         )
@@ -1605,6 +1739,7 @@ VoiceClientEvent = (
 
 VoiceServerEvent = (
     OrchestratorVoiceReadyEvent
+    | OrchestratorVoiceWakeSpeculativeEvent
     | OrchestratorVoiceWakeConfirmedEvent
     | OrchestratorVoiceTranscriptCommittedEvent
     | OrchestratorVoiceFollowUpClosedEvent
@@ -1665,6 +1800,8 @@ def decode_voice_server_event(
     message_type = _coerce_text(payload_dict.get("type"))
     if message_type == "voice_ready":
         return OrchestratorVoiceReadyEvent.from_payload(payload_dict)
+    if message_type == "wake_speculative":
+        return OrchestratorVoiceWakeSpeculativeEvent.from_payload(payload_dict)
     if message_type == "wake_confirmed":
         return OrchestratorVoiceWakeConfirmedEvent.from_payload(payload_dict)
     if message_type == "transcript_committed":
@@ -1706,6 +1843,7 @@ __all__ = [
     "OrchestratorVoiceTranscriptCommittedEvent",
     "OrchestratorVoiceUnknownClientEvent",
     "OrchestratorVoiceUnknownServerEvent",
+    "OrchestratorVoiceWakeSpeculativeEvent",
     "OrchestratorVoiceWakeConfirmedEvent",
     "VOICE_PROTOCOL_VERSION",
     "VOICE_SUBPROTOCOL",

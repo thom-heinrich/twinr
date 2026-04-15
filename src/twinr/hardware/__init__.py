@@ -8,6 +8,53 @@ dependencies during unrelated imports such as audio helpers.
 from __future__ import annotations
 
 from importlib import import_module
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from twinr.hardware.camera import CapturedPhoto, V4L2StillCamera
+    from twinr.hardware.drone_service import (
+        DroneMissionRequest,
+        DroneMissionStatus,
+        DronePoseSnapshot,
+        DroneSafetyStatus,
+        DroneServiceConfig,
+        DroneStateSnapshot,
+        DroneTelemetrySnapshot,
+        RemoteDroneServiceClient,
+    )
+    from twinr.hardware.pir import GpioPirMonitor, PirBinding, PirMotionEvent, build_pir_binding, configured_pir_monitor
+    from twinr.hardware.voice_profile import (
+        VoiceAssessment,
+        VoiceProfileMonitor,
+        VoiceProfileStore,
+        VoiceProfileSummary,
+        VoiceProfileTemplate,
+        voice_profile_store_path,
+    )
+
+    _TYPECHECK_EXPORTS = (
+        CapturedPhoto,
+        DroneMissionRequest,
+        DroneMissionStatus,
+        DronePoseSnapshot,
+        DroneSafetyStatus,
+        DroneServiceConfig,
+        DroneStateSnapshot,
+        DroneTelemetrySnapshot,
+        GpioPirMonitor,
+        PirBinding,
+        PirMotionEvent,
+        RemoteDroneServiceClient,
+        V4L2StillCamera,
+        VoiceAssessment,
+        VoiceProfileMonitor,
+        VoiceProfileStore,
+        VoiceProfileSummary,
+        VoiceProfileTemplate,
+        build_pir_binding,
+        configured_pir_monitor,
+        voice_profile_store_path,
+    )
 
 __all__ = [
     "CapturedPhoto",
@@ -17,6 +64,7 @@ __all__ = [
     "DroneStateSnapshot",
     "DroneSafetyStatus",
     "DronePoseSnapshot",
+    "DroneTelemetrySnapshot",
     "GpioPirMonitor",
     "PirBinding",
     "PirMotionEvent",
@@ -40,6 +88,7 @@ _EXPORTS = {
     "DroneSafetyStatus": "twinr.hardware.drone_service",
     "DroneServiceConfig": "twinr.hardware.drone_service",
     "DroneStateSnapshot": "twinr.hardware.drone_service",
+    "DroneTelemetrySnapshot": "twinr.hardware.drone_service",
     "GpioPirMonitor": "twinr.hardware.pir",
     "PirBinding": "twinr.hardware.pir",
     "PirMotionEvent": "twinr.hardware.pir",

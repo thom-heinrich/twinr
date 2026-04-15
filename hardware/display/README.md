@@ -213,7 +213,12 @@ That keeps Twinr on the supervisor path but emits bounded `display_trace=...`,
 service journal with phase, caller, last command, previous status, GPIO, and
 supply context. Use the standalone probe when you need an exclusive panel
 session; use the runtime trace when you need to catch the first stall inside
-the normal supervisor-managed Twinr loop.
+the normal supervisor-managed Twinr loop. On `hdmi_wayland`, the same flag also
+adds a compact `display_trace=render_path ...` summary plus a structured
+`display_render_trace` ops event for each real status render, so Pi probes can
+separate snapshot pickup, `show_status()`, `show_image()`, `processEvents()`,
+and the backend's internal present boundary without patching ad-hoc print
+statements into the companion.
 
 ## See also
 

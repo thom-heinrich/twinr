@@ -92,7 +92,7 @@ class StreamingSemanticRouterRuntimeTests(unittest.TestCase):
             with mock.patch(
                 "twinr.agent.workflows.streaming_semantic_router.load_semantic_router_bundle",
                 return_value=_fake_bundle(),
-            ):
+            ) as load_route_bundle:
                 with mock.patch(
                     "twinr.agent.workflows.streaming_semantic_router.load_user_intent_bundle",
                     return_value=_fake_bundle(),
@@ -104,8 +104,15 @@ class StreamingSemanticRouterRuntimeTests(unittest.TestCase):
                         with mock.patch(
                             "twinr.agent.workflows.streaming_semantic_router.record_streaming_memory_phase_best_effort"
                         ):
-                            StreamingSemanticRouterRuntime(loop)
+                            runtime = StreamingSemanticRouterRuntime(loop)
+                            load_route_bundle.assert_not_called()
+                            load_user_bundle.assert_not_called()
+                            runtime.maybe_start_warmup("Wie ist die Lage heute?")
+                            self.assertEqual(len(loop.scheduled_warmups), 1)
+                            _, runner = loop.scheduled_warmups[0]
+                            runner()
 
+        load_route_bundle.assert_called_once_with(model_dir.resolve())
         load_user_bundle.assert_called_once_with(
             user_intent_dir.resolve(),
             eager_runtime_validation=False,
@@ -120,7 +127,7 @@ class StreamingSemanticRouterRuntimeTests(unittest.TestCase):
             with mock.patch(
                 "twinr.agent.workflows.streaming_semantic_router.load_semantic_router_bundle",
                 return_value=_fake_bundle(),
-            ):
+            ) as load_bundle:
                 with mock.patch(
                     "twinr.agent.workflows.streaming_semantic_router.LocalSemanticRouter",
                     return_value=router,
@@ -129,6 +136,7 @@ class StreamingSemanticRouterRuntimeTests(unittest.TestCase):
                         "twinr.agent.workflows.streaming_semantic_router.record_streaming_memory_phase_best_effort"
                     ):
                         StreamingSemanticRouterRuntime(loop)
+                        load_bundle.assert_not_called()
 
         self.assertEqual(router.warmup_calls, [])
         self.assertEqual(loop.scheduled_warmups, [])
@@ -142,7 +150,7 @@ class StreamingSemanticRouterRuntimeTests(unittest.TestCase):
             with mock.patch(
                 "twinr.agent.workflows.streaming_semantic_router.load_semantic_router_bundle",
                 return_value=_fake_bundle(),
-            ):
+            ) as load_bundle:
                 with mock.patch(
                     "twinr.agent.workflows.streaming_semantic_router.LocalSemanticRouter",
                     return_value=router,
@@ -151,6 +159,7 @@ class StreamingSemanticRouterRuntimeTests(unittest.TestCase):
                         "twinr.agent.workflows.streaming_semantic_router.record_streaming_memory_phase_best_effort"
                     ) as record_phase:
                         runtime = StreamingSemanticRouterRuntime(loop)
+                        load_bundle.assert_not_called()
                         runtime.maybe_start_warmup("Wie ist die Lage heute?")
                         self.assertEqual(len(loop.scheduled_warmups), 1)
                         name, runner = loop.scheduled_warmups[0]
@@ -158,9 +167,16 @@ class StreamingSemanticRouterRuntimeTests(unittest.TestCase):
                         runner()
                         runtime.maybe_start_warmup("Noch mal warm machen")
 
+        load_bundle.assert_called_once_with(model_dir.resolve())
         self.assertEqual(router.warmup_calls, ["Wie ist die Lage heute?"])
         self.assertEqual(len(loop.scheduled_warmups), 1)
-        record_phase.assert_called_once()
+        self.assertEqual(
+            [call.kwargs["label"] for call in record_phase.call_args_list],
+            [
+                "streaming_loop.semantic_router.bundle_ready",
+                "streaming_loop.semantic_router.lazy_warmup",
+            ],
+        )
 
     def test_runtime_waits_for_pending_warmup_before_resolving_transcript(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -171,7 +187,7 @@ class StreamingSemanticRouterRuntimeTests(unittest.TestCase):
             with mock.patch(
                 "twinr.agent.workflows.streaming_semantic_router.load_semantic_router_bundle",
                 return_value=_fake_bundle(),
-            ):
+            ) as load_bundle:
                 with mock.patch(
                     "twinr.agent.workflows.streaming_semantic_router.LocalSemanticRouter",
                     return_value=router,
@@ -182,9 +198,127 @@ class StreamingSemanticRouterRuntimeTests(unittest.TestCase):
                         runtime = StreamingSemanticRouterRuntime(loop)
                         resolution = runtime.resolve_transcript("Bitte such nach dem Wetter.")
 
-        self.assertIsNotNone(resolution)
+        self.assertIsNone(resolution)
+        load_bundle.assert_not_called()
+        self.assertEqual(len(loop.scheduled_warmups), 1)
         self.assertEqual(loop.waited_warmups, [("local_semantic_router", None)])
+        self.assertEqual(router.warmup_calls, [])
+        self.assertEqual(router.classify_calls, [])
+
+    def test_runtime_builds_synchronously_without_warmup_scheduler(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir) / "router"
+            model_dir.mkdir()
+            loop = _LoopStub(model_dir=str(model_dir))
+            loop._schedule_speculative_warmup = None  # type: ignore[assignment]
+            loop._wait_for_speculative_warmup = None  # type: ignore[assignment]
+            router = _FakeRouter()
+            with mock.patch(
+                "twinr.agent.workflows.streaming_semantic_router.load_semantic_router_bundle",
+                return_value=_fake_bundle(),
+            ) as load_bundle:
+                with mock.patch(
+                    "twinr.agent.workflows.streaming_semantic_router.LocalSemanticRouter",
+                    return_value=router,
+                ):
+                    with mock.patch(
+                        "twinr.agent.workflows.streaming_semantic_router.record_streaming_memory_phase_best_effort"
+                    ) as record_phase:
+                        runtime = StreamingSemanticRouterRuntime(loop)
+                        resolution = runtime.resolve_transcript("Bitte such nach dem Wetter.")
+
+        self.assertIsNotNone(resolution)
+        load_bundle.assert_called_once_with(model_dir.resolve())
+        self.assertEqual(router.warmup_calls, ["Bitte such nach dem Wetter."])
         self.assertEqual(router.classify_calls, ["Bitte such nach dem Wetter."])
+        self.assertEqual(
+            [call.kwargs["label"] for call in record_phase.call_args_list],
+            [
+                "streaming_loop.semantic_router.bundle_ready",
+                "streaming_loop.semantic_router.lazy_warmup",
+            ],
+        )
+
+    def test_reload_defers_rebuild_and_keeps_previous_router_on_failure(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir) / "router"
+            model_dir.mkdir()
+            loop = _LoopStub(model_dir=str(model_dir))
+            loop._schedule_speculative_warmup = None  # type: ignore[assignment]
+            loop._wait_for_speculative_warmup = None  # type: ignore[assignment]
+            router = _FakeRouter()
+            with mock.patch(
+                "twinr.agent.workflows.streaming_semantic_router.load_semantic_router_bundle",
+                side_effect=[_fake_bundle(), RuntimeError("broken_bundle")],
+            ) as load_bundle:
+                with mock.patch(
+                    "twinr.agent.workflows.streaming_semantic_router.LocalSemanticRouter",
+                    return_value=router,
+                ):
+                    with mock.patch(
+                        "twinr.agent.workflows.streaming_semantic_router.record_streaming_memory_phase_best_effort"
+                    ):
+                        runtime = StreamingSemanticRouterRuntime(loop)
+                        first_resolution = runtime.resolve_transcript("Bitte such nach dem Wetter.")
+                        self.assertIsNotNone(first_resolution)
+                        self.assertEqual(load_bundle.call_count, 1)
+                        runtime.reload()
+                        self.assertEqual(load_bundle.call_count, 1)
+                        second_resolution = runtime.resolve_transcript("Noch mal Wetter bitte.")
+
+        self.assertIsNotNone(second_resolution)
+        self.assertEqual(load_bundle.call_count, 2)
+        self.assertEqual(
+            router.warmup_calls,
+            ["Bitte such nach dem Wetter.", "Noch mal Wetter bitte."],
+        )
+        self.assertEqual(
+            router.classify_calls,
+            ["Bitte such nach dem Wetter.", "Noch mal Wetter bitte."],
+        )
+        self.assertIn("local_semantic_router_unavailable=RuntimeError", loop.emitted)
+        self.assertIn(
+            "streaming_local_semantic_router_reload_kept_previous",
+            [name for name, _payload in loop.trace_events],
+        )
+
+    def test_reload_keeps_previous_router_when_model_dir_disappears(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir) / "router"
+            model_dir.mkdir()
+            loop = _LoopStub(model_dir=str(model_dir))
+            loop._schedule_speculative_warmup = None  # type: ignore[assignment]
+            loop._wait_for_speculative_warmup = None  # type: ignore[assignment]
+            router = _FakeRouter()
+            with mock.patch(
+                "twinr.agent.workflows.streaming_semantic_router.load_semantic_router_bundle",
+                return_value=_fake_bundle(),
+            ) as load_bundle:
+                with mock.patch(
+                    "twinr.agent.workflows.streaming_semantic_router.LocalSemanticRouter",
+                    return_value=router,
+                ):
+                    with mock.patch(
+                        "twinr.agent.workflows.streaming_semantic_router.record_streaming_memory_phase_best_effort"
+                    ):
+                        runtime = StreamingSemanticRouterRuntime(loop)
+                        first_resolution = runtime.resolve_transcript("Bitte such nach dem Wetter.")
+                        self.assertIsNotNone(first_resolution)
+                        self.assertEqual(load_bundle.call_count, 1)
+                        loop.config.local_semantic_router_model_dir = None
+                        runtime.reload()
+                        second_resolution = runtime.resolve_transcript("Bitte such noch mal nach dem Wetter.")
+
+        self.assertIsNotNone(second_resolution)
+        self.assertEqual(load_bundle.call_count, 1)
+        self.assertEqual(
+            router.classify_calls,
+            ["Bitte such nach dem Wetter.", "Bitte such noch mal nach dem Wetter."],
+        )
+        self.assertIn(
+            "streaming_local_semantic_router_reload_kept_previous",
+            [name for name, _payload in loop.trace_events],
+        )
 
 
 class StreamingCaptureControllerWarmupTests(unittest.TestCase):

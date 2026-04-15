@@ -33,7 +33,9 @@ from twinr.memory.longterm.evaluation.messy_memory_eval import (
     _merge_structured_current_states,
     _prepare_local_seed_service,
     _publish_materialized_messy_corpus,
+    _rebind_contact_disambiguation_cases,
     _run_phase,
+    _run_cases_until_settled,
     _seed_synthetic_graph_locally_then_sync_remote,
     _build_restart_summary,
     default_messy_memory_eval_path,
@@ -376,6 +378,79 @@ class MessyMemoryEvalTests(unittest.TestCase):
         self.assertEqual(phase_result.synthetic_summary.passed_cases, 1)
         self.assertEqual(phase_result.multimodal_summary.passed_cases, 1)
         self.assertEqual(analysis.summary.total_cases, 0)
+
+    def test_run_cases_until_settled_reruns_only_pending_cases(self) -> None:
+        @dataclass(frozen=True, slots=True)
+        class _FakeCase:
+            case_id: str
+
+        @dataclass(frozen=True, slots=True)
+        class _FakeResult:
+            case_id: str
+            passed: bool
+
+        run_order: list[tuple[str, ...]] = []
+        calls_by_case_id: dict[str, int] = {}
+
+        def _run_cases(cases: tuple[_FakeCase, ...]) -> tuple[_FakeResult, ...]:
+            run_order.append(tuple(case.case_id for case in cases))
+            results: list[_FakeResult] = []
+            for case in cases:
+                calls_by_case_id[case.case_id] = calls_by_case_id.get(case.case_id, 0) + 1
+                if case.case_id == "case-a":
+                    results.append(_FakeResult(case_id=case.case_id, passed=calls_by_case_id[case.case_id] > 1))
+                else:
+                    results.append(_FakeResult(case_id=case.case_id, passed=True))
+            return tuple(results)
+
+        with patch("twinr.memory.longterm.evaluation.messy_memory_eval.time.sleep", return_value=None):
+            results = _run_cases_until_settled(
+                cases=(_FakeCase("case-a"), _FakeCase("case-b")),
+                timeout_s=0.2,
+                poll_interval_s=0.0,
+                run_cases=_run_cases,
+            )
+
+        self.assertEqual(run_order, [("case-a", "case-b"), ("case-a",)])
+        self.assertEqual(calls_by_case_id, {"case-a": 2, "case-b": 1})
+        self.assertTrue(all(item.passed for item in results))
+
+    def test_rebind_contact_disambiguation_cases_uses_actual_mixed_graph_option_count(self) -> None:
+        ambiguous_case = LongTermEvalCase(
+            case_id="contact_ambiguous_08",
+            category="contact_disambiguation",
+            query_text="Anna",
+            kind="contact_lookup",
+            expected_lookup_status="needs_clarification",
+            expected_option_count=3,
+        )
+        exact_case = LongTermEvalCase(
+            case_id="contact_exact_01",
+            category="contact_exact_lookup",
+            query_text="Paula",
+            kind="contact_lookup",
+            expected_lookup_status="found",
+            expected_option_count=0,
+        )
+        fake_service = SimpleNamespace(
+            graph_store=SimpleNamespace(
+                lookup_contact=lambda *, name: SimpleNamespace(
+                    status="needs_clarification",
+                    options=("Anna Becker", "Anna Kraus", "Anna Nagel", "Anna Stahl"),
+                )
+                if name == "Anna"
+                else SimpleNamespace(status="found", options=())
+            )
+        )
+
+        rebound = _rebind_contact_disambiguation_cases(
+            service=cast(LongTermMemoryService, fake_service),
+            cases=(ambiguous_case, exact_case),
+        )
+
+        self.assertEqual(rebound[0].expected_option_count, 4)
+        self.assertEqual(rebound[0].expected_lookup_status, "needs_clarification")
+        self.assertEqual(rebound[1], exact_case)
 
     def test_seed_synthetic_graph_locally_then_sync_remote_persists_once(self) -> None:
         class _FakeRemoteGraph:

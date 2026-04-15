@@ -20,11 +20,13 @@ and current-state commits through remote-primary state.
 - classify shown-card reactions more precisely, including immediate pickup versus delayed pickup or visible pushback, so Twinr can remember not just whether a card landed but how directly it landed
 - serialize those steering cues for runtime evaluators with compact semantic match summaries and region-qualified local titles where available, then resolve matched topics back into concrete follow-up keep-open versus release-after-answer behavior
 - provide storage seams for remote current-state loading and saving without pushing persistence into base-agent prompting
-- keep prompt-time snapshot reads read-only and current-head-first; only probe legacy snapshot blobs when a real legacy catalog head still exists, so first live turns on the Pi stay bounded
+- keep prompt-time snapshot reads read-only and current-head-only, so first live turns on the Pi never reopen legacy snapshot or pointer/blob probes on the critical path
+- keep explicit prompt-time remote-read caps authoritative across nested current-head helpers, so supervisor/personality prompt loads cannot silently widen a 2-second hot-path budget back to cold bootstrap timeouts
 - extract structured interaction, continuity, place, and world signals from long-term consolidation output and tool history
 - gate background learning so repeated interaction, place, and world signals can evolve the durable personality snapshot without allowing one-off drift
 - expose a narrow public engagement-signal read seam so non-prompt runtime consumers such as the ambient reserve bus can adapt from the same persisted state instead of rebuilding their own engagement view
 - expose both synchronous commit paths and foreground-safe queueing paths so runtime turn finalization can hand off tool-history learning without blocking on remote-primary personality writes
+- expose one explicit persisted-history probe seam so nightly/runtime operators can distinguish a truly readable zero-delta state from remote-blind or partially unreadable personality history
 - manage RSS/Atom subscriptions plus calm refresh/discovery state for place/world intelligence
 - learn slow-changing topic/region source-calibration signals from structured conversation and tool evidence
 - condense repeated feed updates into situational-awareness threads so world context can mature over days/weeks instead of staying headline-shaped
@@ -52,7 +54,7 @@ and current-state commits through remote-primary state.
 | [steering.py](./steering.py) | Authoritative turn-steering cues plus runtime follow-up resolution derived from co-attention and conversation appetite |
 | [profile_defaults.py](./profile_defaults.py) | Shared baseline style/humor profiles used by the runtime evolution loop and evaluation tooling |
 | [_remote_state_utils.py](./_remote_state_utils.py) | Shared remote-primary adapter resolution used by the personality and world-intelligence snapshot stores |
-| [store.py](./store.py) | Remote current-head/item persistence seam for personality snapshot state, signals, and deltas; prompt-time loads stay read-only and avoid legacy blob reads unless a real legacy head still exists |
+| [store.py](./store.py) | Remote current-head/item persistence seam for personality snapshot state, signals, and deltas; prompt-time loads stay read-only and current-head-only so live voice turns do not reopen legacy snapshot probes |
 | [evolution.py](./evolution.py) | Policy-gated background learning loop, contradiction/sensitivity gates, and decay maintenance |
 | [signals.py](./signals.py) | Structured signal taxonomy plus extraction for style, humor, topic, continuity, place, and world evidence |
 | [learning.py](./learning.py) | Runtime-facing bridge from extracted signals into background evolution |

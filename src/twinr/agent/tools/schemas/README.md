@@ -25,6 +25,7 @@ split by concern so no single file carries the whole tool surface.
 - describe `search_live_info` as broad web research only, not as a proxy for booking-flow, form, checkout, or social-story inspection on a live site
 - describe `connect_service_integration` as the bounded spoken service-pairing surface for requests such as connecting WhatsApp, including the expectation that progress and QR state move onto Twinr's right info panel
 - describe `send_whatsapp_message` as the bounded remembered-contact messaging surface with missing-message follow-ups, explicit final confirmation, and contact/phone clarification
+- describe `review_saved_memories` as the bounded read surface for explicit durable memories previously saved with `remember_memory`, including the explicit `confirmed` bit required for sensitive inspection retries
 - describe `manage_voice_quiet_mode` as the bounded temporary stay-quiet surface that suppresses transcript-first wake without becoming a persistent setting or `end_conversation`, including `status` checks for whether Twinr is currently quiet and the expectation that missing durations trigger a short follow-up instead of a fake quiet acknowledgement
 - describe that ordinary freshness-sensitive questions about places, businesses, organizations, or events still start on `search_live_info` unless the user explicitly asked for site interaction
 

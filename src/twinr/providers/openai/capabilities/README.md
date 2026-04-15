@@ -12,6 +12,9 @@ reminder phrasing, or printing.
 - response, vision, and streaming helpers built on the OpenAI Responses API
 - live-search prompt shaping, source extraction, search-model fallback logic, and structured spoken-answer output for voice playback
 - speech-to-text and text-to-speech request handling for OpenAI audio endpoints
+- streaming TTS over Twinr's warmed authenticated HTTP transport when the real
+  OpenAI client is available, so short spoken answers do not pay the slower SDK
+  stream-wrapper startup on the Pi
 - reminder, proactive, and automation phrasing with deterministic local fallbacks
 - printer-safe receipt composition and print-text sanitization
 
@@ -26,9 +29,14 @@ models can finish cleanly instead of degrading into generic blank-answer
 errors. Successful search results now also retain the requested model,
 structured per-attempt metadata, and any concrete fallback reason so runtime
 callers can persist what actually happened when a search left its primary
-model. The search voice-rewrite step also returns structured verification and
-follow-up metadata so Twinr can distinguish verified answers from partial or
-unverified results and decide whether to ask for a deeper website check.
+model. Live voice search now defaults to the faster dedicated
+`gpt-4o-mini-search-preview` path unless operators explicitly pin another
+`OPENAI_SEARCH_MODEL`, while the spoken final-lane budget stays wider than the
+generic reply lane so slow but still-valid web searches do not time out before
+their result arrives. The search voice-rewrite step also returns structured
+verification and follow-up metadata so Twinr can distinguish verified answers
+from partial or unverified results and decide whether to ask for a deeper
+website check.
 
 `capabilities` does **not** own:
 - low-level client construction, shared request builders, or base types in [`../core`](../core/README.md)

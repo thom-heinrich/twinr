@@ -7,6 +7,12 @@ keeps probing required remote readiness and writes one rolling artifact.
 
 from __future__ import annotations
 
+# CHANGELOG: 2026-04-11
+# BUG-1: Remove the raw-spawn fallback when a dedicated watchdog systemd unit is
+# BUG-1: configured. Pi runtimes now keep one authoritative owner lane for the
+# BUG-1: remote-memory watchdog instead of silently starting a second detached
+# BUG-1: process after a failed or pending systemd start request.
+
 from pathlib import Path
 from typing import Callable
 import os
@@ -43,9 +49,16 @@ def _normalize_text(value: object) -> str:
 def _coerce_positive_float(value: object, *, default: float) -> float:
     """Return one finite positive float or the provided default."""
 
-    try:
+    if isinstance(value, bool):
         parsed = float(value)
-    except (TypeError, ValueError):
+    elif isinstance(value, (int, float)):
+        parsed = float(value)
+    elif isinstance(value, str):
+        try:
+            parsed = float(value.strip())
+        except ValueError:
+            return float(default)
+    else:
         return float(default)
     if parsed <= 0.0:
         return float(default)
@@ -165,9 +178,8 @@ def ensure_remote_memory_watchdog_process(
     """Ensure the external watchdog owner exists without violating ownership.
 
     On the productive Pi, the dedicated systemd unit is the canonical owner and
-    this helper requests that unit first. Only environments without a configured
-    unit fall back to a detached direct spawn, and callers can explicitly forbid
-    that fallback when a second raw process would violate the ownership model.
+    this helper requests that unit first. Only environments without any
+    configured unit may use the detached direct-spawn lane.
     """
 
     if not _remote_required(config):
@@ -180,7 +192,8 @@ def ensure_remote_memory_watchdog_process(
         return owner
 
     deadline = time.monotonic() + max(0.1, float(startup_timeout_s))
-    if _request_watchdog_systemd_start(config, emit=emit):
+    systemd_unit = _systemd_watchdog_unit(config)
+    if systemd_unit and _request_watchdog_systemd_start(config, emit=emit):
         while time.monotonic() < deadline:
             owner = loop_lock_owner(config, "remote-memory-watchdog")
             if owner is not None:
@@ -189,6 +202,9 @@ def ensure_remote_memory_watchdog_process(
                 return owner
             time.sleep(0.1)
         emit("remote_memory_watchdog=systemd_start_pending")
+        return None
+    if systemd_unit:
+        emit(f"remote_memory_watchdog=systemd_required_no_spawn:{systemd_unit}")
         return None
 
     if not allow_spawn:

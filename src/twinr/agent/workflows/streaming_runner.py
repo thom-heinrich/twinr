@@ -19,6 +19,7 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, replace
 from pathlib import Path
+import logging
 import os
 import stat
 import tempfile
@@ -37,7 +38,10 @@ from twinr.agent.base_agent.contracts import (
     ToolCallingAgentProvider,
     StreamingSpeechToTextProvider,
 )
-from twinr.agent.base_agent.prompting.personality import load_supervisor_loop_instructions
+from twinr.agent.base_agent.prompting.personality import (
+    load_supervisor_loop_instructions,
+    load_tool_loop_instructions,
+)
 from twinr.agent.base_agent.conversation.turn_controller import ToolCallingTurnDecisionEvaluator
 from twinr.agent.tools import (
     DualLaneToolLoop,
@@ -63,6 +67,7 @@ from twinr.agent.workflows.streaming_turn_coordinator import (
     StreamingTurnLanePlan,
     StreamingTurnRequest,
     StreamingTurnSpeechServices,
+    _noop_after_transcript_submitted,
 )
 from twinr.agent.workflows.streaming_turn_orchestrator import StreamingTurnTimeoutPolicy
 from twinr.agent.workflows.voice_turn_latency import emit_voice_turn_latency_breakdown
@@ -76,6 +81,9 @@ from twinr.providers.openai import (
     OpenAISupervisorDecisionProvider,
     OpenAIToolCallingAgentProvider,
 )
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -219,10 +227,40 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         )
         self.first_word_provider: FirstWordProvider | None = getattr(self, "first_word_provider", None)
         self._streaming_capture = StreamingCaptureController(self)
+        self._record_constructor_memory_phase(
+            config,
+            label="streaming_loop.hardware_loop.capture_controller_ready",
+            owner_label="streaming_loop.hardware_loop.capture_controller",
+            owner_detail="TwinrStreamingHardwareLoop built the streaming capture controller.",
+        )
         self._streaming_speculation = StreamingSpeculationController(self)
+        self._record_constructor_memory_phase(
+            config,
+            label="streaming_loop.hardware_loop.speculation_controller_ready",
+            owner_label="streaming_loop.hardware_loop.speculation_controller",
+            owner_detail="TwinrStreamingHardwareLoop built the streaming speculation controller.",
+        )
         self._streaming_lane_planner = StreamingLanePlanner(self)
+        self._record_constructor_memory_phase(
+            config,
+            label="streaming_loop.hardware_loop.lane_planner_ready",
+            owner_label="streaming_loop.hardware_loop.lane_planner",
+            owner_detail="TwinrStreamingHardwareLoop built the streaming lane planner.",
+        )
         self._streaming_semantic_router = StreamingSemanticRouterRuntime(self)
+        self._record_constructor_memory_phase(
+            config,
+            label="streaming_loop.hardware_loop.semantic_router_ready",
+            owner_label="streaming_loop.hardware_loop.semantic_router",
+            owner_detail="TwinrStreamingHardwareLoop built the streaming semantic router runtime.",
+        )
         self._schedule_speculative_warmups()
+        self._record_constructor_memory_phase(
+            config,
+            label="streaming_loop.hardware_loop.speculative_warmups_scheduled",
+            owner_label="streaming_loop.hardware_loop.speculative_warmups",
+            owner_detail="TwinrStreamingHardwareLoop scheduled the speculative warmup lanes.",
+        )
         self._record_constructor_memory_phase(
             config,
             label="streaming_loop.hardware_loop.streaming_features_ready",
@@ -243,6 +281,7 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
     def close(self, *, timeout_s: float = 1.0) -> None:
         """Release streaming-loop resources, including speculative warmups."""
 
+        cleanup_errors: list[Exception] = []
         warmup_lock = getattr(self, "_warmup_lock", None)
         warmup_futures = getattr(self, "_warmup_futures", None)
         executor = None
@@ -257,15 +296,29 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         if executor is not None:
             try:
                 executor.shutdown(wait=False, cancel_futures=True)
-            except Exception:
-                pass
-        super().close(timeout_s=timeout_s)
+            except Exception as exc:
+                wrapped = RuntimeError(f"warmup_executor.shutdown cleanup failed: {type(exc).__name__}: {exc}")
+                wrapped.__cause__ = exc
+                cleanup_errors.append(wrapped)
+        try:
+            super().close(timeout_s=timeout_s)
+        except Exception as exc:
+            wrapped = RuntimeError(f"realtime_loop.close cleanup failed: {type(exc).__name__}: {exc}")
+            wrapped.__cause__ = exc
+            cleanup_errors.append(wrapped)
+        if cleanup_errors:
+            if len(cleanup_errors) == 1:
+                raise cleanup_errors[0]
+            raise ExceptionGroup("Twinr streaming loop close failed.", cleanup_errors)
 
     def __del__(self) -> None:
         try:
             self.close(timeout_s=0.2)
         except Exception:
-            pass
+            _LOGGER.warning(
+                "Twinr streaming loop cleanup failed during garbage collection.",
+                exc_info=True,
+            )
 
     def _resolve_runtime_dependencies(
         self,
@@ -378,6 +431,17 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
     def _streaming_tool_max_rounds(self) -> int:
         return max(1, int(getattr(self.config, "streaming_tool_max_rounds", 6)))
 
+    def _prewarm_tool_loop_instruction_bundle(self) -> None:
+        """Materialize the tool-loop base bundle before the first spoken turn.
+
+        The live specialist lane must not be the first caller that pays the
+        remote-managed static-section read cost. Prewarming here keeps the
+        critical voice turn on the already-rendered bundle while preserving the
+        normal prompt-cache invalidation path.
+        """
+
+        load_tool_loop_instructions(self.config)
+
     def _build_streaming_turn_loop(
         self,
         *,
@@ -397,6 +461,7 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                 if name in supervisor_tool_names
             }
             supervisor_tool_schemas = build_agent_tool_schemas(supervisor_tool_names)
+            self._prewarm_tool_loop_instruction_bundle()
             supervisor_backend = OpenAIBackend(config=self.config)
             supervisor_decision_backend = OpenAIBackend(config=self.config)
             specialist_backend = OpenAIBackend(config=self.config)
@@ -733,8 +798,10 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
             future.result(timeout=timeout_ms / 1000.0)
         except FutureTimeoutError:
             return
-        except Exception:
-            return
+        except Exception as exc:
+            raise RuntimeError(
+                f"Speculative warmup '{name}' failed while the live turn waited for it."
+            ) from exc
 
     def _reload_live_config_from_env(self, env_path: Path) -> None:
         updated_config = self._load_live_config_from_env_file(env_path)
@@ -904,14 +971,10 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
             return self._streaming_speculation.has_shared_supervisor_decision(transcript)
 
     def _prime_supervisor_decision_cache(self) -> None:
-        with self._speculation_lock:
-            self._streaming_speculation.prime_supervisor_decision_cache()
-            self._supervisor_cache_prewarmed = True
+        self._streaming_speculation.prime_supervisor_decision_cache()
 
     def _prime_first_word_cache(self) -> None:
-        with self._speculation_lock:
-            self._streaming_speculation.prime_first_word_cache()
-            self._first_word_cache_prewarmed = True
+        self._streaming_speculation.prime_first_word_cache()
 
     def _generate_first_word_reply(
         self,
@@ -1056,7 +1119,16 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
             listen_source=listen_source,
             proactive_trigger=proactive_trigger,
         )
-        self._emit_status(force=True)
+
+        def _after_transcript_submitted() -> None:
+            # Seeded direct-text turns already have the committed transcript in
+            # hand, so speculative warmups belong after the runtime has entered
+            # `processing`, not before.
+            self._maybe_start_local_semantic_router_warmup(transcript)
+            self._maybe_start_speculative_first_word(transcript)
+            self._maybe_start_speculative_supervisor_decision(transcript)
+            self._maybe_start_speculative_long_term_context(transcript, final_transcript=True)
+
         try:
             with pending_conversation_follow_up_hint_scope(
                 self.runtime,
@@ -1070,6 +1142,8 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                     capture_ms=0,
                     stt_ms=0,
                     allow_follow_up_rearm=allow_remote_follow_up_rearm,
+                    seeded_transcript=True,
+                    after_transcript_submitted=_after_transcript_submitted,
                 )
         except Exception as exc:
             self._trace_event(
@@ -1101,6 +1175,8 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         capture_ms: int,
         stt_ms: int,
         allow_follow_up_rearm: bool,
+        seeded_transcript: bool = False,
+        after_transcript_submitted: Callable[[], None] | None = None,
     ) -> bool:
         self._trace_event(
             "streaming_turn_completion_started",
@@ -1125,6 +1201,7 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                 stt_ms=stt_ms,
                 allow_follow_up_rearm=allow_follow_up_rearm,
                 workflow_trace_id=current_workflow_trace_id(),
+                seeded_transcript=seeded_transcript,
             ),
             lane_plan_factory=lambda: self._build_streaming_turn_lane_plan(transcript),
             speech_services=StreamingTurnSpeechServices(
@@ -1149,6 +1226,11 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                 apply_follow_up_closure_evaluation=self._apply_follow_up_closure_evaluation,
                 follow_up_rearm_allowed_now=lambda request_source: self._follow_up_allowed_for_source(
                     initial_source=request_source
+                ),
+                after_transcript_submitted=(
+                    _noop_after_transcript_submitted
+                    if after_transcript_submitted is None
+                    else after_transcript_submitted
                 ),
                 emit_turn_latency_breakdown=lambda trace_id: emit_voice_turn_latency_breakdown(
                     emit=self.emit,
@@ -1184,6 +1266,7 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                 and self._voice_orchestrator_handles_follow_up(initial_source=listen_source)
             )
             if outcome.keep_listening and remote_follow_up:
+                self._acknowledge_follow_up_open(request_source=listen_source)
                 self._notify_voice_orchestrator_state(
                     "follow_up_open",
                     detail=listen_source,

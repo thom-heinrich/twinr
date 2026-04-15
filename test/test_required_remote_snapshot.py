@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from pathlib import Path
 import os
 import sys
@@ -12,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.workflows.required_remote_snapshot import (
     _default_watchdog_recovery_starter,
+    _required_watchdog_probe_mode,
     assess_required_remote_watchdog_snapshot,
     ensure_required_remote_watchdog_snapshot_ready,
 )
@@ -150,6 +152,65 @@ class RequiredRemoteWatchdogSnapshotTests(unittest.TestCase):
         self.assertTrue(assessment.pid_alive)
         self.assertEqual(assessment.sample_status, "ok")
 
+    def test_assess_ignores_create_time_drift_when_start_ticks_match(self) -> None:
+        now = datetime.now(timezone.utc)
+        config = TwinrConfig()
+        expected_start_ticks = 123456
+        expected_create_time_s = 1_775_405_396.65
+        current_create_time_s = expected_create_time_s + 56.0
+        snapshot = replace(
+            _build_snapshot(now=now, pid=os.getpid(), age_s=2.0),
+            pid_starttime_ticks=expected_start_ticks,
+            pid_create_time_s=expected_create_time_s,
+        )
+
+        with mock.patch(
+            "twinr.agent.workflows.required_remote_snapshot._current_boot_id",
+            return_value=None,
+        ), mock.patch(
+            "twinr.agent.workflows.required_remote_snapshot._read_proc_stat_start_ticks",
+            return_value=expected_start_ticks,
+        ), mock.patch(
+            "twinr.agent.workflows.required_remote_snapshot._read_proc_create_time_s",
+            return_value=current_create_time_s,
+        ):
+            assessment = assess_required_remote_watchdog_snapshot(
+                config,
+                now_wall=now,
+                store=_FakeStore(snapshot),
+            )
+
+        self.assertTrue(assessment.ready)
+        self.assertTrue(assessment.pid_alive)
+        self.assertEqual(assessment.sample_status, "ok")
+
+    def test_assess_still_uses_create_time_when_start_ticks_are_missing(self) -> None:
+        now = datetime.now(timezone.utc)
+        config = TwinrConfig()
+        expected_create_time_s = 1_775_405_396.65
+        current_create_time_s = expected_create_time_s + 56.0
+        snapshot = replace(
+            _build_snapshot(now=now, pid=os.getpid(), age_s=2.0),
+            pid_starttime_ticks=None,
+            pid_create_time_s=expected_create_time_s,
+        )
+
+        with mock.patch(
+            "twinr.agent.workflows.required_remote_snapshot._current_boot_id",
+            return_value=None,
+        ), mock.patch(
+            "twinr.agent.workflows.required_remote_snapshot._read_proc_create_time_s",
+            return_value=current_create_time_s,
+        ):
+            assessment = assess_required_remote_watchdog_snapshot(
+                config,
+                now_wall=now,
+                store=_FakeStore(snapshot),
+            )
+
+        self.assertFalse(assessment.ready)
+        self.assertIn("create-time attestation", assessment.detail)
+
     def test_assess_rejects_non_archive_safe_ok_snapshot(self) -> None:
         now = datetime.now(timezone.utc)
         snapshot = _build_snapshot(
@@ -159,11 +220,14 @@ class RequiredRemoteWatchdogSnapshotTests(unittest.TestCase):
             probe={
                 "warm_result": {
                     "archive_safe": False,
-                    "health_tier": "degraded",
+                    "health_tier": "ready",
+                    "proof_contract": {
+                        "contract_id": "configured_namespace_current_only_readiness",
+                    },
                 }
             },
         )
-        config = TwinrConfig()
+        config = TwinrConfig(long_term_memory_remote_watchdog_probe_mode="archive_inclusive")
 
         assessment = assess_required_remote_watchdog_snapshot(
             config,
@@ -174,6 +238,95 @@ class RequiredRemoteWatchdogSnapshotTests(unittest.TestCase):
         self.assertFalse(assessment.ready)
         self.assertFalse(assessment.snapshot_stale)
         self.assertIn("archive-safe", assessment.detail.lower())
+
+    def test_assess_accepts_current_only_ok_snapshot_when_current_only_contract_is_configured(self) -> None:
+        now = datetime.now(timezone.utc)
+        snapshot = _build_snapshot(
+            now=now,
+            pid=os.getpid(),
+            age_s=2.0,
+            probe={
+                "warm_result": {
+                    "archive_safe": False,
+                    "health_tier": "ready",
+                    "proof_contract": {
+                        "contract_id": "configured_namespace_current_only_readiness",
+                    },
+                }
+            },
+        )
+        config = TwinrConfig(long_term_memory_remote_watchdog_probe_mode="current_only")
+
+        assessment = assess_required_remote_watchdog_snapshot(
+            config,
+            now_wall=now,
+            store=_FakeStore(snapshot),
+        )
+
+        self.assertTrue(assessment.ready)
+        self.assertEqual(assessment.detail, "ok")
+
+    def test_assess_accepts_current_only_probe_despite_remote_status_false_when_watchdog_artifact_defaults_it(
+        self,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        snapshot = _build_snapshot(
+            now=now,
+            pid=os.getpid(),
+            age_s=2.0,
+            probe={
+                "remote_status": {
+                    "ready": False,
+                    "detail": "ChonkyDB instance responded but is not ready.",
+                },
+                "warm_result": {
+                    "archive_safe": False,
+                    "health_tier": "ready",
+                    "proof_contract": {
+                        "contract_id": "configured_namespace_current_only_readiness",
+                    },
+                },
+            },
+        )
+        config = TwinrConfig(long_term_memory_remote_runtime_check_mode="watchdog_artifact")
+
+        assessment = assess_required_remote_watchdog_snapshot(
+            config,
+            now_wall=now,
+            store=_FakeStore(snapshot),
+        )
+
+        self.assertTrue(assessment.ready)
+        self.assertEqual(assessment.detail, "ok")
+
+    def test_assess_accepts_ok_snapshot_when_archive_safe_probe_proves_ready_despite_remote_status_false(self) -> None:
+        now = datetime.now(timezone.utc)
+        snapshot = _build_snapshot(
+            now=now,
+            pid=os.getpid(),
+            age_s=2.0,
+            probe={
+                "remote_status": {
+                    "ready": False,
+                    "detail": "ChonkyDB instance responded but is not ready.",
+                },
+                "warm_result": {
+                    "archive_safe": True,
+                    "health_tier": "ready",
+                },
+            },
+        )
+        config = TwinrConfig()
+
+        assessment = assess_required_remote_watchdog_snapshot(
+            config,
+            now_wall=now,
+            store=_FakeStore(snapshot),
+        )
+
+        self.assertTrue(assessment.ready)
+        self.assertFalse(assessment.snapshot_stale)
+        self.assertEqual(assessment.detail, "ok")
 
     def test_assess_rejects_missing_snapshot(self) -> None:
         config = TwinrConfig()
@@ -792,6 +945,35 @@ class RequiredRemoteWatchdogSnapshotTests(unittest.TestCase):
         self.assertTrue(assessment.ready)
         self.assertEqual(assessment.sample_status, "ok")
 
+    def test_ensure_waits_for_recently_restarted_watchdog_after_one_fresh_fail_sample(self) -> None:
+        now = datetime.now(timezone.utc)
+        failing = _build_snapshot(
+            now=now,
+            pid=os.getpid(),
+            status="fail",
+            ready=False,
+            age_s=1.0,
+            heartbeat_age_s=1.0,
+        )
+        ok = _build_snapshot(
+            now=now,
+            pid=os.getpid(),
+            status="ok",
+            ready=True,
+            age_s=1.0,
+            heartbeat_age_s=1.0,
+        )
+        config = TwinrConfig(long_term_memory_remote_watchdog_startup_wait_s=15.0)
+
+        with mock.patch("twinr.agent.workflows.required_remote_snapshot.time.sleep", return_value=None):
+            assessment = ensure_required_remote_watchdog_snapshot_ready(
+                config,
+                store=_SequencedStore((failing, ok)),
+            )
+
+        self.assertTrue(assessment.ready)
+        self.assertEqual(assessment.sample_status, "ok")
+
     def test_ensure_recovers_dead_external_watchdog_owner_before_waiting_for_ready_snapshot(self) -> None:
         now = datetime.now(timezone.utc)
         dead = _build_snapshot(now=now, pid=999999, age_s=1.0)
@@ -825,6 +1007,9 @@ class RequiredRemoteWatchdogSnapshotTests(unittest.TestCase):
 
 
 class TwinrConfigRemoteRuntimeCheckModeTests(unittest.TestCase):
+    def test_watchdog_probe_mode_defaults_to_auto(self) -> None:
+        self.assertEqual(TwinrConfig().long_term_memory_remote_watchdog_probe_mode, "auto")
+
     def test_pi_runtime_defaults_to_watchdog_artifact_mode(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             fake_twinr = Path(temp_dir) / "twinr"
@@ -843,3 +1028,18 @@ class TwinrConfigRemoteRuntimeCheckModeTests(unittest.TestCase):
                 config = TwinrConfig.from_env(env_path)
 
         self.assertEqual(config.long_term_memory_remote_runtime_check_mode, "watchdog_artifact")
+        self.assertEqual(config.long_term_memory_remote_watchdog_probe_mode, "auto")
+        self.assertEqual(_required_watchdog_probe_mode(config), "current_only")
+
+    def test_explicit_watchdog_probe_mode_is_loaded_from_env(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_PROBE_MODE=archive_inclusive\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.long_term_memory_remote_watchdog_probe_mode, "archive_inclusive")
+        self.assertEqual(_required_watchdog_probe_mode(config), "archive_inclusive")

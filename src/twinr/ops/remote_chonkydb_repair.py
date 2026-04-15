@@ -25,6 +25,8 @@ import urllib.error
 import urllib.request
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.memory.chonkydb.client import ChonkyDBError
+from twinr.memory.longterm.storage._remote_state.shared import is_explicit_remote_transient_detail
 from twinr.memory.longterm.storage._remote_state.shared import _remote_namespace_for_config
 from twinr.ops.pi_runtime_deploy_remote import PiRemoteExecutor
 from twinr.ops.remote_systemd_restart_guard import (
@@ -36,6 +38,7 @@ from twinr.ops.self_coding_pi import PiConnectionSettings
 
 
 _SYSTEMD_HEALTHY_SUBSTATES = frozenset({"running", "listening", "exited"})
+_DEFAULT_SSH_TIMEOUT_S = 180.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,29 +145,53 @@ class BackendDataOwnershipState:
 class BackendQuerySurfaceReadinessContract:
     """Describe whether the backend startup contract can prove query readiness.
 
-    The dedicated Twinr backend currently relies on `CHONKY_FT_REBUILD_ON_OPEN`
-    for correctness. If rebuild-on-open stays enabled while the query-surface
-    fulltext gate is disabled, the systemd unit can look healthy long before
-    `/v1/external/retrieve/topk_records` is actually usable. That exact
-    mismatch recreates the observed `active/running` + `backend 504` +
-    `public 503` outage shape.
+    The dedicated Twinr backend relies on `CHONKY_FT_REBUILD_ON_OPEN` for
+    correctness, but the live `token_fast` serving contract must not block on
+    unrelated fulltext warmup. Twinr also requires the sanctioned
+    payload-read startup lane to stay enabled; disabling that gate strands the
+    dedicated backend on startup even though current-head reads are part of the
+    required remote-memory contract.
     """
 
     fulltext_rebuild_on_open: bool
     warmup_fulltext_gate: bool
     warmup_wait_for_ready: bool
+    ready_default_scope: str = "full"
+    serving_contract_scope: str = "full"
     warmup_wait_ready_timeout_s: float | None = None
+    warmup_payload_read_path: bool = False
+    warmup_payload_read_timeout_s: float | None = None
+
+    @property
+    def requires_full_scope_warmup(self) -> bool:
+        """Return whether the configured serving contract blocks on full scope."""
+
+        scopes = {
+            str(self.ready_default_scope or "").strip().lower() or "full",
+            str(self.serving_contract_scope or "").strip().lower() or "full",
+        }
+        return "full" in scopes
 
     @property
     def unsafe_reason(self) -> str | None:
         """Return the proven unsafe startup mismatch when present."""
 
-        if self.fulltext_rebuild_on_open and not self.warmup_fulltext_gate:
-            return "fulltext_rebuild_on_open_without_query_gate"
-        if self.fulltext_rebuild_on_open and not self.warmup_wait_for_ready:
-            return "fulltext_rebuild_on_open_without_ready_wait"
+        if self.fulltext_rebuild_on_open and self.requires_full_scope_warmup:
+            if not self.warmup_fulltext_gate:
+                return "fulltext_rebuild_on_open_without_query_gate"
+            if not self.warmup_wait_for_ready:
+                return "fulltext_rebuild_on_open_without_ready_wait"
+            if (
+                self.warmup_wait_ready_timeout_s is not None
+                and float(self.warmup_wait_ready_timeout_s) <= 0.0
+            ):
+                return "fulltext_rebuild_on_open_without_ready_timeout"
+            return None
+        if self.fulltext_rebuild_on_open and self.warmup_fulltext_gate:
+            return "token_fast_serving_contract_blocked_by_fulltext_gate"
         if (
             self.fulltext_rebuild_on_open
+            and self.warmup_wait_for_ready
             and self.warmup_wait_ready_timeout_s is not None
             and float(self.warmup_wait_ready_timeout_s) <= 0.0
         ):
@@ -184,9 +211,193 @@ class BackendQuerySurfaceReadinessContract:
             "fulltext_rebuild_on_open": self.fulltext_rebuild_on_open,
             "warmup_fulltext_gate": self.warmup_fulltext_gate,
             "warmup_wait_for_ready": self.warmup_wait_for_ready,
+            "ready_default_scope": self.ready_default_scope,
+            "serving_contract_scope": self.serving_contract_scope,
+            "requires_full_scope_warmup": self.requires_full_scope_warmup,
             "warmup_wait_ready_timeout_s": self.warmup_wait_ready_timeout_s,
+            "warmup_payload_read_path": self.warmup_payload_read_path,
+            "warmup_payload_read_timeout_s": self.warmup_payload_read_timeout_s,
             "unsafe": self.unsafe,
             "unsafe_reason": self.unsafe_reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BackendDataOwnershipRepairStatus:
+    """Describe whether Twinr repaired data-dir owner/group drift."""
+
+    data_dir: str
+    expected_user: str
+    expected_group: str
+    changed_entry_count: int
+    error: str | None = None
+
+    @property
+    def changed(self) -> bool:
+        """Return whether at least one entry was repaired."""
+
+        return int(self.changed_entry_count) > 0
+
+
+@dataclass(frozen=True, slots=True)
+class BackendPayloadReadWarmupRepairStatus:
+    """Describe whether Twinr disabled the proven payload-read startup gate."""
+
+    dropin_path: str
+    changed: bool
+    contract: BackendQuerySurfaceReadinessContract
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable representation."""
+
+        return {
+            "dropin_path": self.dropin_path,
+            "changed": self.changed,
+            "contract": self.contract.to_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BackendPayloadSyncBulkApiReadyContract:
+    """Describe whether payload sync bulk incorrectly waits for full API ready."""
+
+    ready_default_scope: str
+    payload_sync_bulk_require_api_ready: bool
+
+    @property
+    def unsafe_reason(self) -> str | None:
+        """Return the proven unsafe contract mismatch when present."""
+
+        if self.payload_sync_bulk_require_api_ready and self.ready_default_scope == "full":
+            return "sync_bulk_api_waits_for_full_ready"
+        return None
+
+    @property
+    def unsafe(self) -> bool:
+        """Return whether the dedicated Twinr write surface is incorrectly gated."""
+
+        return self.unsafe_reason is not None
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable representation."""
+
+        return {
+            "ready_default_scope": self.ready_default_scope,
+            "payload_sync_bulk_require_api_ready": self.payload_sync_bulk_require_api_ready,
+            "unsafe": self.unsafe,
+            "unsafe_reason": self.unsafe_reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BackendPayloadSyncBulkApiReadyRepairStatus:
+    """Describe whether Twinr disabled the sync-bulk API ready gate."""
+
+    dropin_path: str
+    changed: bool
+    contract: BackendPayloadSyncBulkApiReadyContract
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable representation."""
+
+        return {
+            "dropin_path": self.dropin_path,
+            "changed": self.changed,
+            "contract": self.contract.to_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BackendVectorWarmupContract:
+    """Describe whether the vector warmup budget can satisfy full ready."""
+
+    ready_default_scope: str
+    serving_contract_scope: str
+    warmup_wait_for_ready: bool
+    warmup_wait_ready_timeout_s: float | None = None
+    warmup_vector_open_timeout_s: float | None = None
+
+    @property
+    def requires_full_scope_warmup(self) -> bool:
+        """Return whether the backend is configured to wait for full readiness."""
+
+        if not self.warmup_wait_for_ready:
+            return False
+        scopes = {
+            str(self.ready_default_scope or "").strip().lower(),
+            str(self.serving_contract_scope or "").strip().lower(),
+        }
+        return "full" in scopes
+
+    @property
+    def unsafe_reason(self) -> str | None:
+        """Return the proven unsafe vector warmup contract mismatch when present."""
+
+        if not self.requires_full_scope_warmup:
+            return None
+        ready_budget = self.warmup_wait_ready_timeout_s
+        vector_budget = self.warmup_vector_open_timeout_s
+        if ready_budget is None or float(ready_budget) <= 0.0:
+            return None
+        if vector_budget is None or float(vector_budget) <= 0.0:
+            return None
+        if float(vector_budget) < float(ready_budget):
+            return "vector_open_timeout_shorter_than_full_ready_budget"
+        return None
+
+    @property
+    def unsafe(self) -> bool:
+        """Return whether the vector warmup budget is provably too short."""
+
+        return self.unsafe_reason is not None
+
+    @property
+    def target_vector_open_timeout_s(self) -> float | None:
+        """Return the minimum safe vector-open timeout for the live contract."""
+
+        if not self.requires_full_scope_warmup:
+            return None
+        ready_budget = self.warmup_wait_ready_timeout_s
+        if ready_budget is None or float(ready_budget) <= 0.0:
+            return None
+        vector_budget = self.warmup_vector_open_timeout_s
+        if vector_budget is None:
+            return float(ready_budget)
+        return max(float(vector_budget), float(ready_budget))
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable representation."""
+
+        return {
+            "ready_default_scope": self.ready_default_scope,
+            "serving_contract_scope": self.serving_contract_scope,
+            "warmup_wait_for_ready": self.warmup_wait_for_ready,
+            "warmup_wait_ready_timeout_s": self.warmup_wait_ready_timeout_s,
+            "warmup_vector_open_timeout_s": self.warmup_vector_open_timeout_s,
+            "requires_full_scope_warmup": self.requires_full_scope_warmup,
+            "unsafe": self.unsafe,
+            "unsafe_reason": self.unsafe_reason,
+            "target_vector_open_timeout_s": self.target_vector_open_timeout_s,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BackendVectorWarmupRepairStatus:
+    """Describe whether Twinr repaired the vector warmup timeout budget."""
+
+    dropin_path: str
+    changed: bool
+    contract: BackendVectorWarmupContract
+    target_vector_open_timeout_s: float | None
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable representation."""
+
+        return {
+            "dropin_path": self.dropin_path,
+            "changed": self.changed,
+            "contract": self.contract.to_dict(),
+            "target_vector_open_timeout_s": self.target_vector_open_timeout_s,
         }
 
 
@@ -341,7 +552,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ssh-timeout-s",
         type=float,
-        default=60.0,
+        default=_DEFAULT_SSH_TIMEOUT_S,
         help="Timeout in seconds for individual backend SSH commands.",
     )
     parser.add_argument(
@@ -458,14 +669,68 @@ def plan_remote_chonkydb_repair(
     backend_probe: ChonkyDBHttpProbeResult,
     foreign_consumers: tuple[ForeignBackendConsumer, ...] = (),
     backend_data_ownership: BackendDataOwnershipState | None = None,
+    backend_readiness_contract: BackendQuerySurfaceReadinessContract | None = None,
+    backend_vector_warmup_contract: BackendVectorWarmupContract | None = None,
 ) -> RemoteChonkyDBRepairPlan:
     """Return the bounded repair action for the current outage evidence."""
 
     if public_probe.ready:
         return RemoteChonkyDBRepairPlan(action="none", reason="public_ready")
+    payload_read_gate_outage = _payload_read_gate_causes_outage(
+        contract=backend_readiness_contract,
+        backend_service=backend_service,
+        public_probe=public_probe,
+        backend_probe=backend_probe,
+    )
+    query_surface_contract_outage = _query_surface_contract_causes_outage(
+        contract=backend_readiness_contract,
+        backend_service=backend_service,
+        public_probe=public_probe,
+        backend_probe=backend_probe,
+    )
+    vector_warmup_timeout_outage = _vector_warmup_timeout_contract_causes_outage(
+        contract=backend_vector_warmup_contract,
+        backend_service=backend_service,
+        public_probe=public_probe,
+        backend_probe=backend_probe,
+    )
+    if (
+        query_surface_contract_outage
+        and backend_data_ownership is not None
+        and backend_data_ownership.has_drift
+    ):
+        return RemoteChonkyDBRepairPlan(
+            action="repair_backend_startup_contract_and_data_ownership_then_restart_backend_service",
+            reason="backend_query_surface_contract_and_data_permission_drift",
+        )
+    if query_surface_contract_outage:
+        return RemoteChonkyDBRepairPlan(
+            action="repair_backend_startup_contract_and_restart_backend_service",
+            reason="backend_query_surface_contract",
+        )
+    if payload_read_gate_outage and backend_data_ownership is not None and backend_data_ownership.has_drift:
+        return RemoteChonkyDBRepairPlan(
+            action="repair_backend_startup_contract_and_data_ownership_then_restart_backend_service",
+            reason="backend_payload_read_gate_and_data_permission_drift",
+        )
+    if payload_read_gate_outage:
+        return RemoteChonkyDBRepairPlan(
+            action="repair_backend_startup_contract_and_restart_backend_service",
+            reason="backend_payload_read_gate",
+        )
+    if vector_warmup_timeout_outage and backend_data_ownership is not None and backend_data_ownership.has_drift:
+        return RemoteChonkyDBRepairPlan(
+            action="repair_backend_startup_contract_and_data_ownership_then_restart_backend_service",
+            reason="backend_vector_warmup_timeout_budget_and_data_permission_drift",
+        )
+    if vector_warmup_timeout_outage:
+        return RemoteChonkyDBRepairPlan(
+            action="repair_backend_startup_contract_and_restart_backend_service",
+            reason="backend_vector_warmup_timeout_budget",
+        )
     if backend_data_ownership is not None and backend_data_ownership.has_drift:
         return RemoteChonkyDBRepairPlan(
-            action="none",
+            action="repair_backend_data_ownership_and_restart_backend_service",
             reason="backend_data_permission_drift",
         )
     if not backend_service.healthy:
@@ -478,6 +743,14 @@ def plan_remote_chonkydb_repair(
             action="none",
             reason="backend_foreign_consumer_contention",
         )
+    if _backend_probe_indicates_active_but_unresponsive_service(
+        backend_service=backend_service,
+        backend_probe=backend_probe,
+    ):
+        return RemoteChonkyDBRepairPlan(
+            action="restart_backend_service",
+            reason="backend_active_but_unresponsive",
+        )
     if backend_probe.ready:
         return RemoteChonkyDBRepairPlan(
             action="none",
@@ -486,6 +759,141 @@ def plan_remote_chonkydb_repair(
     return RemoteChonkyDBRepairPlan(
         action="restart_backend_service",
         reason="backend_local_unhealthy",
+    )
+
+
+def _payload_read_gate_causes_outage(
+    *,
+    contract: BackendQuerySurfaceReadinessContract | None,
+    backend_service: ChonkyDBRemoteServiceState,
+    public_probe: ChonkyDBHttpProbeResult,
+    backend_probe: ChonkyDBHttpProbeResult,
+) -> bool:
+    """Return whether a disabled payload-read startup contract is the outage."""
+
+    if contract is None:
+        return False
+    if not backend_service.healthy:
+        return False
+    if not contract.warmup_wait_for_ready or contract.warmup_payload_read_path:
+        return False
+    return is_explicit_service_warmup_detail(
+        public_probe.detail,
+    ) and is_explicit_service_warmup_detail(backend_probe.detail)
+
+
+def _query_surface_contract_causes_outage(
+    *,
+    contract: BackendQuerySurfaceReadinessContract | None,
+    backend_service: ChonkyDBRemoteServiceState,
+    public_probe: ChonkyDBHttpProbeResult,
+    backend_probe: ChonkyDBHttpProbeResult,
+) -> bool:
+    """Return whether the query-surface readiness contract itself is unsafe."""
+
+    if contract is None or not contract.unsafe:
+        return False
+    if not backend_service.healthy:
+        return False
+    if contract.unsafe_reason == "fulltext_rebuild_on_open_without_query_gate":
+        return False
+    return is_explicit_service_warmup_detail(
+        public_probe.detail,
+    ) and is_explicit_service_warmup_detail(backend_probe.detail)
+
+
+def _vector_warmup_timeout_contract_causes_outage(
+    *,
+    contract: BackendVectorWarmupContract | None,
+    backend_service: ChonkyDBRemoteServiceState,
+    public_probe: ChonkyDBHttpProbeResult,
+    backend_probe: ChonkyDBHttpProbeResult,
+) -> bool:
+    """Return whether a too-short vector budget strands full-scope startup."""
+
+    if contract is None or not contract.unsafe:
+        return False
+    if not backend_service.healthy:
+        return False
+    return is_explicit_service_warmup_detail(
+        public_probe.detail,
+    ) and is_explicit_service_warmup_detail(backend_probe.detail)
+
+
+def is_explicit_service_warmup_detail(detail: str | None) -> bool:
+    """Return whether one backend detail explicitly reports startup warmup."""
+
+    return is_explicit_remote_transient_detail(detail)
+
+
+def extract_backend_problem_detail(exc: BaseException | None) -> str | None:
+    """Return one bounded backend problem-detail string from the exception chain."""
+
+    if exc is None:
+        return None
+    for item in _exception_chain(exc):
+        if not isinstance(item, ChonkyDBError):
+            continue
+        response_json = item.response_json if isinstance(item.response_json, dict) else None
+        if response_json is not None:
+            detail = _normalize_problem_detail(response_json.get("detail"))
+            if detail:
+                return detail
+        detail = _normalize_problem_detail(item.response_text)
+        if detail:
+            return detail
+    return None
+
+
+def _exception_chain(exc: BaseException) -> tuple[BaseException, ...]:
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return tuple(chain)
+
+
+def _normalize_problem_detail(value: object) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if len(text) > 240:
+        return text[:240].rstrip()
+    return text
+
+
+def _backend_probe_indicates_active_but_unresponsive_service(
+    *,
+    backend_service: ChonkyDBRemoteServiceState,
+    backend_probe: ChonkyDBHttpProbeResult,
+) -> bool:
+    """Return whether the backend stayed active while its loopback HTTP surface stopped answering.
+
+    Live 2026-04-09 incident evidence showed the dedicated backend keeping an
+    `active/running` systemd state after an internal DocID mapping persistence
+    failure while `127.0.0.1:3044` timed out completely. Treat that outage
+    shape as a distinct operator diagnosis instead of collapsing it into the
+    generic local-unhealthy bucket.
+    """
+
+    if not backend_service.healthy or backend_probe.ready:
+        return False
+    if int(backend_probe.status_code or 0) != 0:
+        return False
+    if str(backend_probe.error or "").strip() == "TimeoutError":
+        return True
+    detail = str(backend_probe.detail or "").strip().lower()
+    return any(
+        fragment in detail
+        for fragment in (
+            "timed out",
+            "timeout",
+            "connection refused",
+            "connection reset",
+        )
     )
 
 
@@ -528,6 +936,14 @@ def repair_remote_chonkydb(
         executor=executor,
         service_name=settings.backend_service,
     )
+    backend_readiness_contract = fetch_backend_query_surface_readiness_contract(
+        executor=executor,
+        service_name=settings.backend_service,
+    )
+    backend_vector_warmup_contract = fetch_backend_vector_warmup_contract(
+        executor=executor,
+        service_name=settings.backend_service,
+    )
     foreign_consumers: tuple[ForeignBackendConsumer, ...] = ()
     foreign_consumer_inspection_error: str | None = None
     try:
@@ -543,18 +959,43 @@ def repair_remote_chonkydb(
         backend_probe=backend_before,
         foreign_consumers=foreign_consumers,
         backend_data_ownership=backend_data_ownership,
+        backend_readiness_contract=backend_readiness_contract,
+        backend_vector_warmup_contract=backend_vector_warmup_contract,
     )
     action_taken = "none"
     public_after = public_before
     backend_service_after = backend_service_before
     backend_after = backend_before
 
-    if plan.action == "restart_backend_service":
+    restart_actions = {
+        "restart_backend_service",
+        "repair_backend_startup_contract_and_restart_backend_service",
+        "repair_backend_data_ownership_and_restart_backend_service",
+        "repair_backend_startup_contract_and_data_ownership_then_restart_backend_service",
+    }
+    if plan.action in restart_actions:
         if restart_if_needed:
             ensure_backend_query_surface_readiness_contract(
                 executor=executor,
                 service_name=settings.backend_service,
             )
+            ensure_backend_payload_read_warmup_contract(
+                executor=executor,
+                service_name=settings.backend_service,
+            )
+            ensure_backend_vector_warmup_timeout_contract(
+                executor=executor,
+                service_name=settings.backend_service,
+            )
+            ensure_backend_payload_sync_bulk_api_ready_contract(
+                executor=executor,
+                service_name=settings.backend_service,
+            )
+            if backend_data_ownership is not None and backend_data_ownership.has_drift:
+                repair_backend_data_ownership(
+                    executor=executor,
+                    service_name=settings.backend_service,
+                )
             restart_backend_service(
                 executor=executor,
                 service_name=settings.backend_service,
@@ -578,7 +1019,10 @@ def repair_remote_chonkydb(
     elif plan.reason == "backend_foreign_consumer_contention":
         diagnosis = "backend_foreign_consumer_contention"
     elif action_taken == "restart_required_but_skipped":
-        diagnosis = "backend_restart_required"
+        if plan.reason == "backend_active_but_unresponsive":
+            diagnosis = "backend_active_but_unresponsive_restart_required"
+        else:
+            diagnosis = "backend_restart_required"
     elif action_taken == "restart_backend_service" and not public_after.ready:
         diagnosis = "backend_restart_did_not_restore_public_health"
     return RemoteChonkyDBRepairResult(
@@ -616,7 +1060,7 @@ def probe_public_chonkydb(
         },
         timeout_s=timeout_s,
     )
-    if not instance_probe.ready:
+    if not _should_probe_query_surface_after_instance_probe(instance_probe):
         return instance_probe
     query_probe = _probe_http_json(
         label="public",
@@ -661,6 +1105,19 @@ def fetch_backend_service_state(
     )
 
 
+def _fetch_backend_service_env_map(
+    *,
+    executor: RemoteChonkyDBExecutor,
+    service_name: str,
+) -> dict[str, str]:
+    """Return the live `systemd` environment mapping for one backend service."""
+
+    env_output = executor.run_sudo_ssh(
+        "systemctl show -p Environment --no-pager " + shlex.quote(service_name)
+    ).stdout
+    return _parse_systemd_environment_output(env_output)
+
+
 def probe_backend_local_chonkydb(
     *,
     executor: RemoteChonkyDBExecutor,
@@ -669,10 +1126,10 @@ def probe_backend_local_chonkydb(
 ) -> ChonkyDBHttpProbeResult:
     """Probe the backend loopback instance on the remote host."""
 
-    env_output = executor.run_sudo_ssh(
-        "systemctl show -p Environment --no-pager " + shlex.quote(settings.backend_service)
-    ).stdout
-    env_map = _parse_systemd_environment_output(env_output)
+    env_map = _fetch_backend_service_env_map(
+        executor=executor,
+        service_name=settings.backend_service,
+    )
     api_key = (
         str(env_map.get("CHONKDB_API_KEY") or env_map.get("CCODEX_MEMORY_API_KEY") or "").strip()
         or settings.public_api_key
@@ -706,7 +1163,7 @@ def probe_backend_local_chonkydb(
         input_text=json.dumps(instance_probe_payload, ensure_ascii=False),
     )
     instance_probe = _probe_result_from_remote_payload(json.loads(completed.stdout))
-    if not instance_probe.ready:
+    if not _should_probe_query_surface_after_instance_probe(instance_probe):
         return instance_probe
     query_probe_payload = {
         "url": settings.backend_local_base_url.rstrip("/") + "/v1/external/retrieve/topk_records",
@@ -779,6 +1236,53 @@ def inspect_backend_data_ownership(
     )
 
 
+def repair_backend_data_ownership(
+    *,
+    executor: RemoteChonkyDBExecutor,
+    service_name: str,
+) -> BackendDataOwnershipRepairStatus:
+    """Repair data-dir owner/group drift to the backend service account."""
+
+    current = inspect_backend_data_ownership(
+        executor=executor,
+        service_name=service_name,
+    )
+    if current is None:
+        return BackendDataOwnershipRepairStatus(
+            data_dir="",
+            expected_user="",
+            expected_group="",
+            changed_entry_count=0,
+            error="missing_backend_data_ownership_state",
+        )
+    if not current.has_drift or current.error:
+        return BackendDataOwnershipRepairStatus(
+            data_dir=current.data_dir,
+            expected_user=current.expected_user,
+            expected_group=current.expected_group,
+            changed_entry_count=0,
+            error=current.error,
+        )
+    payload = {
+        "data_dir": current.data_dir,
+        "expected_user": current.expected_user,
+        "expected_group": current.expected_group,
+    }
+    completed = executor.run_sudo_ssh(
+        _python_backend_data_ownership_repair_script(payload=payload),
+    )
+    parsed = _parse_json_payload(completed.stdout)
+    return BackendDataOwnershipRepairStatus(
+        data_dir=str(parsed.get("data_dir") or current.data_dir).strip(),
+        expected_user=str(parsed.get("expected_user") or current.expected_user).strip()
+        or current.expected_user,
+        expected_group=str(parsed.get("expected_group") or current.expected_group).strip()
+        or current.expected_group,
+        changed_entry_count=int(_parse_optional_int(parsed.get("changed_entry_count")) or 0),
+        error=str(parsed.get("error") or "").strip() or None,
+    )
+
+
 def inspect_foreign_backend_consumers(
     *,
     executor: RemoteChonkyDBExecutor,
@@ -840,10 +1344,10 @@ def ensure_backend_query_surface_readiness_contract(
     the corrected env contract take effect.
     """
 
-    env_output = executor.run_sudo_ssh(
-        "systemctl show -p Environment --no-pager " + shlex.quote(service_name)
-    ).stdout
-    env_map = _parse_systemd_environment_output(env_output)
+    env_map = _fetch_backend_service_env_map(
+        executor=executor,
+        service_name=service_name,
+    )
     contract = _backend_query_surface_readiness_contract_from_env(env_map)
     dropin_path = f"/etc/systemd/system/{service_name}.d/40-twinr-query-surface-readiness.conf"
     if not contract.unsafe:
@@ -859,10 +1363,11 @@ def ensure_backend_query_surface_readiness_contract(
         else 180.0
     )
     dropin_content = _backend_query_surface_readiness_dropin_content(
+        contract=contract,
         readiness_timeout_s=readiness_timeout_s,
     )
     completed = executor.run_sudo_ssh(
-        _python_backend_query_surface_readiness_dropin_script(
+        _python_service_dropin_sync_script(
             dropin_path=dropin_path,
             dropin_content=dropin_content,
         )
@@ -873,6 +1378,147 @@ def ensure_backend_query_surface_readiness_contract(
         dropin_path=str(payload.get("path") or dropin_path).strip() or dropin_path,
         changed=changed,
         contract=contract,
+    )
+
+
+def fetch_backend_query_surface_readiness_contract(
+    *,
+    executor: RemoteChonkyDBExecutor,
+    service_name: str,
+) -> BackendQuerySurfaceReadinessContract:
+    """Return the live startup-readiness contract from the backend env."""
+
+    return _backend_query_surface_readiness_contract_from_env(
+        _fetch_backend_service_env_map(
+            executor=executor,
+            service_name=service_name,
+        )
+    )
+
+
+def ensure_backend_payload_read_warmup_contract(
+    *,
+    executor: RemoteChonkyDBExecutor,
+    service_name: str,
+) -> BackendPayloadReadWarmupRepairStatus:
+    """Restore the required payload-read startup contract for Twinr."""
+
+    contract = fetch_backend_query_surface_readiness_contract(
+        executor=executor,
+        service_name=service_name,
+    )
+    dropin_path = f"/etc/systemd/system/{service_name}.d/45-twinr-disable-payload-read-gate.conf"
+    payload_timeout_s = (
+        float(contract.warmup_payload_read_timeout_s)
+        if contract.warmup_payload_read_timeout_s is not None
+        and float(contract.warmup_payload_read_timeout_s) > 0.0
+        else 30.0
+    )
+    if contract.warmup_payload_read_path and payload_timeout_s > 0.0:
+        return BackendPayloadReadWarmupRepairStatus(
+            dropin_path=dropin_path,
+            changed=False,
+            contract=contract,
+        )
+    completed = executor.run_sudo_ssh(
+        _python_service_dropin_sync_script(
+            dropin_path=dropin_path,
+            dropin_content=_backend_payload_read_warmup_dropin_content(
+                payload_timeout_s=payload_timeout_s,
+            ),
+        )
+    )
+    payload = _parse_json_payload(completed.stdout)
+    return BackendPayloadReadWarmupRepairStatus(
+        dropin_path=str(payload.get("path") or dropin_path).strip() or dropin_path,
+        changed=bool(payload.get("changed")),
+        contract=contract,
+    )
+
+
+def ensure_backend_payload_sync_bulk_api_ready_contract(
+    *,
+    executor: RemoteChonkyDBExecutor,
+    service_name: str,
+) -> BackendPayloadSyncBulkApiReadyRepairStatus:
+    """Disable the over-strict sync-bulk API ready gate for Twinr dedicated writes."""
+
+    contract = _backend_payload_sync_bulk_api_ready_contract_from_env(
+        _fetch_backend_service_env_map(
+            executor=executor,
+            service_name=service_name,
+        )
+    )
+    dropin_path = f"/etc/systemd/system/{service_name}.d/46-twinr-disable-sync-bulk-api-ready-gate.conf"
+    if not contract.unsafe:
+        return BackendPayloadSyncBulkApiReadyRepairStatus(
+            dropin_path=dropin_path,
+            changed=False,
+            contract=contract,
+        )
+    completed = executor.run_sudo_ssh(
+        _python_service_dropin_sync_script(
+            dropin_path=dropin_path,
+            dropin_content=_backend_payload_sync_bulk_api_ready_dropin_content(),
+        )
+    )
+    payload = _parse_json_payload(completed.stdout)
+    return BackendPayloadSyncBulkApiReadyRepairStatus(
+        dropin_path=str(payload.get("path") or dropin_path).strip() or dropin_path,
+        changed=bool(payload.get("changed")),
+        contract=contract,
+    )
+
+
+def fetch_backend_vector_warmup_contract(
+    *,
+    executor: RemoteChonkyDBExecutor,
+    service_name: str,
+) -> BackendVectorWarmupContract:
+    """Return the live vector-warmup budget contract from the backend env."""
+
+    return _backend_vector_warmup_contract_from_env(
+        _fetch_backend_service_env_map(
+            executor=executor,
+            service_name=service_name,
+        )
+    )
+
+
+def ensure_backend_vector_warmup_timeout_contract(
+    *,
+    executor: RemoteChonkyDBExecutor,
+    service_name: str,
+) -> BackendVectorWarmupRepairStatus:
+    """Align vector warmup timeout with the full-scope ready-wait budget."""
+
+    contract = fetch_backend_vector_warmup_contract(
+        executor=executor,
+        service_name=service_name,
+    )
+    dropin_path = f"/etc/systemd/system/{service_name}.d/52-twinr-vector-warmup-budget.conf"
+    target_timeout_s = contract.target_vector_open_timeout_s
+    if not contract.unsafe or target_timeout_s is None:
+        return BackendVectorWarmupRepairStatus(
+            dropin_path=dropin_path,
+            changed=False,
+            contract=contract,
+            target_vector_open_timeout_s=target_timeout_s,
+        )
+    completed = executor.run_sudo_ssh(
+        _python_service_dropin_sync_script(
+            dropin_path=dropin_path,
+            dropin_content=_backend_vector_warmup_timeout_dropin_content(
+                vector_open_timeout_s=target_timeout_s,
+            ),
+        )
+    )
+    payload = _parse_json_payload(completed.stdout)
+    return BackendVectorWarmupRepairStatus(
+        dropin_path=str(payload.get("path") or dropin_path).strip() or dropin_path,
+        changed=bool(payload.get("changed")),
+        contract=contract,
+        target_vector_open_timeout_s=target_timeout_s,
     )
 
 
@@ -1009,6 +1655,21 @@ def _probe_result_from_remote_payload(payload: Mapping[str, Any]) -> ChonkyDBHtt
     )
 
 
+def _should_probe_query_surface_after_instance_probe(instance_probe: ChonkyDBHttpProbeResult) -> bool:
+    """Return whether the live query canary should run after `/instance`.
+
+    Live 2026-04-11 evidence showed the dedicated backend continuing to return
+    `503 Service warmup in progress` on `/v1/external/instance` even while the
+    real `catalog/current` query surface was already resolving current heads.
+    Keep probing the authoritative query path for explicit warmup responses so
+    repair/recovery flows do not keep treating a usable backend as still down.
+    """
+
+    if instance_probe.ok:
+        return True
+    return is_explicit_service_warmup_detail(instance_probe.detail)
+
+
 def _query_surface_canary_payload(*, runtime_namespace: str) -> dict[str, object]:
     """Return a tiny current-scope query canary for ChonkyDB read readiness."""
 
@@ -1031,7 +1692,22 @@ def _require_query_surface_ready(
     """Only mark ChonkyDB ready when the query surface works after `/instance`."""
 
     if query_probe.ok or _query_probe_empty_but_healthy(query_probe):
-        return instance_probe
+        if instance_probe.ready:
+            return instance_probe
+        detail = str(instance_probe.detail or "").strip()
+        if detail:
+            detail = f"query_surface_ready_despite_instance_flag_false: {detail}"
+        else:
+            detail = "query_surface_ready_despite_instance_flag_false"
+        return ChonkyDBHttpProbeResult(
+            label=instance_probe.label,
+            ok=True,
+            status_code=200,
+            ready=True,
+            detail=detail,
+            url=query_probe.url or instance_probe.url,
+            payload=query_probe.payload or instance_probe.payload,
+        )
     return ChonkyDBHttpProbeResult(
         label=instance_probe.label,
         ok=False,
@@ -1145,25 +1821,108 @@ def _backend_query_surface_readiness_contract_from_env(
             env_map.get("CHONKY_API_WARMUP_WAIT_FOR_READY"),
             default=False,
         ),
+        ready_default_scope=str(env_map.get("CHONKY_API_READY_DEFAULT_SCOPE") or "").strip().lower()
+        or "full",
+        serving_contract_scope=str(env_map.get("CHONKY_API_SERVING_CONTRACT_SCOPE") or "").strip().lower()
+        or str(env_map.get("CHONKY_API_READY_DEFAULT_SCOPE") or "").strip().lower()
+        or "full",
         warmup_wait_ready_timeout_s=_parse_optional_float(
             env_map.get("CHONKY_API_WARMUP_WAIT_READY_TIMEOUT_S"),
+        ),
+        warmup_payload_read_path=_parse_env_flag(
+            env_map.get("CHONKY_API_WARMUP_PAYLOAD_READ_PATH"),
+            default=False,
+        ),
+        warmup_payload_read_timeout_s=_parse_optional_float(
+            env_map.get("CHONKY_API_WARMUP_PAYLOAD_READ_TIMEOUT_S"),
         ),
     )
 
 
-def _backend_query_surface_readiness_dropin_content(*, readiness_timeout_s: float) -> str:
+def _backend_payload_sync_bulk_api_ready_contract_from_env(
+    env_map: Mapping[str, str],
+) -> BackendPayloadSyncBulkApiReadyContract:
+    """Summarize the startup env flags that govern sync-bulk write readiness."""
+
+    return BackendPayloadSyncBulkApiReadyContract(
+        ready_default_scope=str(env_map.get("CHONKY_API_READY_DEFAULT_SCOPE") or "").strip().lower() or "full",
+        payload_sync_bulk_require_api_ready=_parse_env_flag(
+            env_map.get("CHONKY_API_PAYLOADS_SYNC_BULK_REQUIRE_API_READY"),
+            default=True,
+        ),
+    )
+
+
+def _backend_vector_warmup_contract_from_env(
+    env_map: Mapping[str, str],
+) -> BackendVectorWarmupContract:
+    """Summarize the vector warmup budget that gates full-scope readiness."""
+
+    return BackendVectorWarmupContract(
+        ready_default_scope=str(env_map.get("CHONKY_API_READY_DEFAULT_SCOPE") or "").strip().lower() or "full",
+        serving_contract_scope=str(env_map.get("CHONKY_API_SERVING_CONTRACT_SCOPE") or "").strip().lower() or "full",
+        warmup_wait_for_ready=_parse_env_flag(
+            env_map.get("CHONKY_API_WARMUP_WAIT_FOR_READY"),
+            default=False,
+        ),
+        warmup_wait_ready_timeout_s=_parse_optional_float(
+            env_map.get("CHONKY_API_WARMUP_WAIT_READY_TIMEOUT_S"),
+        ),
+        warmup_vector_open_timeout_s=_parse_optional_float(
+            env_map.get("CHONKY_API_WARMUP_VECTOR_OPEN_TIMEOUT_S"),
+        ),
+    )
+
+
+def _backend_query_surface_readiness_dropin_content(
+    *,
+    contract: BackendQuerySurfaceReadinessContract,
+    readiness_timeout_s: float,
+) -> str:
     """Render the hardened startup contract for the dedicated backend service."""
 
+    gate_value = "1" if contract.requires_full_scope_warmup else "0"
     return (
         "[Service]\n"
-        "# Keep the query surface fail-closed while rebuild-on-open finishes.\n"
-        "Environment=CHONKY_API_WARMUP_FULLTEXT_GATE=1\n"
+        "# Keep the query surface on the configured serving contract.\n"
+        f"Environment=CHONKY_API_WARMUP_FULLTEXT_GATE={gate_value}\n"
         "Environment=CHONKY_API_WARMUP_WAIT_FOR_READY=1\n"
         f"Environment=CHONKY_API_WARMUP_WAIT_READY_TIMEOUT_S={int(max(1.0, readiness_timeout_s))}\n"
     )
 
 
-def _python_backend_query_surface_readiness_dropin_script(
+def _backend_payload_read_warmup_dropin_content(*, payload_timeout_s: float) -> str:
+    """Render the sanctioned Twinr payload-read startup contract."""
+
+    return (
+        "[Service]\n"
+        "# Keep the Twinr dedicated backend on the sanctioned payload-read startup lane.\n"
+        "Environment=CHONKY_API_WARMUP_PAYLOAD_READ_PATH=1\n"
+        f"Environment=CHONKY_API_WARMUP_PAYLOAD_READ_TIMEOUT_S={int(max(1.0, payload_timeout_s))}\n"
+    )
+
+
+def _backend_payload_sync_bulk_api_ready_dropin_content() -> str:
+    """Render the Twinr-specific override that disables sync-bulk API ready gating."""
+
+    return (
+        "[Service]\n"
+        "# Twinr writes must not wait for unrelated full-scope startup warmup.\n"
+        "Environment=CHONKY_API_PAYLOADS_SYNC_BULK_REQUIRE_API_READY=0\n"
+    )
+
+
+def _backend_vector_warmup_timeout_dropin_content(*, vector_open_timeout_s: float) -> str:
+    """Render the Twinr-specific override that widens vector warmup budget."""
+
+    return (
+        "[Service]\n"
+        "# Full-scope warmup must not abort vector open before ready-wait expires.\n"
+        f"Environment=CHONKY_API_WARMUP_VECTOR_OPEN_TIMEOUT_S={int(max(1.0, vector_open_timeout_s))}\n"
+    )
+
+
+def _python_service_dropin_sync_script(
     *,
     dropin_path: str,
     dropin_content: str,
@@ -1184,6 +1943,67 @@ def _python_backend_query_surface_readiness_dropin_script(
         "print(json.dumps({'path': str(path), 'changed': changed}, ensure_ascii=False))\n"
         "PY\n"
         "systemctl daemon-reload"
+    )
+
+
+def _python_backend_data_ownership_repair_script(*, payload: Mapping[str, object]) -> str:
+    """Return one remote Python script that repairs data-dir owner/group drift."""
+
+    return (
+        "python3 - <<'PY'\n"
+        "from __future__ import annotations\n"
+        "import grp\n"
+        "import json\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "import pwd\n"
+        f"payload = json.loads({json.dumps(dict(payload), ensure_ascii=False)!r})\n"
+        "data_dir = str(payload.get('data_dir') or '').strip()\n"
+        "expected_user = str(payload.get('expected_user') or '').strip() or 'root'\n"
+        "expected_group = str(payload.get('expected_group') or '').strip() or expected_user\n"
+        "result = {\n"
+        "    'data_dir': data_dir,\n"
+        "    'expected_user': expected_user,\n"
+        "    'expected_group': expected_group,\n"
+        "    'changed_entry_count': 0,\n"
+        "    'error': '',\n"
+        "}\n"
+        "if not data_dir:\n"
+        "    result['error'] = 'missing_data_dir'\n"
+        "    print(json.dumps(result, ensure_ascii=False))\n"
+        "    raise SystemExit(0)\n"
+        "path = Path(data_dir)\n"
+        "if not path.exists():\n"
+        "    result['error'] = 'data_dir_not_found'\n"
+        "    print(json.dumps(result, ensure_ascii=False))\n"
+        "    raise SystemExit(0)\n"
+        "try:\n"
+        "    expected_uid = pwd.getpwnam(expected_user).pw_uid\n"
+        "    expected_gid = grp.getgrnam(expected_group).gr_gid\n"
+        "except KeyError as exc:\n"
+        "    result['error'] = f'missing_identity:{exc}'\n"
+        "    print(json.dumps(result, ensure_ascii=False))\n"
+        "    raise SystemExit(0)\n"
+        "def _repair_one(raw_path: str) -> None:\n"
+        "    stat_result = os.lstat(raw_path)\n"
+        "    if int(stat_result.st_uid) == int(expected_uid) and int(stat_result.st_gid) == int(expected_gid):\n"
+        "        return\n"
+        "    os.chown(raw_path, int(expected_uid), int(expected_gid), follow_symlinks=False)\n"
+        "    result['changed_entry_count'] += 1\n"
+        "try:\n"
+        "    _repair_one(data_dir)\n"
+        "    stack = [data_dir]\n"
+        "    while stack:\n"
+        "        current = stack.pop()\n"
+        "        with os.scandir(current) as entries:\n"
+        "            for entry in entries:\n"
+        "                _repair_one(entry.path)\n"
+        "                if entry.is_dir(follow_symlinks=False):\n"
+        "                    stack.append(entry.path)\n"
+        "except OSError as exc:\n"
+        "    result['error'] = f'{type(exc).__name__}:{exc}'\n"
+        "print(json.dumps(result, ensure_ascii=False))\n"
+        "PY"
     )
 
 

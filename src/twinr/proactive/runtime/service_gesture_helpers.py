@@ -9,6 +9,9 @@ orchestrator.
 # BUG-1: Gesture wake dispatch no longer fails closed when priming sensor context,
 # BUG-2: forensic tracing or debug serialization raises; those side effects are
 #        now isolated so wake/refresh control flow keeps running.
+# BUG-3: Transcript-first voice runtimes now fail close the dedicated HDMI
+#        gesture lane through the shared refresh helper contract, so the
+#        proactive monitor never arms the heavy lane on the streaming PID.
 # SEC-1: Arbitrary pipeline debug payloads are no longer emitted directly.
 #        Telemetry is now bounded and serialization-safe while preserving the
 #        stable gesture-stream contract fields expected by local debug tooling.

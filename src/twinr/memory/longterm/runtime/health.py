@@ -29,6 +29,9 @@ _WARM_PROOF_READINESS_PROVES = (
     "configured namespace graph current-view readability",
     "configured namespace midterm current-head readability",
 )
+_FAST_TOPIC_PROOF_PROVES = (
+    "configured namespace current-scope fast-topic retrieval route",
+)
 _WARM_PROOF_ARCHIVE_ONLY_PROVES = (
     "configured namespace archive-head readability",
 )
@@ -46,10 +49,14 @@ def _warm_result_proof_contract(
     archive_checked: bool,
     archive_safe: bool,
     health_tier: str,
+    fast_topic_checked: bool,
+    fast_topic_ready: bool,
 ) -> dict[str, object]:
     """Describe exactly which remote-memory contract one warm probe proves."""
 
     proved = list(_WARM_PROOF_READINESS_PROVES)
+    if fast_topic_checked and fast_topic_ready:
+        proved.extend(_FAST_TOPIC_PROOF_PROVES)
     if archive_checked:
         proved.extend(_WARM_PROOF_ARCHIVE_ONLY_PROVES)
     contract_id = (
@@ -57,6 +64,14 @@ def _warm_result_proof_contract(
         if archive_checked
         else "configured_namespace_current_only_readiness"
     )
+    if archive_checked and fast_topic_checked and fast_topic_ready:
+        summary = "Proves archive-inclusive warm reads plus the configured fast-topic route for the runtime namespace."
+    elif archive_checked:
+        summary = "Proves archive-inclusive warm reads for the configured runtime namespace."
+    elif fast_topic_checked and fast_topic_ready:
+        summary = "Proves current-state warm reads plus the configured fast-topic route for the runtime namespace."
+    else:
+        summary = "Proves current-state warm reads for the configured runtime namespace only."
     return {
         "contract_id": contract_id,
         "contract_kind": "warm_read_readiness",
@@ -66,13 +81,16 @@ def _warm_result_proof_contract(
         "archive_checked": archive_checked,
         "archive_safe": archive_safe,
         "health_tier": health_tier,
+        "fast_topic_checked": fast_topic_checked,
+        "fast_topic_ready": fast_topic_ready,
         "operations_proved": proved,
-        "operations_not_proved": list(_WARM_PROOF_DOES_NOT_PROVE),
-        "summary": (
-            "Proves archive-inclusive warm reads for the configured runtime namespace."
-            if archive_checked
-            else "Proves current-state warm reads for the configured runtime namespace only."
+        "operations_not_proved": list(
+            (
+                *_WARM_PROOF_DOES_NOT_PROVE,
+                *(() if fast_topic_checked and fast_topic_ready else _FAST_TOPIC_PROOF_PROVES),
+            )
         ),
+        "summary": summary,
     }
 
 
@@ -121,6 +139,8 @@ class LongTermRemoteWarmResult:
     archive_checked: bool = True
     archive_safe: bool = True
     health_tier: str = "ready"
+    fast_topic_checked: bool = False
+    fast_topic_ready: bool = False
 
     def proof_contract(self) -> dict[str, object]:
         """Return the exact operator-facing contract this warm probe attests."""
@@ -130,6 +150,8 @@ class LongTermRemoteWarmResult:
             archive_checked=self.archive_checked,
             archive_safe=self.archive_safe,
             health_tier=self.health_tier,
+            fast_topic_checked=self.fast_topic_checked,
+            fast_topic_ready=self.fast_topic_ready,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -146,6 +168,8 @@ class LongTermRemoteWarmResult:
             "archive_checked": self.archive_checked,
             "archive_safe": self.archive_safe,
             "health_tier": self.health_tier,
+            "fast_topic_checked": self.fast_topic_checked,
+            "fast_topic_ready": self.fast_topic_ready,
             "proof_contract": self.proof_contract(),
         }
 
@@ -176,6 +200,9 @@ class LongTermRemoteHealthProbe:
         checked: list[str] = []
         checks: list[LongTermRemoteWarmCheck] = []
         try:
+            prompt_memory_kind = str(
+                getattr(self.prompt_context_store.memory_store, "remote_snapshot_kind", "") or ""
+            )
             prompt_remote_state = self._require_remote_state(self.prompt_context_store.memory_store.remote_state)
             prompt_memory_probe = getattr(self.prompt_context_store.memory_store, "probe_remote_current_head", None)
             prompt_memory_load = getattr(self.prompt_context_store.memory_store, "load_remote_current_head", None)
@@ -188,7 +215,7 @@ class LongTermRemoteHealthProbe:
                 )
                 result = self._probe_store_payload(
                     store="prompt_context",
-                    snapshot_kind=self.prompt_context_store.memory_store.remote_snapshot_kind,
+                    snapshot_kind=prompt_memory_kind,
                     payload=payload,
                     checked=checked,
                     checks=checks,
@@ -199,13 +226,16 @@ class LongTermRemoteHealthProbe:
                 result = self._probe_snapshot(
                     store="prompt_context",
                     remote_state=prompt_remote_state,
-                    snapshot_kind=self.prompt_context_store.memory_store.remote_snapshot_kind,
+                    snapshot_kind=prompt_memory_kind,
                     checked=checked,
                     checks=checks,
                     include_archive=include_archive,
                 )
             if not result.ready:
                 return result
+            prompt_user_kind = str(
+                getattr(self.prompt_context_store.user_store, "remote_snapshot_kind", "") or ""
+            )
             prompt_user_probe = getattr(self.prompt_context_store.user_store, "probe_remote_current_head", None)
             prompt_user_load = getattr(self.prompt_context_store.user_store, "load_remote_current_head", None)
             if callable(prompt_user_probe) or callable(prompt_user_load):
@@ -217,7 +247,7 @@ class LongTermRemoteHealthProbe:
                 )
                 result = self._probe_store_payload(
                     store="prompt_context",
-                    snapshot_kind=self.prompt_context_store.user_store.remote_snapshot_kind,
+                    snapshot_kind=prompt_user_kind,
                     payload=payload,
                     checked=checked,
                     checks=checks,
@@ -228,13 +258,16 @@ class LongTermRemoteHealthProbe:
                 result = self._probe_snapshot(
                     store="prompt_context",
                     remote_state=prompt_remote_state,
-                    snapshot_kind=self.prompt_context_store.user_store.remote_snapshot_kind,
+                    snapshot_kind=prompt_user_kind,
                     checked=checked,
                     checks=checks,
                     include_archive=include_archive,
                 )
             if not result.ready:
                 return result
+            prompt_personality_kind = str(
+                getattr(self.prompt_context_store.personality_store, "remote_snapshot_kind", "") or ""
+            )
             prompt_personality_probe = getattr(self.prompt_context_store.personality_store, "probe_remote_current_head", None)
             prompt_personality_load = getattr(self.prompt_context_store.personality_store, "load_remote_current_head", None)
             if callable(prompt_personality_probe) or callable(prompt_personality_load):
@@ -246,7 +279,7 @@ class LongTermRemoteHealthProbe:
                 )
                 result = self._probe_store_payload(
                     store="prompt_context",
-                    snapshot_kind=self.prompt_context_store.personality_store.remote_snapshot_kind,
+                    snapshot_kind=prompt_personality_kind,
                     payload=payload,
                     checked=checked,
                     checks=checks,
@@ -257,7 +290,7 @@ class LongTermRemoteHealthProbe:
                 result = self._probe_snapshot(
                     store="prompt_context",
                     remote_state=prompt_remote_state,
-                    snapshot_kind=self.prompt_context_store.personality_store.remote_snapshot_kind,
+                    snapshot_kind=prompt_personality_kind,
                     checked=checked,
                     checks=checks,
                     include_archive=include_archive,
@@ -626,10 +659,8 @@ class LongTermRemoteHealthProbe:
         probe_mode = "archive_inclusive" if include_archive else "current_only"
         if not ready:
             health_tier = "hard_down"
-        elif include_archive:
-            health_tier = "ready"
         else:
-            health_tier = "degraded"
+            health_tier = "ready"
         return LongTermRemoteWarmResult(
             checked_snapshots=checked_snapshots,
             ready=ready,

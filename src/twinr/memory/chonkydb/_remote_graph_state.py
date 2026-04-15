@@ -11,7 +11,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, cast
 
-from twinr.agent.workflows.forensics import workflow_event
+from twinr.agent.workflows.forensics import workflow_decision, workflow_event
 from twinr.memory.chonkydb.client import ChonkyDBError
 from twinr.memory.chonkydb.models import (
     ChonkyDBGraphNeighborsRequest,
@@ -21,7 +21,7 @@ from twinr.memory.chonkydb.models import (
     ChonkyDBGraphStoreManyRequest,
 )
 from twinr.memory.chonkydb.schema import TwinrGraphDocumentV1, TwinrGraphEdgeV1, TwinrGraphNodeV1
-from twinr.text_utils import slugify_identifier
+from twinr.text_utils import folded_lookup_text, slugify_identifier, truncate_text
 
 if TYPE_CHECKING:
     from twinr.memory.longterm.storage._remote_catalog.shared import LongTermRemoteCatalogEntry
@@ -36,6 +36,20 @@ _MAX_GRAPH_QUERY_RETRY_ATTEMPTS = 2
 _MAX_GRAPH_QUERY_RETRY_BACKOFF_S = 0.25
 _MAX_GRAPH_STORE_RETRY_ATTEMPTS = 10
 _READINESS_CURRENT_HEAD_TIMEOUT_S = 5.0
+_GRAPH_NODE_CATALOG_SEARCH_TEXT_LIMIT = 512
+_GRAPH_NODE_RERANK_DEBUG_LIMIT = 8
+_GRAPH_CONTACT_QUERY_TERMS = frozenset(
+    {
+        "email",
+        "mail",
+        "address",
+        "adresse",
+        "phone",
+        "telefon",
+        "number",
+        "nummer",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +74,24 @@ def _remote_unavailable_error_type():
 
 def _normalize_text(value: object) -> str:
     return " ".join(str(value or "").split()).strip()
+
+
+def _lookup_terms(value: object | None) -> tuple[str, ...]:
+    normalized = " ".join(folded_lookup_text(_normalize_text(value)).split())
+    if not normalized:
+        return ()
+    seen: set[str] = set()
+    terms: list[str] = []
+    for term in normalized.split():
+        clean_term = _normalize_text(term)
+        if clean_term and clean_term not in seen:
+            seen.add(clean_term)
+            terms.append(clean_term)
+    return tuple(terms)
+
+
+def _phrase_fingerprint(value: object | None) -> str:
+    return " ".join(_lookup_terms(value))
 
 
 def _edge_item_id(edge: TwinrGraphEdgeV1) -> str:
@@ -244,6 +276,372 @@ def _node_content_for_document(
     return " ".join(part for part in (base_content, related_contact_content) if part)
 
 
+def _node_search_text_for_catalog(
+    document: TwinrGraphDocumentV1,
+    node_payload: Mapping[str, object],
+) -> str:
+    """Return bounded search text for projection-only graph-node catalog entries.
+
+    Projection-only graph current views deliberately skip a second fine-grained
+    item-document write lane. The catalog metadata therefore has to preserve a
+    small searchable projection of the enriched node text, otherwise ambiguous
+    contact queries lose the email/phone fragments needed for disambiguation.
+    """
+
+    return truncate_text(
+        _node_content_for_document(document, node_payload),
+        limit=_GRAPH_NODE_CATALOG_SEARCH_TEXT_LIMIT,
+    )
+
+
+def _node_aliases_from_payload(node_payload: Mapping[str, object]) -> tuple[str, ...]:
+    aliases = node_payload.get("aliases")
+    if not isinstance(aliases, Sequence) or isinstance(aliases, (str, bytes, bytearray)):
+        return ()
+    normalized_aliases: list[str] = []
+    for alias in aliases:
+        alias_text = _normalize_text(alias)
+        if alias_text:
+            normalized_aliases.append(alias_text)
+    return tuple(normalized_aliases)
+
+
+def _node_search_text_from_entry(entry: object | None) -> str:
+    metadata = getattr(entry, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        return ""
+    return _normalize_text(metadata.get("search_text"))
+
+
+def _node_owner_person_ids(
+    document: TwinrGraphDocumentV1,
+    node_payload: Mapping[str, object],
+) -> tuple[str, ...]:
+    """Return owning person ids for one contact-method node."""
+
+    node_id = _normalize_text(node_payload.get("id"))
+    node_type = _normalize_text(node_payload.get("type")).lower()
+    if not node_id or node_type not in {"email", "phone"}:
+        return ()
+    person_ids: list[str] = []
+    seen: set[str] = set()
+    nodes_by_id = {node.node_id: node for node in document.nodes}
+    for edge in document.edges:
+        if edge.target_node_id != node_id or edge.edge_type != "general_has_contact_method":
+            continue
+        source = nodes_by_id.get(edge.source_node_id)
+        if source is None or _normalize_text(source.node_type).lower() != "person":
+            continue
+        if source.node_id in seen:
+            continue
+        seen.add(source.node_id)
+        person_ids.append(source.node_id)
+    return tuple(person_ids)
+
+
+def _node_owner_person_ids_from_entry(entry: object | None) -> tuple[str, ...]:
+    metadata = getattr(entry, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        return ()
+    owner_ids = metadata.get("owner_person_node_ids")
+    if not isinstance(owner_ids, Sequence) or isinstance(owner_ids, (str, bytes, bytearray)):
+        return ()
+    normalized_owner_ids: list[str] = []
+    seen: set[str] = set()
+    for owner_id in owner_ids:
+        normalized_owner_id = _normalize_text(owner_id)
+        if not normalized_owner_id or normalized_owner_id in seen:
+            continue
+        seen.add(normalized_owner_id)
+        normalized_owner_ids.append(normalized_owner_id)
+    return tuple(normalized_owner_ids)
+
+
+def _catalog_entry_projection_payload(entry: object | None) -> dict[str, object] | None:
+    if entry is None:
+        return None
+    metadata = getattr(entry, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        return None
+    projection = metadata.get("selection_projection")
+    if not isinstance(projection, Mapping):
+        return None
+    return dict(projection)
+
+
+def _promote_owner_person_candidate_payloads(
+    *,
+    candidate_payloads: Sequence[Mapping[str, object]],
+    current_entries_by_item_id: Mapping[str, object],
+    origins_by_item_id: Mapping[str, Sequence[str]],
+) -> tuple[tuple[dict[str, object], ...], dict[str, tuple[str, ...]], tuple[dict[str, object], ...]]:
+    """Inject owning person nodes for direct contact-method hits.
+
+    Ambiguous queries such as "Anna Becker email" can retrieve a direct contact
+    node (`email:anna...`) without the owning person node appearing in the same
+    bounded candidate pool. If that happens, later unified selection sees only
+    the distractor person (`Chris Becker`) as a focal person match. Promote the
+    owning person into the same rerank pool so entity disambiguation is decided
+    before graph seed expansion.
+    """
+
+    promoted_payloads: list[dict[str, object]] = [
+        dict(payload)
+        for payload in candidate_payloads
+        if isinstance(payload, Mapping)
+    ]
+    promoted_origins: dict[str, tuple[str, ...]] = {
+        item_id: tuple(origins)
+        for item_id, origins in origins_by_item_id.items()
+    }
+    known_item_ids = {
+        _normalize_text(payload.get("id"))
+        for payload in promoted_payloads
+        if _normalize_text(payload.get("id"))
+    }
+    promotion_debug: list[dict[str, object]] = []
+    for payload in candidate_payloads:
+        if not isinstance(payload, Mapping):
+            continue
+        node_id = _normalize_text(payload.get("id"))
+        if not node_id:
+            continue
+        entry = current_entries_by_item_id.get(node_id)
+        owner_person_ids = _node_owner_person_ids_from_entry(entry)
+        if not owner_person_ids:
+            continue
+        for owner_person_id in owner_person_ids:
+            if owner_person_id in known_item_ids:
+                continue
+            owner_entry = current_entries_by_item_id.get(owner_person_id)
+            owner_payload = _catalog_entry_projection_payload(owner_entry)
+            if not isinstance(owner_payload, Mapping):
+                continue
+            promoted_payloads.append(dict(owner_payload))
+            known_item_ids.add(owner_person_id)
+            prior_origins = list(promoted_origins.get(owner_person_id, ()))
+            if "owner_person_promotion" not in prior_origins:
+                prior_origins.append("owner_person_promotion")
+            promoted_origins[owner_person_id] = tuple(prior_origins)
+            promotion_debug.append(
+                {
+                    "from_node_id": node_id,
+                    "from_node_type": _normalize_text(payload.get("type")).lower() or "unknown",
+                    "promoted_owner_node_id": owner_person_id,
+                    "promoted_owner_label": _normalize_text(owner_payload.get("label")) or owner_person_id,
+                    "reason": "contact_method_owner_seed",
+                }
+            )
+    return tuple(promoted_payloads), promoted_origins, tuple(promotion_debug)
+
+
+def _merge_graph_node_candidate_payloads(
+    *,
+    initial_payloads: Sequence[Mapping[str, object]],
+    local_entries: Sequence[object],
+) -> tuple[tuple[dict[str, object], ...], dict[str, tuple[str, ...]]]:
+    """Merge scope-topk and current-catalog candidates into one bounded rerank pool."""
+
+    payloads_by_item_id: dict[str, dict[str, object]] = {}
+    origins_by_item_id: dict[str, list[str]] = {}
+    order_by_item_id: dict[str, int] = {}
+
+    def register_payload(
+        *,
+        payload: Mapping[str, object] | None,
+        origin: str,
+        order: int,
+    ) -> None:
+        if not isinstance(payload, Mapping):
+            return
+        item_id = _normalize_text(payload.get("id"))
+        if not item_id:
+            return
+        payloads_by_item_id.setdefault(item_id, dict(payload))
+        order_by_item_id.setdefault(item_id, order)
+        origins = origins_by_item_id.setdefault(item_id, [])
+        if origin not in origins:
+            origins.append(origin)
+
+    for index, payload in enumerate(initial_payloads):
+        register_payload(payload=payload, origin="scope_topk_records", order=index)
+    for index, entry in enumerate(local_entries, start=len(order_by_item_id)):
+        register_payload(
+            payload=_catalog_entry_projection_payload(entry),
+            origin="local_catalog_search",
+            order=index,
+        )
+
+    ordered_payloads = tuple(
+        payload
+        for _item_id, payload in sorted(payloads_by_item_id.items(), key=lambda item: order_by_item_id[item[0]])
+    )
+    origins = {
+        item_id: tuple(origin_list)
+        for item_id, origin_list in origins_by_item_id.items()
+    }
+    return ordered_payloads, origins
+
+
+def _graph_node_rerank_scorecard(
+    *,
+    query_text: str,
+    query_terms: Sequence[str],
+    node_payload: Mapping[str, object],
+    entry: object | None,
+    remote_rank: int,
+    origins: Sequence[str],
+) -> dict[str, object]:
+    """Return one bounded scorecard for local graph-node reranking."""
+
+    node_id = _normalize_text(node_payload.get("id"))
+    node_type = _normalize_text(node_payload.get("type")).lower()
+    label = _normalize_text(node_payload.get("label"))
+    aliases = _node_aliases_from_payload(node_payload)
+    search_text = _node_search_text_from_entry(entry)
+
+    query_fingerprint = _phrase_fingerprint(query_text)
+    label_fingerprint = _phrase_fingerprint(label)
+    alias_fingerprints = tuple(_phrase_fingerprint(alias) for alias in aliases if _phrase_fingerprint(alias))
+    query_term_set = set(query_terms)
+    label_terms = set(_lookup_terms(label))
+    alias_term_sets = [set(_lookup_terms(alias)) for alias in aliases]
+    search_term_set = set(_lookup_terms(search_text))
+    exact_label_phrase = bool(label_fingerprint and label_fingerprint in query_fingerprint)
+    exact_alias_phrase = any(alias and alias in query_fingerprint for alias in alias_fingerprints)
+    label_overlap = len(query_term_set & label_terms)
+    alias_overlap = max((len(query_term_set & alias_terms) for alias_terms in alias_term_sets), default=0)
+    search_overlap = len(query_term_set & search_term_set)
+    contact_overlap = len((query_term_set & _GRAPH_CONTACT_QUERY_TERMS) & search_term_set)
+    label_coverage = (label_overlap / len(label_terms)) if label_terms else 0.0
+    alias_coverage = max(((len(query_term_set & alias_terms) / len(alias_terms)) for alias_terms in alias_term_sets if alias_terms), default=0.0)
+    person_bias = 1.0 if node_type == "person" else 0.0
+    exact_contact_value = bool(
+        node_type in {"email", "phone"}
+        and label_fingerprint
+        and label_fingerprint in query_fingerprint
+    )
+
+    total_score = (
+        (100.0 if exact_label_phrase else 0.0)
+        + (85.0 if exact_alias_phrase else 0.0)
+        + (40.0 * label_coverage)
+        + (20.0 * alias_coverage)
+        + (4.0 * search_overlap)
+        + (8.0 * contact_overlap)
+        + (3.0 * person_bias)
+        + (30.0 if exact_contact_value else 0.0)
+        - (0.05 * remote_rank)
+    )
+    return {
+        "node_id": node_id,
+        "label": label or node_id,
+        "node_type": node_type or "unknown",
+        "origins": list(origins),
+        "remote_rank": remote_rank,
+        "total_score": total_score,
+        "score_components": {
+            "exact_label_phrase": exact_label_phrase,
+            "exact_alias_phrase": exact_alias_phrase,
+            "exact_contact_value": exact_contact_value,
+            "label_overlap": label_overlap,
+            "alias_overlap": alias_overlap,
+            "label_coverage": round(label_coverage, 4),
+            "alias_coverage": round(alias_coverage, 4),
+            "search_overlap": search_overlap,
+            "contact_overlap": contact_overlap,
+            "person_bias": person_bias,
+        },
+        "debug": {
+            "aliases": list(aliases[:4]),
+            "search_text_excerpt": truncate_text(search_text, limit=160),
+        },
+    }
+
+
+def _rerank_graph_node_payloads(
+    *,
+    query_text: str,
+    candidate_payloads: Sequence[Mapping[str, object]],
+    current_entries_by_item_id: Mapping[str, object],
+    candidate_limit: int,
+    origins_by_item_id: Mapping[str, Sequence[str]],
+) -> tuple[tuple[dict[str, object], ...], tuple[dict[str, object], ...]]:
+    """Rerank graph-node candidates locally so exact person/contact cues beat popularity noise."""
+
+    query_terms = _lookup_terms(query_text)
+    scored_candidates: list[tuple[dict[str, object], dict[str, object]]] = []
+    for remote_rank, payload in enumerate(candidate_payloads):
+        node_id = _normalize_text(payload.get("id"))
+        if not node_id:
+            continue
+        scorecard = _graph_node_rerank_scorecard(
+            query_text=query_text,
+            query_terms=query_terms,
+            node_payload=payload,
+            entry=current_entries_by_item_id.get(node_id),
+            remote_rank=remote_rank,
+            origins=origins_by_item_id.get(node_id, ()),
+        )
+        scored_candidates.append((dict(payload), scorecard))
+
+    scored_candidates.sort(
+        key=lambda item: (
+            -cast(float, item[1]["total_score"]),
+            cast(int, item[1]["remote_rank"]),
+            _normalize_text(item[1]["node_id"]),
+        )
+    )
+    bounded_limit = max(1, int(candidate_limit))
+    selected_payloads = tuple(payload for payload, _scorecard in scored_candidates[:bounded_limit])
+    selected_ids = {
+        _normalize_text(payload.get("id"))
+        for payload in selected_payloads
+        if _normalize_text(payload.get("id"))
+    }
+    debug_candidates: list[dict[str, object]] = []
+    for payload, scorecard in scored_candidates[:_GRAPH_NODE_RERANK_DEBUG_LIMIT]:
+        debug_entry = dict(scorecard)
+        debug_entry["selected_seed"] = _normalize_text(payload.get("id")) in selected_ids
+        debug_candidates.append(debug_entry)
+    return selected_payloads, tuple(debug_candidates)
+
+
+def _filter_edge_payloads_for_seed_nodes(
+    *,
+    edge_payloads: Sequence[Mapping[str, object]],
+    seed_node_ids: Sequence[str],
+    subject_node_id: str,
+) -> tuple[tuple[dict[str, object], ...], tuple[dict[str, object], ...]]:
+    """Keep only edge-search hits that reinforce the reranked node seeds."""
+
+    normalized_seed_ids = {
+        normalized
+        for normalized in (_normalize_text(item) for item in seed_node_ids)
+        if normalized
+    }
+    selected: list[dict[str, object]] = []
+    deferred: list[dict[str, object]] = []
+    for payload in edge_payloads:
+        source_node_id = _normalize_text(payload.get("source"))
+        target_node_id = _normalize_text(payload.get("target"))
+        touches_focus = bool(
+            source_node_id in normalized_seed_ids
+            or target_node_id in normalized_seed_ids
+            or source_node_id == subject_node_id
+            or target_node_id == subject_node_id
+        )
+        target_bucket = selected if touches_focus else deferred
+        target_bucket.append(dict(payload))
+    if selected:
+        return tuple(selected), tuple(deferred)
+    if deferred:
+        # Keep one bounded fallback edge when node seeds did not help, so graph-only
+        # prompts can still bootstrap a path/neighbor expansion instead of going empty.
+        return (deferred[0],), tuple(deferred[1:])
+    return (), ()
+
+
 def _catalog_entry_locator(entry: object) -> tuple[str | None, str | None]:
     """Extract optional document locator fields from a remote catalog entry."""
 
@@ -276,6 +674,8 @@ def _node_metadata(document: TwinrGraphDocumentV1, node_payload: Mapping[str, ob
     metadata: dict[str, object] = {
         "kind": _normalize_text(node_payload.get("type")),
         "summary": _normalize_text(node_payload.get("label")),
+        "search_text": _node_search_text_for_catalog(document, node_payload),
+        "owner_person_node_ids": list(_node_owner_person_ids(document, node_payload)),
         "updated_at": _normalize_text(document.updated_at),
         "created_at": _normalize_text(document.created_at),
         "selection_projection": dict(node_payload),
@@ -532,15 +932,7 @@ class TwinrRemoteGraphState:
 
     @staticmethod
     def _catalog_entry_projection_payload(entry: object) -> dict[str, object] | None:
-        if entry is None:
-            return None
-        metadata = getattr(entry, "metadata", None)
-        if not isinstance(metadata, Mapping):
-            return None
-        projection = metadata.get("selection_projection")
-        if not isinstance(projection, Mapping):
-            return None
-        return dict(projection)
+        return _catalog_entry_projection_payload(entry)
 
     def _current_entries_by_item_id(self, *, snapshot_kind: str) -> dict[str, object]:
         payload = self._resolve_current_head_payload(
@@ -701,13 +1093,80 @@ class TwinrRemoteGraphState:
             fallback_limit=max(0, int(fallback_limit)),
         )
 
+        current_node_entries_by_item_id = self._current_entries_by_item_id(snapshot_kind=_GRAPH_NODE_SNAPSHOT_KIND)
+        local_node_entries: tuple["LongTermRemoteCatalogEntry", ...] = ()
+        if current_node_entries_by_item_id:
+            local_node_entries = self._catalog._local_search_catalog_entries(  # pylint: disable=protected-access
+                snapshot_kind=_GRAPH_NODE_SNAPSHOT_KIND,
+                entries=cast(tuple["LongTermRemoteCatalogEntry", ...], tuple(current_node_entries_by_item_id.values())),
+                query_text=clean_query,
+                limit=max(1, int(candidate_limit)),
+            )
+        merged_node_payloads, node_candidate_origins = _merge_graph_node_candidate_payloads(
+            initial_payloads=matched_node_payloads,
+            local_entries=local_node_entries,
+        )
+        merged_node_payloads, node_candidate_origins, owner_seed_promotions = _promote_owner_person_candidate_payloads(
+            candidate_payloads=merged_node_payloads,
+            current_entries_by_item_id=current_node_entries_by_item_id,
+            origins_by_item_id=node_candidate_origins,
+        )
+        reranked_node_payloads, node_rerank_debug = _rerank_graph_node_payloads(
+            query_text=clean_query,
+            candidate_payloads=merged_node_payloads,
+            current_entries_by_item_id=current_node_entries_by_item_id,
+            candidate_limit=max(1, int(candidate_limit)),
+            origins_by_item_id=node_candidate_origins,
+        )
         matched_node_ids: set[str] = {
             _normalize_text(payload.get("id"))
-            for payload in matched_node_payloads
+            for payload in reranked_node_payloads
             if isinstance(payload, Mapping) and _normalize_text(payload.get("id"))
         }
+        workflow_decision(
+            msg="twinr_remote_graph_node_rerank",
+            question="Which graph nodes should seed the query-first remote subgraph?",
+            selected={
+                "id": "local_graph_node_rerank",
+                "summary": "Use bounded Twinr-side reranking over remote and catalog graph-node candidates.",
+                "selected_seed_node_ids": sorted(matched_node_ids),
+            },
+            options=[
+                {
+                    "id": _normalize_text(candidate.get("node_id")) or f"candidate:{index}",
+                    "summary": _normalize_text(candidate.get("label")) or _normalize_text(candidate.get("node_id")),
+                    "score_components": dict(
+                        cast(Mapping[str, object], candidate.get("score_components") or {})
+                    ),
+                    "constraints_violated": [] if bool(candidate.get("selected_seed")) else ["not_top_seed"],
+                }
+                for index, candidate in enumerate(node_rerank_debug, start=1)
+            ],
+            context={
+                "query_text": clean_query,
+                "candidate_count_before_rerank": len(merged_node_payloads),
+                "candidate_count_after_rerank": len(reranked_node_payloads),
+                "node_fallback_used": bool(node_fallback_used),
+                "owner_seed_promotion_count": len(owner_seed_promotions),
+            },
+            confidence="high",
+            guardrails=[
+                "Keep the remote query-first path authoritative, but correct same-surname ambiguity locally.",
+                "Prefer exact person-label or alias matches over remote popularity order when contact cues agree.",
+                "Direct contact-method hits may promote their owning person node into the same seed pool.",
+            ],
+            kpi_impact_estimate={
+                "extra_local_catalog_candidates": len(local_node_entries),
+                "selected_seed_count": len(matched_node_ids),
+            },
+        )
         matched_edge_ids: set[str] = set()
-        for payload in matched_edge_payloads:
+        filtered_edge_payloads, deferred_edge_payloads = _filter_edge_payloads_for_seed_nodes(
+            edge_payloads=matched_edge_payloads,
+            seed_node_ids=tuple(sorted(matched_node_ids)),
+            subject_node_id=subject_node_id,
+        )
+        for payload in filtered_edge_payloads:
             if not isinstance(payload, Mapping):
                 continue
             source_node_id = _normalize_text(payload.get("source"))
@@ -772,7 +1231,6 @@ class TwinrRemoteGraphState:
             neighbor_hints.append({"node_id": node_id, "neighbor_count": neighbor_count})
         selected_node_ids.update(expanded_path_nodes)
 
-        current_node_entries_by_item_id = self._current_entries_by_item_id(snapshot_kind=_GRAPH_NODE_SNAPSHOT_KIND)
         node_payloads = self._load_graph_item_payloads(
             snapshot_kind=_GRAPH_NODE_SNAPSHOT_KIND,
             item_ids=tuple(sorted(selected_node_ids)),
@@ -791,7 +1249,7 @@ class TwinrRemoteGraphState:
         node_ids = {node.node_id for node in nodes}
 
         edge_payloads_by_id: dict[str, dict[str, object]] = {}
-        for payload in matched_edge_payloads:
+        for payload in filtered_edge_payloads:
             if not isinstance(payload, Mapping):
                 continue
             edge_item_id = _edge_item_id_from_payload(payload)
@@ -842,6 +1300,16 @@ class TwinrRemoteGraphState:
             "fallbacks": {
                 "node_catalog_top": bool(node_fallback_used),
                 "edge_catalog_top": bool(edge_fallback_used),
+            },
+            "graph_node_rerank": {
+                "candidate_count_before_rerank": len(merged_node_payloads),
+                "candidate_count_after_rerank": len(reranked_node_payloads),
+                "candidates": list(node_rerank_debug),
+                "owner_seed_promotions": list(owner_seed_promotions),
+            },
+            "edge_candidate_filter": {
+                "selected_edge_input_count": len(filtered_edge_payloads),
+                "deferred_edge_input_count": len(deferred_edge_payloads),
             },
             "matched_node_ids": sorted(matched_node_ids),
             "matched_edge_ids": sorted(matched_edge_ids),
@@ -1635,7 +2103,21 @@ class TwinrRemoteGraphState:
                 parameters = cast("Mapping[str, inspect.Parameter]", {})
             if "fast_fail" in parameters:
                 probe_kwargs["fast_fail"] = use_probe
-            probe = probe_loader(**probe_kwargs)
+            try:
+                probe = probe_loader(**probe_kwargs)
+            except Exception as exc:
+                workflow_event(
+                    kind="retrieval",
+                    msg="twinr_remote_graph_current_head_probe_failed",
+                    details={
+                        "snapshot_kind": snapshot_kind,
+                        "use_probe": bool(use_probe),
+                        "readiness_mode": bool(readiness_mode),
+                        "error_type": type(exc).__name__,
+                        "error": _normalize_text(exc),
+                    },
+                )
+                raise
             payload = getattr(probe, "payload", None)
         else:
             load_snapshot = getattr(remote_state, "load_snapshot")
@@ -1647,7 +2129,21 @@ class TwinrRemoteGraphState:
             load_kwargs: dict[str, object] = {"snapshot_kind": snapshot_kind}
             if "prefer_cached_document_id" in parameters:
                 load_kwargs["prefer_cached_document_id"] = False
-            payload = load_snapshot(**load_kwargs)
+            try:
+                payload = load_snapshot(**load_kwargs)
+            except Exception as exc:
+                workflow_event(
+                    kind="retrieval",
+                    msg="twinr_remote_graph_current_head_snapshot_load_failed",
+                    details={
+                        "snapshot_kind": snapshot_kind,
+                        "use_probe": bool(use_probe),
+                        "readiness_mode": bool(readiness_mode),
+                        "error_type": type(exc).__name__,
+                        "error": _normalize_text(exc),
+                    },
+                )
+                raise
         if not isinstance(payload, Mapping):
             return None
         payload_dict = dict(payload)

@@ -406,12 +406,7 @@ class DualLaneToolLoop:
             # own web-search mode can bypass the intended search-vs-browser
             # boundary and skip the permission step entirely.
             specialist_allow_web_search = False
-        return ToolCallingStreamingLoop(
-            provider=self.specialist_provider,
-            tool_handlers=self.tool_handlers,
-            tool_schemas=self.tool_schemas,
-            max_rounds=self.max_rounds,
-        ).run(
+        return self._run_specialist_tool_loop(
             specialist_prompt,
             conversation=specialist_conversation,
             instructions=merge_instructions(
@@ -423,6 +418,70 @@ class DualLaneToolLoop:
             on_text_delta=None,
             should_stop=should_stop,
         )
+
+    def _run_specialist_tool_loop(
+        self,
+        prompt: str,
+        *,
+        conversation: ConversationLike | None,
+        instructions: str | None,
+        allow_web_search: bool | None,
+        on_text_delta: Callable[[str], None] | None,
+        should_stop: Callable[[], bool] | None,
+    ) -> StreamingToolLoopResult:
+        """Run the specialist/tool loop without opening a supervisor lane."""
+
+        return ToolCallingStreamingLoop(
+            provider=self.specialist_provider,
+            tool_handlers=self.tool_handlers,
+            tool_schemas=self.tool_schemas,
+            max_rounds=self.max_rounds,
+        ).run(
+            prompt,
+            conversation=conversation,
+            instructions=instructions,
+            allow_web_search=allow_web_search,
+            on_text_delta=on_text_delta,
+            should_stop=should_stop,
+        )
+
+    def run_specialist_only(
+        self,
+        prompt: str,
+        *,
+        conversation: ConversationLike | None = None,
+        instructions: str | None = None,
+        allow_web_search: bool | None = None,
+        on_text_delta: Callable[[str], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> StreamingToolLoopResult:
+        """Run the bounded tool-capable specialist loop without supervisor routing."""
+
+        _raise_if_should_stop(should_stop, context="specialist_only_start")
+        try:
+            return self._run_specialist_tool_loop(
+                prompt,
+                conversation=conversation,
+                instructions=merge_instructions(self.specialist_instructions, instructions),
+                allow_web_search=allow_web_search,
+                on_text_delta=on_text_delta,
+                should_stop=should_stop,
+            )
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            logger.exception("Specialist-only loop failed.")
+            self._trace_event(
+                "dual_lane_specialist_only_failed",
+                kind="exception",
+                level="ERROR",
+                details={
+                    "error_type": type(exc).__name__,
+                    "conversation": _conversation_summary(conversation),
+                    "prompt": _text_summary(prompt),
+                },
+            )
+            raise
 
     def run_handoff_only(
         self,
@@ -658,7 +717,20 @@ class DualLaneToolLoop:
             _emit_user_text(spoken_ack, lane="filler")
 
         try:
-            tool_output = handler(tool_arguments)
+            call_id = _first_non_none(
+                getattr(decision, "response_id", None),
+                _make_call_id(tool_name),
+            )
+            tool_call = AgentToolCall(
+                name=tool_name,
+                call_id=call_id,
+                arguments=tool_arguments,
+                raw_arguments=_safe_json_dumps(tool_arguments),
+            )
+            if getattr(handler, "_twinr_accepts_tool_call", False):
+                tool_output = handler(tool_call)
+            else:
+                tool_output = handler(tool_arguments)
         except InterruptedError:
             raise
         except Exception as exc:
@@ -696,21 +768,10 @@ class DualLaneToolLoop:
                 "output_present": tool_output is not None,
             },
         )
-        call_id = _first_non_none(
-            getattr(decision, "response_id", None),
-            _make_call_id(tool_name),
-        )
         return _make_loop_result(
             text=final_text,
             rounds=1,
-            tool_calls=(
-                AgentToolCall(
-                    name=tool_name,
-                    call_id=call_id,
-                    arguments=tool_arguments,
-                    raw_arguments=_safe_json_dumps(tool_arguments),
-                ),
-            ),
+            tool_calls=(tool_call,),
             tool_results=(
                 AgentToolResult(
                     call_id=call_id,
@@ -828,7 +889,45 @@ class DualLaneToolLoop:
             return output
 
         decision = None
-        if not skip_supervisor_decision:
+        if skip_supervisor_decision and prefetched_decision is not None:
+            if _supervisor_decision_has_required_user_reply(prefetched_decision):
+                decision = prefetched_decision
+                self._trace_decision(
+                    "dual_lane_supervisor_decision_resolved",
+                    question="Which supervisor decision is active for this turn?",
+                    selected={
+                        "id": _normalize_decision_action(getattr(prefetched_decision, "action", None)),
+                        "summary": "Reuse prefetched supervisor decision while skipping provider resolution",
+                    },
+                    options=[
+                        {"id": "prefetched", "summary": "Reuse prefetched decision"},
+                        {"id": "provider", "summary": "Resolve decision from provider"},
+                        {"id": "none", "summary": "Fall back to supervisor loop"},
+                    ],
+                    context={
+                        "source": "prefetched_skip",
+                        "decision": _decision_summary(prefetched_decision),
+                        "conversation": _conversation_summary(resolved_supervisor_conversation),
+                        "prompt": _text_summary(prompt),
+                    },
+                    guardrails=["skip_duplicate_supervisor_resolution"],
+                )
+            else:
+                logger.warning(
+                    "Ignoring prefetched supervisor decision without the required user-facing reply field."
+                )
+                self._trace_event(
+                    "dual_lane_prefetched_decision_rejected",
+                    kind="exception",
+                    level="WARN",
+                    details={
+                        "reason": "missing_user_reply",
+                        "decision": _decision_summary(prefetched_decision),
+                        "conversation": _conversation_summary(resolved_supervisor_conversation),
+                        "prompt": _text_summary(prompt),
+                    },
+                )
+        elif not skip_supervisor_decision:
             decision = self.resolve_supervisor_decision(
                 prompt,
                 conversation=resolved_supervisor_conversation,
@@ -906,9 +1005,22 @@ class DualLaneToolLoop:
                     end_handler = self.tool_handlers.get("end_conversation")  # AUDIT-FIX(#3): Do not silently re-enable shared handlers when an empty supervisor override was intentional.
                 end_result: Any = {"status": "ok"}
                 reply = _strip_text(getattr(decision, "spoken_reply", None))
+                call_id = _first_non_none(
+                    getattr(decision, "response_id", None),
+                    _make_call_id("end_conversation"),
+                )  # AUDIT-FIX(#6): Ensure a unique fallback ID for tool/result pairing.
+                end_tool_call = AgentToolCall(
+                    name="end_conversation",
+                    call_id=call_id,
+                    arguments={},
+                    raw_arguments="{}",
+                )
                 try:
                     if end_handler is not None:
-                        end_result = end_handler({})
+                        if getattr(end_handler, "_twinr_accepts_tool_call", False):
+                            end_result = end_handler(end_tool_call)
+                        else:
+                            end_result = end_handler({})
                 except Exception as exc:
                     logger.exception("end_conversation handler failed.")
                     self._trace_event(
@@ -917,27 +1029,17 @@ class DualLaneToolLoop:
                         level="ERROR",
                         details={
                             "error_type": type(exc).__name__,
+                            "call_id": call_id,
                             "decision": _decision_summary(decision),
                             "conversation": _conversation_summary(resolved_supervisor_conversation),
                         },
                     )
                     raise
-                call_id = _first_non_none(
-                    getattr(decision, "response_id", None),
-                    _make_call_id("end_conversation"),
-                )  # AUDIT-FIX(#6): Ensure a unique fallback ID for tool/result pairing.
                 _emit_user_text(reply, lane="direct")
                 return _make_loop_result(
                     text=reply,
                     rounds=1,
-                    tool_calls=(
-                        AgentToolCall(
-                            name="end_conversation",
-                            call_id=call_id,
-                            arguments={},
-                            raw_arguments="{}",
-                        ),
-                    ),
+                    tool_calls=(end_tool_call,),
                     tool_results=(
                         AgentToolResult(
                             call_id=call_id,
@@ -951,6 +1053,33 @@ class DualLaneToolLoop:
                     model=getattr(decision, "model", None),
                     token_usage=getattr(decision, "token_usage", None),
                     used_web_search=False,
+                )
+
+            if action == "handoff" and _decision_runtime_local_tool_call(decision) is not None:
+                self._trace_decision(
+                    "dual_lane_runtime_local_shortcut_selected",
+                    question="Why was the specialist lane skipped for this handoff?",
+                    selected={
+                        "id": "runtime_local_tool_only",
+                        "summary": "The supervisor already resolved one complete runtime-local tool call",
+                    },
+                    options=[
+                        {"id": "runtime_local_tool_only", "summary": "Execute the runtime-local tool directly"},
+                        {"id": "handoff_specialist", "summary": "Open the specialist tool loop"},
+                    ],
+                    context={
+                        "decision": _decision_summary(decision),
+                        "conversation": _conversation_summary(resolved_supervisor_conversation),
+                    },
+                    guardrails=["no_second_model_pass_for_complete_runtime_local_handoff"],
+                )
+                return self.run_runtime_local_tool_only(
+                    prompt,
+                    decision=decision,
+                    on_text_delta=on_text_delta,
+                    on_lane_text_delta=on_lane_text_delta,
+                    emit_filler=True,
+                    should_stop=should_stop,
                 )
 
             return self.run_handoff_only(

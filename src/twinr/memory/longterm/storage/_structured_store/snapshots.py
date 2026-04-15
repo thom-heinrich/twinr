@@ -340,11 +340,20 @@ class StructuredStoreSnapshotMixin:
             ):
                 head_result_loader = getattr(remote_catalog, "_load_catalog_head_result", None)
                 if callable(head_result_loader):
-                    head_result = head_result_loader(snapshot_kind=snapshot_kind, metadata_only=True)
+                    head_result = head_result_loader(
+                        snapshot_kind=snapshot_kind,
+                        metadata_only=True,
+                        fast_fail=True,
+                    )
                     head_status = str(getattr(head_result, "status", "") or "")
                     head_payload = getattr(head_result, "payload", None)
                     if remote_catalog.is_catalog_payload(snapshot_kind=snapshot_kind, payload=head_payload):
-                        return dict(cast(Mapping[str, object], head_payload))
+                        catalog_payload = dict(cast(Mapping[str, object], head_payload))
+                        self._prime_fast_topic_catalog_entries_for_readiness(
+                            snapshot_kind=snapshot_kind,
+                            catalog_payload=catalog_payload,
+                        )
+                        return catalog_payload
                     if isinstance(recent_local_payload, Mapping) and self._is_valid_snapshot_payload(
                         snapshot_kind=snapshot_kind,
                         payload=recent_local_payload,
@@ -366,6 +375,58 @@ class StructuredStoreSnapshotMixin:
 
         return self.probe_remote_current_snapshot_for_readiness(snapshot_kind=snapshot_kind)
 
+    def _prime_fast_topic_catalog_entries_for_readiness(
+        self,
+        *,
+        snapshot_kind: str,
+        catalog_payload: Mapping[str, object],
+    ) -> None:
+        """Warm the current objects catalog once so cold watchdog probes can rescue fast-topic timeouts.
+
+        Required fast-topic rescue deliberately stays on same-process current
+        catalog entries; it must not cold-load the catalog inside the rescue
+        path itself. A freshly restarted watchdog therefore needs to populate
+        that same-process bridge from the already-proven current head before
+        running the first fast-topic readiness query.
+        """
+
+        if snapshot_kind != "objects":
+            return
+        remote_catalog = self._remote_catalog
+        if remote_catalog is None or not self._remote_catalog_enabled():
+            return
+        cached_entries_getter = getattr(remote_catalog, "_cached_catalog_entries", None)
+        if callable(cached_entries_getter) and cached_entries_getter(snapshot_kind=snapshot_kind) is not None:
+            return
+        recent_entries_getter = getattr(remote_catalog, "_recent_catalog_entries", None)
+        if callable(recent_entries_getter) and recent_entries_getter(snapshot_kind=snapshot_kind) is not None:
+            return
+        remote_catalog.load_catalog_entries(
+            snapshot_kind=snapshot_kind,
+            payload=catalog_payload,
+            fast_fail=True,
+        )
+
+    def _catalog_payload_is_fresh_reader_readable(
+        self,
+        *,
+        snapshot_kind: str,
+        catalog_payload: Mapping[str, object],
+    ) -> bool:
+        """Return whether one current head can still hydrate its advertised segments."""
+
+        remote_catalog = self._remote_catalog
+        if remote_catalog is None or not self._remote_catalog_enabled():
+            return False
+        try:
+            remote_catalog.load_catalog_entries(
+                snapshot_kind=snapshot_kind,
+                payload=catalog_payload,
+            )
+        except LongTermRemoteUnavailableError:
+            return False
+        return True
+
     def get_object(self, memory_id: str) -> LongTermMemoryObjectV1 | None:
         """Return one stored memory object by canonical memory ID."""
 
@@ -383,6 +444,7 @@ class StructuredStoreSnapshotMixin:
         memory_ids: Iterable[str],
         *,
         selection_only: bool = False,
+        allow_cold_remote_catalog_scan: bool = True,
     ) -> tuple[LongTermMemoryObjectV1, ...]:
         """Load a bounded set of long-term objects by memory id when possible.
 
@@ -403,6 +465,10 @@ class StructuredStoreSnapshotMixin:
         remote_catalog = self._remote_catalog
         if self._remote_catalog_enabled() and remote_catalog is not None:
             try:
+                if not selection_only and not allow_cold_remote_catalog_scan:
+                    direct_loaded = self._load_remote_objects_by_exact_item_ids(item_ids=normalized_ids)
+                    if direct_loaded or self._remote_is_required():
+                        return direct_loaded
                 if remote_catalog.catalog_available(snapshot_kind="objects"):
                     payload_loader = (
                         remote_catalog.load_selection_item_payloads
@@ -426,6 +492,44 @@ class StructuredStoreSnapshotMixin:
                 _LOG.warning("Failed loading fine-grained remote long-term objects; falling back to snapshot state.", exc_info=True)
         objects_by_id = {item.memory_id: item for item in self.load_objects_fine_grained()}
         return tuple(objects_by_id[memory_id] for memory_id in normalized_ids if memory_id in objects_by_id)
+
+    def _load_remote_objects_by_exact_item_ids(
+        self,
+        *,
+        item_ids: Iterable[str],
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Load exact remote objects by deterministic item URI without catalog scans."""
+
+        remote_catalog = self._remote_catalog
+        if remote_catalog is None:
+            return ()
+        loaded_by_id: dict[str, LongTermMemoryObjectV1] = {}
+        ordered_ids: list[str] = []
+        for raw_item_id in item_ids:
+            item_id = _normalize_text(raw_item_id)
+            if not item_id:
+                continue
+            ordered_ids.append(item_id)
+            try:
+                payload = remote_catalog.load_item_payload(
+                    snapshot_kind="objects",
+                    item_id=item_id,
+                )
+            except LongTermRemoteUnavailableError as exc:
+                status_code_getter = getattr(remote_catalog, "_status_code_from_exception", None)
+                if callable(status_code_getter) and status_code_getter(exc) == 404:
+                    continue
+                raise
+            if not isinstance(payload, Mapping):
+                continue
+            try:
+                loaded_by_id[item_id] = LongTermMemoryObjectV1.from_payload(payload)
+            except Exception:
+                _LOG.warning(
+                    "Skipping invalid remote long-term object payload during exact item load.",
+                    exc_info=True,
+                )
+        return tuple(loaded_by_id[item_id] for item_id in ordered_ids if item_id in loaded_by_id)
 
     def _load_current_item_payloads_fine_grained(
         self,
@@ -902,8 +1006,14 @@ class StructuredStoreSnapshotMixin:
             else:
                 head_status = ""
                 head_payload = head_probe(snapshot_kind=snapshot_kind)
+            unreadable_catalog_head = False
             if remote_catalog.is_catalog_payload(snapshot_kind=snapshot_kind, payload=head_payload):
-                return False
+                unreadable_catalog_head = not self._catalog_payload_is_fresh_reader_readable(
+                    snapshot_kind=snapshot_kind,
+                    catalog_payload=cast(Mapping[str, object], head_payload),
+                )
+                if not unreadable_catalog_head:
+                    return False
             probe = self._probe_remote_state_snapshot(
                 remote_state=self.remote_state,
                 snapshot_kind=snapshot_kind,
@@ -921,6 +1031,18 @@ class StructuredStoreSnapshotMixin:
                 raise LongTermRemoteUnavailableError(
                     detail or f"Required remote structured snapshot {snapshot_kind!r} is unavailable."
                 )
+            local_payload = self._read_local_snapshot_payload(snapshot_kind=snapshot_kind, local_path=local_path)
+            if unreadable_catalog_head:
+                if local_payload is None:
+                    raise LongTermRemoteUnavailableError(
+                        f"Required remote structured snapshot {snapshot_kind!r} current head references unreadable catalog segments."
+                    )
+                self._persist_snapshot_payload(
+                    snapshot_kind=snapshot_kind,
+                    local_path=local_path,
+                    payload=dict(local_payload),
+                )
+                return True
             if head_status == "invalid":
                 repair_invalid_head = getattr(remote_catalog, "repair_invalid_current_head_from_segment_uris", None)
                 if callable(repair_invalid_head):
@@ -930,7 +1052,6 @@ class StructuredStoreSnapshotMixin:
                 raise LongTermRemoteUnavailableError(
                     f"Required remote structured snapshot {snapshot_kind!r} current head is {head_status}."
                 )
-            local_payload = self._read_local_snapshot_payload(snapshot_kind=snapshot_kind, local_path=local_path)
             payload: dict[str, object] = local_payload if local_payload is not None else dict(empty_payload)
             self._persist_snapshot_payload(
                 snapshot_kind=snapshot_kind,
@@ -999,8 +1120,14 @@ class StructuredStoreSnapshotMixin:
             else:
                 head_status = ""
                 head_payload = head_probe(snapshot_kind=snapshot_kind)
+            unreadable_catalog_head = False
             if remote_catalog.is_catalog_payload(snapshot_kind=snapshot_kind, payload=head_payload):
-                return False
+                unreadable_catalog_head = not self._catalog_payload_is_fresh_reader_readable(
+                    snapshot_kind=snapshot_kind,
+                    catalog_payload=cast(Mapping[str, object], head_payload),
+                )
+                if not unreadable_catalog_head:
+                    return False
             if head_status == "invalid":
                 repair_invalid_head = getattr(remote_catalog, "repair_invalid_current_head_from_segment_uris", None)
                 if callable(repair_invalid_head):
@@ -1011,16 +1138,29 @@ class StructuredStoreSnapshotMixin:
                     f"Required remote structured snapshot {snapshot_kind!r} current head is {head_status}."
                 )
             local_payload = self._read_local_snapshot_payload(snapshot_kind=snapshot_kind, local_path=local_path)
+            if unreadable_catalog_head:
+                if (
+                    local_payload is None
+                    or not self._is_valid_snapshot_payload(snapshot_kind=snapshot_kind, payload=local_payload)
+                ):
+                    raise LongTermRemoteUnavailableError(
+                        f"Required remote structured snapshot {snapshot_kind!r} current head references unreadable catalog segments."
+                    )
+                self._persist_snapshot_payload(
+                    snapshot_kind=snapshot_kind,
+                    local_path=local_path,
+                    payload=dict(local_payload),
+                )
+                return True
             if (
                 local_payload is None
                 or not self._is_valid_snapshot_payload(snapshot_kind=snapshot_kind, payload=local_payload)
-                or self._is_effectively_empty_snapshot_payload(snapshot_kind=snapshot_kind, payload=local_payload)
             ):
                 return False
             self._persist_snapshot_payload(
                 snapshot_kind=snapshot_kind,
                 local_path=local_path,
-                payload=local_payload,
+                payload=dict(local_payload),
             )
             return True
         return self._ensure_remote_snapshot_payload(
@@ -1462,6 +1602,10 @@ class StructuredStoreSnapshotMixin:
                 "kind": payload.get("kind"),
                 "status": payload.get("status"),
                 "summary": payload.get("summary"),
+                "search_text": self._remote_item_search_text(
+                    snapshot_kind=snapshot_kind,
+                    payload=payload,
+                ),
                 "slot_key": payload.get("slot_key"),
                 "value_key": payload.get("value_key"),
                 "created_at": payload.get("created_at"),

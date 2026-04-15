@@ -8,13 +8,14 @@ from types import SimpleNamespace
 import sys
 import tempfile
 import unittest
-from typing import cast
+from typing import Any, cast
 from unittest.mock import patch
 import wave
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import warnings
 
+from fastapi import Request
 from fastapi.testclient import TestClient
 from test.self_coding_test_utils import stable_sha256
 
@@ -52,9 +53,9 @@ from twinr.memory.longterm.core.models import (
     LongTermMidtermPacketV1,
     LongTermSourceRefV1,
 )
+from twinr.memory.on_device import ConversationTurn, MemoryLedgerItem, MemoryState, SearchMemoryEntry
 from twinr.memory.query_normalization import LongTermQueryProfile
 from twinr.memory.reminders import ReminderStore
-from twinr.memory import ConversationTurn, MemoryLedgerItem, MemoryState, SearchMemoryEntry
 from twinr.integrations import (
     HUE_ADDITIONAL_BRIDGE_HOSTS_SETTING_KEY,
     ManagedIntegrationConfig,
@@ -62,13 +63,17 @@ from twinr.integrations import (
     hue_application_key_env_key_for_host,
 )
 from twinr.integrations.email.connectivity import EmailConnectionTestResult, EmailTransportProbe
-from twinr.ops import DeviceFact, DeviceOverview, DeviceStatus, TwinrOpsEventStore, resolve_ops_paths
+from twinr.ops.devices import DeviceFact, DeviceOverview, DeviceStatus
+from twinr.ops.events import TwinrOpsEventStore
+from twinr.ops.paths import resolve_ops_paths
 from twinr.ops.remote_memory_watchdog import (
     RemoteMemoryWatchdogSample,
     RemoteMemoryWatchdogSnapshot,
     RemoteMemoryWatchdogStore,
 )
+from twinr.ops.usage import TokenUsage, TwinrUsageStore
 from twinr.web.app import create_app
+from twinr.web.context import WebAppContext
 from twinr.web.support.channel_onboarding import ChannelPairingSnapshot
 
 _TEST_WHATSAPP_ALLOW_FROM = "+15555554567"
@@ -177,6 +182,46 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("Reminders", response.text)
         self.assertIn("Twinr now", response.text)
         self.assertIn("Needs attention", response.text)
+
+    def test_render_surfaces_template_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            request = Request(
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/",
+                    "headers": [],
+                    "query_string": b"",
+                    "client": ("127.0.0.1", 50000),
+                    "server": ("localhost", 80),
+                    "scheme": "http",
+                }
+            )
+            request.state.web_auth_context = None
+            context = WebAppContext(
+                env_path=root / ".env",
+                project_root=root,
+                ops_paths=SimpleNamespace(),
+                templates=cast(
+                    Any,
+                    SimpleNamespace(
+                        TemplateResponse=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                            RuntimeError("template boom")
+                        )
+                    ),
+                ),
+            )
+
+            with self.assertRaises(RuntimeError) as raised:
+                context.render(
+                    request=request,
+                    template_name="index.html",
+                    page_title="Twinr",
+                    active_page="home",
+                )
+
+            self.assertEqual(str(raised.exception), "template boom")
 
     def test_advanced_page_groups_operator_tools(self) -> None:
         client, _env_path = self.make_client()
@@ -2281,7 +2326,6 @@ class WebAppTests(unittest.TestCase):
     def test_ops_usage_page_renders_usage_summary(self) -> None:
         client, env_path = self.make_client()
         config = TwinrConfig.from_env(env_path)
-        from twinr.ops import TokenUsage, TwinrUsageStore
 
         TwinrUsageStore.from_config(config).append(
             source="hardware_loop",
@@ -2364,7 +2408,6 @@ class WebAppTests(unittest.TestCase):
             message="Green button started a conversation turn.",
             data={"request_source": "button"},
         )
-        from twinr.ops import TokenUsage, TwinrUsageStore
 
         TwinrUsageStore.from_config(config).append(
             source="hardware_loop",

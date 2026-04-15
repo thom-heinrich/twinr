@@ -140,6 +140,58 @@ class UserDiscoveryQueryMixin:
             display_prompt_stage=display_prompt_stage,
         )
 
+    def build_runtime_context_status_result(
+        self,
+        state: UserDiscoveryState,
+        *,
+        topic_id: str | None,
+    ) -> UserDiscoveryResult:
+        """Build one prompt-safe discovery status view without remote profile reads.
+
+        Live tool-context assembly runs on the critical voice path. It only
+        needs compact local discovery guidance, so this view must stay limited
+        to persisted discovery state and never trigger authoritative remote
+        coverage queries.
+        """
+
+        resolved_topic_id = topic_id or state.active_topic_id
+        definition = _TOPICS_BY_ID.get(resolved_topic_id or "")
+        topic_state = self._topic_state(state, resolved_topic_id) if resolved_topic_id else None
+        return UserDiscoveryResult(
+            phase=state.phase,
+            session_state=state.session_state,
+            response_mode="status",
+            topic_id=resolved_topic_id,
+            topic_label=definition.label if definition is not None else None,
+            display_topic_label=definition.display_label if definition is not None else None,
+            topic_goal=definition.goal if definition is not None else None,
+            assistant_brief=(
+                "Use this status to decide whether to resume discovery, ask one bounded question, "
+                "leave the flow inactive, or offer a short review."
+            ),
+            question_brief=(
+                self._question_brief(definition, topic_state, state.phase) if definition and topic_state else None
+            ),
+            current_topic_summary=self._topic_summary(topic_state) if topic_state is not None else None,
+            session_minutes=self._session_minutes_for_phase(state.phase),
+            session_answers_used=state.session_answer_count,
+            session_answers_remaining=max(0, state.session_answer_limit - state.session_answer_count),
+            facts_saved=0,
+            saved_targets=(),
+            review_items=(),
+            can_pause=True,
+            can_skip_topic=True,
+            sensitive_permission_required=(
+                bool(definition.sensitive and topic_state.permission_state != "granted")
+                if definition and topic_state
+                else False
+            ),
+            setup_topics_completed=self._stored_setup_topics_completed(state),
+            setup_topics_total=len(_TOPIC_ORDER),
+            setup_complete=bool(state.setup_completed_at),
+            next_invite_after=state.next_invite_after,
+        )
+
     def _build_status_result(
         self,
         state: UserDiscoveryState,
@@ -367,6 +419,14 @@ class UserDiscoveryQueryMixin:
         completed = 0
         for topic_id in _TOPIC_ORDER:
             topic_state = self._effective_topic_state(state, topic_id)
+            if topic_state.completed_once or topic_state.skip_count > 0:
+                completed += 1
+        return completed
+
+    def _stored_setup_topics_completed(self, state: UserDiscoveryState) -> int:
+        completed = 0
+        for topic_id in _TOPIC_ORDER:
+            topic_state = self._topic_state(state, topic_id)
             if topic_state.completed_once or topic_state.skip_count > 0:
                 completed += 1
         return completed

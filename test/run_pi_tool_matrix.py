@@ -455,10 +455,7 @@ def run_text_turn(
         )
     except Exception as exc:
         emitted.append(f"exception={type(exc).__name__}: {exc}")
-        try:
-            loop.runtime.fail(str(exc))
-        except Exception:
-            pass
+        loop.runtime.fail(str(exc))
         return TurnArtifact(
             prompt=prompt,
             answer="",

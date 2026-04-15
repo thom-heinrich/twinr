@@ -9,6 +9,8 @@
 # IMP-2: writer coordination now uses an OS-level lock file on Unix/Pi deployments so concurrent writers serialize cleanly.
 # IMP-3: repeated load() calls are stat-cached, reducing JSON parsing and disk churn in polling-heavy HDMI render loops.
 # BREAKING: cue expiry is now hard-clamped to max_ttl_s (default 300s) to preserve the "short ambient impulse" contract.
+# BUG-4: signature() now excludes updated_at/expires_at so cue lifetime refreshes do not
+#        force semantically identical HDMI reserve rerenders on hdmi_wayland.
 
 """Persist short ambient display impulses for Twinr's HDMI reserve area.
 
@@ -311,8 +313,6 @@ class DisplayAmbientImpulseCue:
 
         return (
             self.source,
-            self.updated_at,
-            self.expires_at,
             self.topic_key,
             self.semantic_topic_key,
             self.eyebrow,

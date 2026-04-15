@@ -17,11 +17,10 @@ from typing import Protocol
 
 
 _PROTECTED_DROPIN_NAME = "10-refuse-manual-restart.conf"
-_TEMP_OVERRIDE_DROPIN_NAME = (
-    "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-temp-manual-restart-override.conf"
-)
+_SYSTEM_UNIT_DROPIN_ROOT = "/etc/systemd/system"
 _PROTECTED_DROPIN_CONTENT = "[Unit]\nRefuseManualStart=yes\nRefuseManualStop=yes\n"
-_TEMP_OVERRIDE_DROPIN_CONTENT = "[Unit]\nRefuseManualStart=no\nRefuseManualStop=no\n"
+_REMOTE_HOST_CONTROL_PERMIT_PATH = "/run/caia/maintenance/twinr_host_control.permit"
+_REMOTE_HOST_CONTROL_PERMIT_TOKEN = "ALLOW_TWINR_HOST_CONTROL"
 _RESTART_STOP_WAIT_S = 12.0
 _RESTART_KILL_WAIT_S = 8.0
 
@@ -48,6 +47,14 @@ class RemoteManualRestartProtectionStatus:
         """Return whether the remote systemd manager now refuses manual restarts."""
 
         return self.refuse_manual_start and self.refuse_manual_stop
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteHostControlPermitStatus:
+    """Describe whether the remote host-control maintenance permit changed."""
+
+    file_path: str
+    changed: bool
 
 
 def ensure_remote_service_manual_restart_protection(
@@ -91,6 +98,39 @@ def ensure_remote_service_manual_restart_protection(
     return status
 
 
+def ensure_remote_host_control_permit(
+    *,
+    executor: RemoteSudoExecutor,
+) -> RemoteHostControlPermitStatus:
+    """Open the host-control maintenance contract for bounded remote actions."""
+
+    changed = _sync_remote_plain_file(
+        executor=executor,
+        file_path=_REMOTE_HOST_CONTROL_PERMIT_PATH,
+        contents=_REMOTE_HOST_CONTROL_PERMIT_TOKEN,
+    )
+    return RemoteHostControlPermitStatus(
+        file_path=_REMOTE_HOST_CONTROL_PERMIT_PATH,
+        changed=changed,
+    )
+
+
+def remove_remote_host_control_permit(
+    *,
+    executor: RemoteSudoExecutor,
+) -> RemoteHostControlPermitStatus:
+    """Close the host-control maintenance contract after bounded remote actions."""
+
+    changed = _remove_remote_plain_file(
+        executor=executor,
+        file_path=_REMOTE_HOST_CONTROL_PERMIT_PATH,
+    )
+    return RemoteHostControlPermitStatus(
+        file_path=_REMOTE_HOST_CONTROL_PERMIT_PATH,
+        changed=changed,
+    )
+
+
 def guarded_restart_remote_service(
     *,
     executor: RemoteSudoExecutor,
@@ -104,38 +144,79 @@ def guarded_restart_remote_service(
     repairs fail fast instead of burning the full systemd stop timeout.
     """
 
-    temp_override_path = _dropin_path(
+    protected_path = _dropin_path(
         service_name=service_name,
-        dropin_name=_TEMP_OVERRIDE_DROPIN_NAME,
+        dropin_name=_PROTECTED_DROPIN_NAME,
     )
-    _sync_remote_dropin(
+    restart_error: Exception | None = None
+    cleanup_error: Exception | None = None
+    ensure_remote_host_control_permit(
         executor=executor,
-        dropin_path=temp_override_path,
-        contents=_TEMP_OVERRIDE_DROPIN_CONTENT,
     )
     try:
-        completed = executor.run_sudo_ssh(
-            _python_bounded_restart_script(
-                service_name=service_name,
-                graceful_stop_wait_s=_RESTART_STOP_WAIT_S,
-                kill_wait_s=_RESTART_KILL_WAIT_S,
-            )
-        )
-        _raise_for_remote_command_failure(
-            completed=completed,
-            failure_prefix="remote_guarded_restart_failed",
-        )
-    finally:
+        # Live-host proof on 2026-04-07: freshly written [Unit] allow-manual
+        # drop-ins are not loaded into DropInPaths for this already loaded unit,
+        # so the only reliable way to open a manual-restart window is to remove
+        # the durable protection drop-in, reload, restart, then restore it.
         _remove_remote_dropin(
             executor=executor,
-            dropin_path=temp_override_path,
+            dropin_path=protected_path,
         )
+        try:
+            _ensure_remote_manual_restart_override_open(
+                executor=executor,
+                service_name=service_name,
+            )
+            completed = executor.run_sudo_ssh(
+                _python_bounded_restart_script(
+                    service_name=service_name,
+                    graceful_stop_wait_s=_RESTART_STOP_WAIT_S,
+                    kill_wait_s=_RESTART_KILL_WAIT_S,
+                )
+            )
+            _raise_for_remote_command_failure(
+                completed=completed,
+                failure_prefix="remote_guarded_restart_failed",
+            )
+        except Exception as exc:
+            restart_error = exc
+    finally:
+        try:
+            _sync_remote_dropin(
+                executor=executor,
+                dropin_path=protected_path,
+                contents=_PROTECTED_DROPIN_CONTENT,
+            )
+            _ensure_remote_manual_restart_protection_closed(
+                executor=executor,
+                service_name=service_name,
+            )
+        except Exception as exc:
+            cleanup_error = exc
+        finally:
+            remove_remote_host_control_permit(
+                executor=executor,
+            )
+    if restart_error is not None and cleanup_error is not None:
+        raise RuntimeError(
+            "remote_guarded_restart_and_cleanup_failed:"
+            f"restart_error={restart_error}:cleanup_error={cleanup_error}"
+        ) from restart_error
+    if cleanup_error is not None:
+        raise cleanup_error
+    if restart_error is not None:
+        raise restart_error
 
 
-def _dropin_path(*, service_name: str, dropin_name: str) -> str:
+def _dropin_path(
+    *,
+    service_name: str,
+    dropin_name: str,
+    root_path: str = _SYSTEM_UNIT_DROPIN_ROOT,
+) -> str:
     """Return the absolute drop-in path for one remote service."""
 
-    return f"/etc/systemd/system/{service_name}.d/{dropin_name}"
+    return f"{str(root_path).rstrip('/')}/{service_name}.d/{dropin_name}"
 
 
 def _remove_conflicting_manual_restart_overrides(
@@ -178,6 +259,24 @@ def _sync_remote_dropin(
     return bool(payload.get("changed", False))
 
 
+def _sync_remote_plain_file(
+    *,
+    executor: RemoteSudoExecutor,
+    file_path: str,
+    contents: str,
+) -> bool:
+    """Write one remote plain-text file only when its contents changed."""
+
+    completed = executor.run_sudo_ssh(
+        _python_plain_file_sync_script(
+            file_path=file_path,
+            contents=contents,
+        )
+    )
+    payload = _parse_json_stdout(completed.stdout)
+    return bool(payload.get("changed", False))
+
+
 def _remove_remote_dropin(
     *,
     executor: RemoteSudoExecutor,
@@ -187,6 +286,20 @@ def _remove_remote_dropin(
 
     completed = executor.run_sudo_ssh(
         _python_dropin_remove_script(dropin_path=dropin_path)
+    )
+    payload = _parse_json_stdout(completed.stdout)
+    return bool(payload.get("changed", False))
+
+
+def _remove_remote_plain_file(
+    *,
+    executor: RemoteSudoExecutor,
+    file_path: str,
+) -> bool:
+    """Remove one remote plain-text file and report whether it existed."""
+
+    completed = executor.run_sudo_ssh(
+        _python_plain_file_remove_script(file_path=file_path)
     )
     payload = _parse_json_stdout(completed.stdout)
     return bool(payload.get("changed", False))
@@ -215,6 +328,53 @@ def _fetch_manual_restart_flags(
         normalized = str(value or "").strip().lower()
         values[str(key).strip()] = normalized in {"1", "yes", "true"}
     return values
+
+
+def _ensure_remote_manual_restart_override_open(
+    *,
+    executor: RemoteSudoExecutor,
+    service_name: str,
+) -> None:
+    """Fail fast when the temporary manual-restart override did not take effect."""
+
+    flags = _fetch_manual_restart_flags(
+        executor=executor,
+        service_name=service_name,
+    )
+    refuse_manual_start = flags["RefuseManualStart"]
+    refuse_manual_stop = flags["RefuseManualStop"]
+    if not refuse_manual_start and not refuse_manual_stop:
+        return
+    raise RuntimeError(
+        "remote_manual_restart_override_not_verified:"
+        f"service={service_name}:"
+        f"refuse_manual_start={refuse_manual_start}:"
+        f"refuse_manual_stop={refuse_manual_stop}:"
+        f"permit_path={_REMOTE_HOST_CONTROL_PERMIT_PATH}"
+    )
+
+
+def _ensure_remote_manual_restart_protection_closed(
+    *,
+    executor: RemoteSudoExecutor,
+    service_name: str,
+) -> None:
+    """Fail fast when the persistent manual-restart protection was not restored."""
+
+    flags = _fetch_manual_restart_flags(
+        executor=executor,
+        service_name=service_name,
+    )
+    refuse_manual_start = flags["RefuseManualStart"]
+    refuse_manual_stop = flags["RefuseManualStop"]
+    if refuse_manual_start and refuse_manual_stop:
+        return
+    raise RuntimeError(
+        "remote_manual_restart_protection_restore_not_verified:"
+        f"service={service_name}:"
+        f"refuse_manual_start={refuse_manual_start}:"
+        f"refuse_manual_stop={refuse_manual_stop}"
+    )
 
 
 def _parse_json_stdout(stdout: str) -> dict[str, object]:
@@ -278,6 +438,41 @@ def _python_dropin_sync_script(*, dropin_path: str, contents: str) -> str:
         "            tmp_path.unlink()\n"
         "if changed:\n"
         "    subprocess.run(['systemctl', 'daemon-reload'], check=True)\n"
+        "print(json.dumps({'changed': changed, 'path': str(path)}))\n"
+        "PY"
+    )
+
+
+def _python_plain_file_sync_script(*, file_path: str, contents: str) -> str:
+    """Return the remote Python snippet that syncs one plain-text file."""
+
+    return (
+        "python3 - <<'PY'\n"
+        "from pathlib import Path\n"
+        "import json\n"
+        "import os\n"
+        "import tempfile\n"
+        f"path = Path({file_path!r})\n"
+        f"contents = {contents!r}\n"
+        "path.parent.mkdir(parents=True, exist_ok=True)\n"
+        "changed = True\n"
+        "try:\n"
+        "    current = path.read_text(encoding='utf-8')\n"
+        "except FileNotFoundError:\n"
+        "    current = None\n"
+        "if current == contents:\n"
+        "    changed = False\n"
+        "else:\n"
+        "    fd, tmp_name = tempfile.mkstemp(prefix=path.name + '.', dir=str(path.parent), text=True)\n"
+        "    os.close(fd)\n"
+        "    tmp_path = Path(tmp_name)\n"
+        "    try:\n"
+        "        tmp_path.write_text(contents, encoding='utf-8')\n"
+        "        os.chmod(tmp_path, 0o644)\n"
+        "        os.replace(tmp_path, path)\n"
+        "    finally:\n"
+        "        if tmp_path.exists():\n"
+        "            tmp_path.unlink()\n"
         "print(json.dumps({'changed': changed, 'path': str(path)}))\n"
         "PY"
     )
@@ -441,6 +636,23 @@ def _python_bounded_restart_script(
         "}\n"
         "json.dump(payload, sys.stdout)\n"
         "raise SystemExit(int(start_completed.returncode))\n"
+        "PY"
+    )
+
+
+def _python_plain_file_remove_script(*, file_path: str) -> str:
+    """Return the remote Python snippet that removes one plain-text file."""
+
+    return (
+        "python3 - <<'PY'\n"
+        "from pathlib import Path\n"
+        "import json\n"
+        f"path = Path({file_path!r})\n"
+        "changed = False\n"
+        "if path.exists():\n"
+        "    path.unlink()\n"
+        "    changed = True\n"
+        "print(json.dumps({'changed': changed, 'path': str(path)}))\n"
         "PY"
     )
 

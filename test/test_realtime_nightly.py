@@ -7,11 +7,13 @@ from types import SimpleNamespace
 import sys
 import tempfile
 import unittest
+from typing import Any, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent import TwinrConfig
 from twinr.agent.personality.evolution import PersonalityEvolutionResult
+from twinr.agent.personality.learning import PersonalityHistoryProbe
 from twinr.agent.personality.intelligence.models import (
     SituationalAwarenessThread,
     WorldFeedSubscription,
@@ -19,6 +21,9 @@ from twinr.agent.personality.intelligence.models import (
 )
 from twinr.agent.personality.models import ContinuityThread, PersonalityDelta, PersonalitySnapshot
 from twinr.agent.workflows.realtime_runtime.nightly import TwinrNightlyOrchestrator
+from twinr.agent.workflows.realtime_runtime.nightly_digest_refinement import (
+    build_nightly_digest_refinement,
+)
 from twinr.memory.longterm.core.models import LongTermMemoryObjectV1, LongTermReflectionResultV1, LongTermSourceRefV1
 from twinr.memory.reminders import ReminderEntry
 from twinr.proactive.runtime.display_reserve_companion_planner import DisplayReserveCompanionPlanner
@@ -121,6 +126,7 @@ class _FakePersonalityLearning:
         *,
         refresh_result: WorldIntelligenceRefreshResult | None,
         flush_results: tuple[PersonalityEvolutionResult | None, ...] | None = None,
+        history_probe: PersonalityHistoryProbe | None = None,
     ) -> None:
         self.refresh_result = refresh_result
         self.flush_results = flush_results or (
@@ -128,6 +134,12 @@ class _FakePersonalityLearning:
             None,
         )
         self.flush_calls = 0
+        self.history_probe = history_probe or PersonalityHistoryProbe(
+            history_read_status="loaded",
+            snapshot_head_status="loaded",
+            delta_head_status="loaded",
+            last_commit_at="2026-03-22T20:00:00Z",
+        )
 
     def flush_pending(self) -> PersonalityEvolutionResult | None:
         self.flush_calls += 1
@@ -145,6 +157,9 @@ class _FakePersonalityLearning:
         del force, search_backend
         return self.refresh_result
 
+    def probe_history_status(self) -> PersonalityHistoryProbe:
+        return self.history_probe
+
 
 @dataclass
 class _FakeLongTermMemory:
@@ -153,6 +168,8 @@ class _FakeLongTermMemory:
     flush_ok: bool = True
     flush_calls: int = 0
     reflection_calls: int = 0
+    writer: object | None = None
+    multimodal_writer: object | None = None
 
     def flush(self, *, timeout_s: float = 2.0) -> bool:
         del timeout_s
@@ -175,6 +192,76 @@ class _FakeReminderStore:
 
     def load_entries(self) -> tuple[ReminderEntry, ...]:
         return self._entries
+
+
+class _RecordingCompose:
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    def __call__(self, *, prompt: str, max_len: int) -> str:
+        del max_len
+        self.prompts.append(prompt)
+        return ""
+
+
+@dataclass
+class _FakeWriterState:
+    worker_name: str = "writer"
+    pending_count: int = 0
+    inflight_count: int = 0
+    dropped_count: int = 0
+    last_error_message: str | None = None
+    accepting: bool = True
+    worker_alive: bool = True
+
+
+class _FakeWriter:
+    def __init__(self, state: _FakeWriterState) -> None:
+        self._state = state
+
+    def snapshot_state(self) -> _FakeWriterState:
+        return self._state
+
+
+def _make_orchestrator(
+    *,
+    config: TwinrConfig,
+    runtime: _FakeRuntime,
+    backend: object,
+    planner: DisplayReserveCompanionPlanner | None = None,
+    remote_ready=lambda: True,
+    background_allowed=lambda: True,
+) -> TwinrNightlyOrchestrator:
+    return TwinrNightlyOrchestrator(
+        config=config,
+        runtime=cast(Any, runtime),
+        text_backend=cast(Any, backend),
+        search_backend=cast(Any, backend),
+        print_backend=cast(Any, backend),
+        display_planner=planner,
+        remote_ready=remote_ready,
+        background_allowed=background_allowed,
+    )
+
+
+def _digest_store(orchestrator: TwinrNightlyOrchestrator):
+    assert orchestrator.digest_store is not None
+    return orchestrator.digest_store
+
+
+def _summary_store(orchestrator: TwinrNightlyOrchestrator):
+    assert orchestrator.summary_store is not None
+    return orchestrator.summary_store
+
+
+def _state_store(orchestrator: TwinrNightlyOrchestrator):
+    assert orchestrator.state_store is not None
+    return orchestrator.state_store
+
+
+def _personality_status_store(orchestrator: TwinrNightlyOrchestrator):
+    assert orchestrator.personality_status_store is not None
+    return orchestrator.personality_status_store
 
 
 @dataclass
@@ -338,13 +425,11 @@ class TwinrNightlyOrchestratorTests(unittest.TestCase):
                 due_reminders=(),
             )
             planner = self._make_planner(config)
-            orchestrator = TwinrNightlyOrchestrator(
+            orchestrator = _make_orchestrator(
                 config=config,
                 runtime=runtime,
-                text_backend=backend,
-                search_backend=backend,
-                print_backend=backend,
-                display_planner=planner,
+                backend=backend,
+                planner=planner,
                 remote_ready=lambda: True,
                 background_allowed=lambda: True,
             )
@@ -353,8 +438,8 @@ class TwinrNightlyOrchestratorTests(unittest.TestCase):
                 local_now=datetime(2026, 3, 23, 1, 0, tzinfo=timezone.utc)
             )
 
-            prepared_digest = orchestrator.digest_store.load()
-            summary = orchestrator.summary_store.load()
+            prepared_digest = _digest_store(orchestrator).load()
+            summary = _summary_store(orchestrator).load()
             prepared_plan = planner.prepared_store.load()
 
         self.assertEqual(result.action, "prepared")
@@ -373,6 +458,9 @@ class TwinrNightlyOrchestratorTests(unittest.TestCase):
         self.assertEqual(summary.reflection_reflected_object_count, 1)
         self.assertEqual(summary.reflection_created_summary_count, 1)
         self.assertEqual(summary.accepted_personality_delta_count, 1)
+        self.assertEqual(summary.personality_flush_status, "committed")
+        self.assertEqual(summary.personality_history_read_status, "loaded")
+        self.assertEqual(summary.last_personality_commit_at, "2026-03-22T20:00:00Z")
         self.assertEqual(summary.target_day_reminder_count, 1)
         self.assertEqual(summary.live_search_queries, 1)
         self.assertTrue(summary.new_insights)
@@ -416,13 +504,11 @@ class TwinrNightlyOrchestratorTests(unittest.TestCase):
                 reminder_store=_FakeReminderStore(()),
                 due_reminders=(),
             )
-            orchestrator = TwinrNightlyOrchestrator(
+            orchestrator = _make_orchestrator(
                 config=config,
                 runtime=runtime,
-                text_backend=backend,
-                search_backend=backend,
-                print_backend=backend,
-                display_planner=self._make_planner(config),
+                backend=backend,
+                planner=self._make_planner(config),
                 remote_ready=lambda: True,
                 background_allowed=lambda: True,
             )
@@ -449,12 +535,10 @@ class TwinrNightlyOrchestratorTests(unittest.TestCase):
                 reminder_store=_FakeReminderStore(()),
                 due_reminders=(),
             )
-            orchestrator = TwinrNightlyOrchestrator(
+            orchestrator = _make_orchestrator(
                 config=config,
                 runtime=runtime,
-                text_backend=backend,
-                search_backend=backend,
-                print_backend=backend,
+                backend=backend,
                 remote_ready=lambda: False,
                 background_allowed=lambda: True,
             )
@@ -463,14 +547,20 @@ class TwinrNightlyOrchestratorTests(unittest.TestCase):
                 local_now=datetime(2026, 3, 23, 1, 0, tzinfo=timezone.utc)
             )
 
-            state = orchestrator.state_store.load()
+            state = _state_store(orchestrator).load()
+            personality_status = _personality_status_store(orchestrator).load()
 
         self.assertEqual(result.action, "blocked")
         self.assertEqual(result.reason, "remote_not_ready")
         self.assertIsNotNone(state)
         assert state is not None
         self.assertEqual(state.last_status, "blocked_remote_not_ready")
-        self.assertIsNone(orchestrator.digest_store.load())
+        self.assertIsNone(_digest_store(orchestrator).load())
+
+        self.assertIsNotNone(personality_status)
+        assert personality_status is not None
+        self.assertEqual(personality_status.failure_stage, "required_remote_not_ready")
+        self.assertEqual(personality_status.error, "required_remote_not_ready")
 
     def test_orchestrator_degrades_to_fallback_digest_when_text_backend_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -492,13 +582,11 @@ class TwinrNightlyOrchestratorTests(unittest.TestCase):
                 ),
                 due_reminders=(),
             )
-            orchestrator = TwinrNightlyOrchestrator(
+            orchestrator = _make_orchestrator(
                 config=config,
                 runtime=runtime,
-                text_backend=backend,
-                search_backend=backend,
-                print_backend=backend,
-                display_planner=self._make_planner(config),
+                backend=backend,
+                planner=self._make_planner(config),
                 remote_ready=lambda: True,
                 background_allowed=lambda: True,
             )
@@ -507,8 +595,8 @@ class TwinrNightlyOrchestratorTests(unittest.TestCase):
                 local_now=datetime(2026, 3, 23, 1, 0, tzinfo=timezone.utc)
             )
 
-            digest = orchestrator.digest_store.load()
-            summary = orchestrator.summary_store.load()
+            digest = _digest_store(orchestrator).load()
+            summary = _summary_store(orchestrator).load()
 
         self.assertEqual(result.action, "prepared")
         self.assertIsNotNone(result.state)
@@ -522,6 +610,130 @@ class TwinrNightlyOrchestratorTests(unittest.TestCase):
         self.assertIn("Medikament nehmen", digest.print_text)
         self.assertIn("spoken_digest:provider_unavailable", summary.errors)
         self.assertIn("print_digest:provider_unavailable", summary.errors)
+
+    def test_digest_refinement_does_not_invent_personality_or_continuity_lines_without_inputs(self) -> None:
+        compose = _RecordingCompose()
+
+        refinement = build_nightly_digest_refinement(
+            compose=compose,
+            language="de",
+            target_day_text="2026-03-23",
+            location_hint="Berlin, DE",
+            raw_headline_lines=("Stadtservice bleibt ruhig.",),
+            raw_live_news_summary=None,
+            candidate_news_sources=("https://news.example/top",),
+            raw_new_insights=(),
+            raw_continuity_shifts=(),
+        )
+
+        self.assertEqual(refinement.new_insights, ())
+        self.assertEqual(refinement.continuity_shifts, ())
+        self.assertFalse(
+            any("morning-visible overnight insight lines" in prompt for prompt in compose.prompts)
+        )
+        self.assertFalse(
+            any("Prepare Twinr's morning continuity lines." in prompt for prompt in compose.prompts)
+        )
+
+    def test_orchestrator_marks_history_blindness_in_summary_and_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._make_config(temp_dir)
+            backend = _FakeNightlyBackend()
+            runtime = _FakeRuntime(
+                long_term_memory=_FakeLongTermMemory(
+                    reflection=_reflection_result(),
+                    personality_learning=_FakePersonalityLearning(
+                        refresh_result=None,
+                        history_probe=PersonalityHistoryProbe(
+                            history_read_status="remote_unavailable",
+                            snapshot_head_status="loaded",
+                            delta_head_status="error",
+                            failure_stage="delta_payload",
+                            error="LongTermRemoteUnavailableError: GET /v1/external/documents/full 503",
+                        ),
+                    ),
+                ),
+                reminder_store=_FakeReminderStore(()),
+                due_reminders=(),
+            )
+            orchestrator = _make_orchestrator(
+                config=config,
+                runtime=runtime,
+                backend=backend,
+                planner=self._make_planner(config),
+                remote_ready=lambda: True,
+                background_allowed=lambda: True,
+            )
+
+            result = orchestrator.maybe_run(
+                local_now=datetime(2026, 3, 23, 1, 0, tzinfo=timezone.utc)
+            )
+
+            summary = _summary_store(orchestrator).load()
+            state = _state_store(orchestrator).load()
+            personality_status = _personality_status_store(orchestrator).load()
+
+        self.assertEqual(result.action, "prepared")
+        self.assertEqual(result.reason, "prepared_degraded")
+        self.assertIsNotNone(summary)
+        self.assertIsNotNone(state)
+        self.assertIsNotNone(personality_status)
+        assert summary is not None
+        assert state is not None
+        assert personality_status is not None
+        self.assertEqual(summary.failure_stage, "delta_payload")
+        self.assertEqual(summary.personality_history_read_status, "remote_unavailable")
+        self.assertEqual(
+            summary.personality_history_error,
+            "LongTermRemoteUnavailableError: GET /v1/external/documents/full 503",
+        )
+        self.assertIn(
+            "personality_history:delta_payload:LongTermRemoteUnavailableError: GET /v1/external/documents/full 503",
+            summary.errors,
+        )
+        self.assertEqual(state.last_status, "degraded")
+        self.assertEqual(state.personality_history_read_status, "remote_unavailable")
+        self.assertEqual(personality_status.history_read_status, "remote_unavailable")
+        self.assertEqual(personality_status.failure_stage, "delta_payload")
+
+    def test_orchestrator_records_explicit_long_term_flush_failure_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._make_config(temp_dir)
+            backend = _FakeNightlyBackend()
+            runtime = _FakeRuntime(
+                long_term_memory=_FakeLongTermMemory(
+                    reflection=_reflection_result(),
+                    personality_learning=_FakePersonalityLearning(refresh_result=None),
+                    flush_ok=False,
+                    writer=_FakeWriter(_FakeWriterState(pending_count=3)),
+                ),
+                reminder_store=_FakeReminderStore(()),
+                due_reminders=(),
+            )
+            orchestrator = _make_orchestrator(
+                config=config,
+                runtime=runtime,
+                backend=backend,
+                planner=self._make_planner(config),
+                remote_ready=lambda: True,
+                background_allowed=lambda: True,
+            )
+
+            result = orchestrator.maybe_run(
+                local_now=datetime(2026, 3, 23, 1, 0, tzinfo=timezone.utc)
+            )
+
+            summary = _summary_store(orchestrator).load()
+
+        self.assertEqual(result.action, "prepared")
+        self.assertIsNotNone(summary)
+        assert summary is not None
+        self.assertFalse(summary.long_term_flush_ok)
+        self.assertEqual(summary.failure_stage, "long_term_flush_conversation_writer_pending")
+        self.assertIn(
+            "long_term_flush:long_term_flush_conversation_writer_pending:pending_count=3",
+            summary.errors,
+        )
 
 
 if __name__ == "__main__":

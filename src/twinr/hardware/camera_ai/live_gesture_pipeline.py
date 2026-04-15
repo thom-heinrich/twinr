@@ -10,6 +10,10 @@
 # IMP-1: Added bounded per-timestamp snapshot history so fallback reads exact-or-older results but never "future" callbacks from later frames.
 # IMP-2: Added lightweight temporal stabilization for rescue paths plus wave cooldown/reset logic to reduce flicker and false positives in continuous user-facing HCI.
 # IMP-3: Added IoU-based hand-box deduplication and config-driven tuning knobs via getattr(config, ...) without breaking older configs.
+# BUG-7: User-facing live-stream gestures now honor the existing HDMI ack
+#        confidence floors instead of a stricter generic temporal gate that
+#        suppressed valid Pi peace-sign/thumbs gestures before they could reach
+#        the authoritative stream.
 
 """Run a dedicated low-latency MediaPipe live-stream gesture lane.
 
@@ -32,6 +36,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from collections import OrderedDict, deque
 from dataclasses import dataclass
+from functools import lru_cache
 from threading import Condition, RLock
 from time import monotonic
 from typing import Any, cast
@@ -43,7 +48,6 @@ from twinr.hardware.hand_landmarks import (
     HandRoiSource,
     MediaPipeHandLandmarkWorker,
 )
-
 from .authoritative_gestures import AuthoritativeGestureLane
 from .config import MediaPipeVisionConfig
 from .fine_hand_gestures import (
@@ -359,6 +363,26 @@ class _GestureStabilityTracker:
 
         if gesture != AICameraFineHandGesture.NONE:
             votes, mean_confidence = self._votes_for_gesture(gesture)
+            live_stream_passthrough_confidence = _live_stream_passthrough_confidence(
+                self._config,
+                gesture=gesture,
+                resolved_source=resolved_source,
+                require_weak_live_stream_consensus=require_weak_live_stream_consensus,
+            )
+            if live_stream_passthrough_confidence is not None and score >= live_stream_passthrough_confidence:
+                self._remember_output(gesture, confidence, observed_at)
+                return gesture, confidence, {
+                    "temporal_enabled": temporal_enabled,
+                    "temporal_reason": "user_facing_hdmi_floor",
+                    "temporal_votes": votes,
+                    "temporal_output_gesture": gesture.value,
+                    "temporal_output_confidence": _round_optional_confidence(confidence),
+                    "temporal_output_changed": False,
+                    "temporal_resolved_source": resolved_source,
+                    "temporal_user_facing_min_confidence": _round_optional_confidence(
+                        live_stream_passthrough_confidence
+                    ),
+                }
             if score >= strong_confidence:
                 self._remember_output(gesture, confidence, observed_at)
                 return gesture, confidence, {
@@ -3029,6 +3053,40 @@ def _live_temporal_hold_s(config: MediaPipeVisionConfig) -> float:
         minimum=0.0,
         maximum=1.0,
     )
+
+
+def _live_stream_passthrough_confidence(
+    config: MediaPipeVisionConfig,
+    *,
+    gesture: AICameraFineHandGesture,
+    resolved_source: str,
+    require_weak_live_stream_consensus: bool,
+) -> float | None:
+    """Return the user-facing live-stream floor for one supported HDMI gesture."""
+
+    if not require_weak_live_stream_consensus or resolved_source != "live_stream":
+        return None
+    if gesture in {AICameraFineHandGesture.NONE, AICameraFineHandGesture.UNKNOWN}:
+        return None
+    floor = _live_hdmi_ack_min_confidence_by_gesture_value().get(gesture.value)
+    if floor is None:
+        return None
+    return min(
+        _live_temporal_strong_confidence(config),
+        _coerce_bounded_float(floor, default=_live_temporal_strong_confidence(config), minimum=0.0, maximum=1.0),
+    )
+
+
+@lru_cache(maxsize=1)
+def _live_hdmi_ack_min_confidence_by_gesture_value() -> dict[str, float]:
+    """Load HDMI ack floors lazily to avoid a proactive<->camera-ai import cycle."""
+
+    from twinr.proactive.social.gesture_calibration import DEFAULT_HDMI_ACK_FINE_HAND_POLICIES
+
+    return {
+        gesture.value: policy.min_confidence
+        for gesture, policy in DEFAULT_HDMI_ACK_FINE_HAND_POLICIES.items()
+    }
 
 
 def _short_exception(exc: Exception, *, limit: int = 160) -> str:

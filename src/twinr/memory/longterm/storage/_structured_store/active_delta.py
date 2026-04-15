@@ -95,7 +95,6 @@ class StructuredStoreActiveDeltaMixin(StructuredStoreMixinBase):
                 for normalized in (
                     _normalize_text(value)
                     for value in (
-                        *(item.memory_id for item in candidates),
                         *(memory_id for item in candidates for memory_id in item.conflicts_with),
                         *(memory_id for item in candidates for memory_id in item.supersedes),
                     )
@@ -111,18 +110,47 @@ class StructuredStoreActiveDeltaMixin(StructuredStoreMixinBase):
             )
         )
 
-        add_objects(self.load_objects_by_ids(target_memory_ids))
-        add_objects(self.load_objects_by_slot_keys(target_slot_keys))
-        add_objects(self.load_objects_by_event_ids(normalized_event_ids))
+        # Active persistence batches must stay on bounded exact-id/projection
+        # contracts. Cold full-catalog scans here can turn one background write
+        # into a remote-stability incident on the Pi.
+        add_objects(
+            self.load_objects_by_ids(
+                target_memory_ids,
+                allow_cold_remote_catalog_scan=False,
+            )
+        )
+        add_objects(
+            self.load_objects_by_slot_keys(
+                target_slot_keys,
+                allow_cold_remote_catalog_scan=False,
+            )
+        )
+        add_objects(
+            self.load_objects_by_event_ids(
+                normalized_event_ids,
+                allow_cold_remote_catalog_scan=False,
+            )
+        )
 
         related_memory_ids = tuple(selected_objects)
         if related_memory_ids:
-            add_objects(self.load_objects_referencing_memory_ids(related_memory_ids))
+            add_objects(
+                self.load_objects_referencing_memory_ids(
+                    related_memory_ids,
+                    allow_cold_remote_catalog_scan=False,
+                )
+            )
 
         selected_conflicts: dict[str, LongTermMemoryConflictV1] = {}
-        for conflict in self.load_conflicts_by_slot_keys(target_slot_keys):
+        for conflict in self.load_conflicts_by_slot_keys(
+            target_slot_keys,
+            allow_cold_remote_catalog_scan=False,
+        ):
             selected_conflicts[conflict.slot_key] = conflict
-        for conflict in self.load_conflicts_for_memory_ids(tuple(selected_objects)):
+        for conflict in self.load_conflicts_for_memory_ids(
+            tuple(selected_objects),
+            allow_cold_remote_catalog_scan=False,
+        ):
             selected_conflicts[conflict.slot_key] = conflict
 
         related_conflict_ids = tuple(
@@ -263,28 +291,34 @@ class StructuredStoreActiveDeltaMixin(StructuredStoreMixinBase):
                 return
 
             written_at = _utcnow().isoformat()
-            self._commit_remote_collection_delta(
-                snapshot_kind="objects",
-                upsert_payloads=object_payloads,
-                delete_item_ids=normalized_object_delete_ids,
-                written_at=written_at,
-            )
-            self._commit_remote_collection_delta(
-                snapshot_kind="conflicts",
-                upsert_payloads=conflict_payloads,
-                delete_item_ids=(),
-                delete_slot_keys=normalized_conflict_delete_slots,
-                written_at=written_at,
-            )
-            self._commit_remote_collection_delta(
-                snapshot_kind="archive",
-                upsert_payloads=archive_payloads,
-                delete_item_ids=normalized_archive_delete_ids,
-                written_at=written_at,
-            )
-            self._recent_local_snapshot_payloads.pop("objects", None)
-            self._recent_local_snapshot_payloads.pop("conflicts", None)
-            self._recent_local_snapshot_payloads.pop("archive", None)
+            touched_snapshot_kinds: list[str] = []
+            if object_payloads or normalized_object_delete_ids:
+                self._commit_remote_collection_delta(
+                    snapshot_kind="objects",
+                    upsert_payloads=object_payloads,
+                    delete_item_ids=normalized_object_delete_ids,
+                    written_at=written_at,
+                )
+                touched_snapshot_kinds.append("objects")
+            if conflict_payloads or normalized_conflict_delete_slots:
+                self._commit_remote_collection_delta(
+                    snapshot_kind="conflicts",
+                    upsert_payloads=conflict_payloads,
+                    delete_item_ids=(),
+                    delete_slot_keys=normalized_conflict_delete_slots,
+                    written_at=written_at,
+                )
+                touched_snapshot_kinds.append("conflicts")
+            if archive_payloads or normalized_archive_delete_ids:
+                self._commit_remote_collection_delta(
+                    snapshot_kind="archive",
+                    upsert_payloads=archive_payloads,
+                    delete_item_ids=normalized_archive_delete_ids,
+                    written_at=written_at,
+                )
+                touched_snapshot_kinds.append("archive")
+            for snapshot_kind in touched_snapshot_kinds:
+                self._recent_local_snapshot_payloads.pop(snapshot_kind, None)
 
     def _commit_remote_collection_delta(
         self,

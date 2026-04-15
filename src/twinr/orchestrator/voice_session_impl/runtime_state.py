@@ -43,6 +43,10 @@ class VoiceSessionRuntimeStateMixin:
     def handle_hello(self, request: OrchestratorVoiceHelloRequest) -> list[dict[str, Any]]:
         """Accept one new edge voice session and validate stream metadata."""
 
+        try:
+            request.validate()
+        except Exception as exc:
+            return [self._voice_error_payload(str(exc))]
         error = self._validate_hello_request(request)
         if error is not None:
             return [self._voice_error_payload(error)]
@@ -70,6 +74,10 @@ class VoiceSessionRuntimeStateMixin:
         elif self._state == "follow_up_open" and self._voice_quiet_active():
             hello_state_downgrade_reason = "voice_quiet_active"
             self._state = "waiting"
+        self._set_active_remote_wait_contract(
+            state=self._state,
+            wait_id=getattr(request, "wait_id", None),
+        )
 
         if self._state == "follow_up_open" and self._follow_up_allowed:
             now = self._monotonic()
@@ -102,6 +110,10 @@ class VoiceSessionRuntimeStateMixin:
     def handle_runtime_state(self, event: OrchestratorVoiceRuntimeStateEvent) -> list[dict[str, Any]]:
         """Update explicit edge runtime state and drain any timeout-based events."""
 
+        try:
+            event.validate()
+        except Exception as exc:
+            return [self._voice_error_payload(str(exc))]
         if not self._event_matches_active_session(event):
             self._trace_event(
                 "voice_runtime_state_ignored_session_mismatch",
@@ -174,6 +186,10 @@ class VoiceSessionRuntimeStateMixin:
     ) -> list[dict[str, Any]]:
         """Update the read-only household voice profiles used for wake bias."""
 
+        try:
+            event.validate()
+        except Exception as exc:
+            return [self._voice_error_payload(str(exc))]
         if not self._event_matches_active_session(event):
             self._trace_event(
                 "voice_identity_profiles_ignored_session_mismatch",
@@ -254,6 +270,10 @@ class VoiceSessionRuntimeStateMixin:
         quiet_details = self._set_voice_quiet_until_utc(getattr(event, "voice_quiet_until_utc", None))
         self._intent_context = VoiceRuntimeIntentContext.from_runtime_event(event)
         self._apply_runtime_policy_overrides(event)
+        self._set_active_remote_wait_contract(
+            state=self._state,
+            wait_id=getattr(event, "wait_id", None),
+        )
         if self._state == "follow_up_open" and self._follow_up_allowed:
             now = self._monotonic()
             if previous_state != "follow_up_open" or self._follow_up_opened_at is None:
@@ -278,6 +298,8 @@ class VoiceSessionRuntimeStateMixin:
             self._pending_transcript_utterance = None
         if self._state not in self._ACTIVE_STATES:
             self._pending_transcript_utterance = None
+        if self._state != "waiting":
+            self._wake_speculative_active = False
         if incoming_order is not None:
             self._runtime_state_order = incoming_order
         self._trace_event(
@@ -308,6 +330,8 @@ class VoiceSessionRuntimeStateMixin:
         if self._normalize_runtime_state(event.state or "waiting") != self._state:
             return False
         if bool(event.follow_up_allowed) != self._follow_up_allowed:
+            return False
+        if self._event_wait_id(event) != self._active_remote_wait_id_for_state(self._state):
             return False
         if self._normalize_voice_quiet_until_utc(getattr(event, "voice_quiet_until_utc", None)) != self._voice_quiet_until_utc:
             return False
@@ -479,12 +503,16 @@ class VoiceSessionRuntimeStateMixin:
         """Close the current remote follow-up window with an explicit reason."""
 
         previous_state = self._state
+        closed_wait_id = self._active_remote_wait_id_for_state(previous_state)
+        if closed_wait_id is None:
+            raise RuntimeError("Remote follow-up close requires an active follow_up_open wait_id")
         self._follow_up_deadline_at = None
         self._follow_up_opened_at = None
         self._pending_transcript_utterance = None
         self._history.clear()
         self._barge_in_sent = False
         self._state = "waiting"
+        self._set_active_remote_wait_contract(state=self._state, wait_id=None)
         self._refresh_waiting_visibility_anchor()
         self._trace_event(
             "voice_follow_up_closed",
@@ -495,7 +523,12 @@ class VoiceSessionRuntimeStateMixin:
                 "new_state": self._state,
             },
         )
-        return [OrchestratorVoiceFollowUpClosedEvent(reason=reason).to_payload()]
+        return [
+            OrchestratorVoiceFollowUpClosedEvent(
+                reason=reason,
+                wait_id=closed_wait_id,
+            ).to_payload()
+        ]
 
     def _waiting_visibility_grace_active(self) -> bool:
         """Return whether a recent visible waiting context is still fresh."""
@@ -611,6 +644,8 @@ class VoiceSessionRuntimeStateMixin:
         self._pending_transcript_utterance = None
         self._follow_up_deadline_at = None
         self._follow_up_opened_at = None
+        self._active_remote_wait_id = None
+        self._active_remote_wait_state = None
         self._barge_in_sent = False
         self._last_waiting_visible_at = None
         self._voice_quiet_until_utc = None
@@ -625,6 +660,33 @@ class VoiceSessionRuntimeStateMixin:
     def _event_session_id(self, event: object) -> str | None:
         session_id = str(getattr(event, "session_id", "") or "").strip()
         return session_id or None
+
+    def _event_wait_id(self, event: object) -> str | None:
+        wait_id = str(getattr(event, "wait_id", "") or "").strip()
+        return wait_id or None
+
+    def _set_active_remote_wait_contract(
+        self,
+        *,
+        state: str,
+        wait_id: str | None,
+    ) -> None:
+        normalized_wait_id = str(wait_id or "").strip() or None
+        if state in {"listening", "follow_up_open"}:
+            if normalized_wait_id is None:
+                raise RuntimeError(f"Remote wait_id is required while state={state!r}")
+            self._active_remote_wait_state = state
+            self._active_remote_wait_id = normalized_wait_id
+            return
+        self._active_remote_wait_state = None
+        self._active_remote_wait_id = None
+
+    def _active_remote_wait_id_for_state(self, state: str | None) -> str | None:
+        normalized_state = str(state or "").strip()
+        if normalized_state != str(getattr(self, "_active_remote_wait_state", "") or "").strip():
+            return None
+        wait_id = str(getattr(self, "_active_remote_wait_id", "") or "").strip()
+        return wait_id or None
 
     def _event_matches_active_session(self, event: object) -> bool:
         event_session_id = self._event_session_id(event)

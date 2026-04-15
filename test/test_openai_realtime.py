@@ -230,6 +230,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("remember_contact tool", instructions)
         self.assertIn("lookup_contact tool", instructions)
         self.assertIn("send_whatsapp_message tool", instructions)
+        self.assertIn("review_saved_memories tool", instructions)
         self.assertIn("get_memory_conflicts tool", instructions)
         self.assertIn("resolve_memory_conflict tool", instructions)
         self.assertIn("remember_preference tool", instructions)
@@ -385,6 +386,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 "control_smart_home_entities": lambda _arguments: {"status": "ok"},
                 "read_smart_home_sensor_stream": lambda _arguments: {"status": "ok", "events": []},
                 "remember_memory": lambda _arguments: {"status": "saved"},
+                "review_saved_memories": lambda _arguments: {"status": "ok", "memories": []},
                 "remember_contact": lambda _arguments: {"status": "created"},
                 "lookup_contact": lambda _arguments: {"status": "found"},
                 "send_whatsapp_message": lambda _arguments: {"status": "sent"},
@@ -432,6 +434,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 "control_smart_home_entities",
                 "read_smart_home_sensor_stream",
                 "remember_memory",
+                "review_saved_memories",
                 "remember_contact",
                 "lookup_contact",
                 "send_whatsapp_message",
@@ -513,6 +516,8 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("instead of web search", tools_by_name["read_smart_home_sensor_stream"]["description"])
         self.assertIn("summary", tools_by_name["remember_memory"]["parameters"]["properties"])
         self.assertIn("confirmed", tools_by_name["remember_memory"]["parameters"]["properties"])
+        self.assertIn("limit", tools_by_name["review_saved_memories"]["parameters"]["properties"])
+        self.assertIn("confirmed", tools_by_name["review_saved_memories"]["parameters"]["properties"])
         self.assertIn("phone", tools_by_name["remember_contact"]["parameters"]["properties"])
         self.assertIn("role", tools_by_name["remember_contact"]["parameters"]["properties"])
         self.assertIn("name", tools_by_name["lookup_contact"]["parameters"]["properties"])

@@ -46,6 +46,70 @@ class MultimodalAttentionTargetTests(unittest.TestCase):
         self.assertEqual(snapshot.focus_source, "speaker_association")
         self.assertIsNotNone(snapshot.target_center_x)
 
+    def test_visible_speaker_confidence_does_not_drop_below_active_track_floor(self) -> None:
+        tracker = MultimodalAttentionTargetTracker.from_config(TwinrConfig())
+
+        tracker.observe(
+            observed_at=10.0,
+            live_facts={
+                "camera": {
+                    "person_visible": True,
+                    "person_count": 1,
+                    "visible_persons": [
+                        {
+                            "box": {"top": 0.1, "left": 0.7, "bottom": 0.9, "right": 0.9},
+                            "zone": "right",
+                            "confidence": 0.92,
+                        },
+                    ],
+                    "primary_person_center_x": 0.8,
+                    "primary_person_center_y": 0.5,
+                    "visual_attention_score": 0.18,
+                },
+                "vad": {"speech_detected": False},
+            },
+            runtime_status="waiting",
+            presence_session_id=7,
+        )
+
+        snapshot = tracker.observe(
+            observed_at=10.5,
+            live_facts={
+                "camera": {
+                    "person_visible": True,
+                    "person_count": 1,
+                    "visible_persons": [
+                        {
+                            "box": {"top": 0.1, "left": 0.7, "bottom": 0.9, "right": 0.9},
+                            "zone": "right",
+                            "confidence": 0.92,
+                        },
+                    ],
+                    "primary_person_center_x": 0.8,
+                    "primary_person_center_y": 0.5,
+                    "visual_attention_score": 0.18,
+                },
+                "vad": {"speech_detected": True},
+                "respeaker": {
+                    "azimuth_deg": 74,
+                    "direction_confidence": None,
+                },
+                "audio_policy": {"speaker_direction_stable": None},
+            },
+            runtime_status="listening",
+            presence_session_id=7,
+            speaker_association=ReSpeakerSpeakerAssociationSnapshot(
+                state="primary_visible_person_associated",
+                associated=True,
+                confidence=0.2,
+            ),
+        )
+
+        self.assertEqual(snapshot.state, "active_visible_speaker_track")
+        self.assertTrue(snapshot.active)
+        self.assertTrue(snapshot.speaker_locked)
+        self.assertGreaterEqual(snapshot.confidence, 0.6)
+
     def test_prefers_recently_moving_visible_person_when_room_is_quiet(self) -> None:
         tracker = MultimodalAttentionTargetTracker.from_config(TwinrConfig())
 

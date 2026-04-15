@@ -30,7 +30,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from threading import Lock
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, cast
 import logging
 import math
 import time
@@ -39,6 +39,7 @@ from twinr.agent.base_agent.config import TwinrConfig
 from twinr.hardware.audio import (
     AudioCaptureReadinessProbe,
     capture_device_identity,
+    config_targets_respeaker,
     resolve_capture_device,
 )
 from twinr.ops.locks import loop_lock_owner
@@ -46,9 +47,6 @@ from twinr.ops.locks import loop_lock_owner
 if TYPE_CHECKING:
     from twinr.agent.base_agent.runtime.runtime import TwinrRuntime
 
-_VISION_REVIEW_FAIL_OPEN_TRIGGERS = frozenset(
-    {"possible_fall", "floor_stillness", "distress_possible"}
-)
 _DEFAULT_CLOSE_JOIN_TIMEOUT_S = 5.0
 _DISPLAY_ATTENTION_ACTIVE_RUNTIME_STATES = frozenset({"waiting", "listening", "processing", "answering"})
 _DISPLAY_ATTENTION_CUE_ONLY_RUNTIME_STATES = frozenset({"error"})
@@ -118,7 +116,7 @@ def _coerce_int(value: object, *, default: int, minimum: int | None = None, maxi
     """Parse one int-like config value with bounds and a safe fallback."""
 
     try:
-        parsed = int(value)  # type: ignore[arg-type]
+        parsed = int(cast(Any, value))
     except (TypeError, ValueError, OverflowError):
         parsed = default
     if minimum is not None and parsed < minimum:
@@ -134,7 +132,7 @@ def _finite_float_or_none(value: object | None) -> float | None:
     if value is None:
         return None
     try:
-        parsed = float(value)
+        parsed = float(cast(Any, value))
     except (TypeError, ValueError, OverflowError):
         return None
     if not math.isfinite(parsed):
@@ -383,6 +381,32 @@ def _proactive_pcm_capture_conflicts_with_voice_orchestrator(
     return False
 
 
+def _proactive_respeaker_host_control_conflicts_with_voice_orchestrator(
+    config: TwinrConfig,
+) -> bool:
+    """Return whether proactive XVF3800 polling would contend with live voice.
+
+    Shared-reader PCM aliases do not matter here: the proactive signal provider
+    still issues USB host-control reads against the same XVF3800, and those
+    transfers can stall the long-lived voice sender when both paths target the
+    same hardware inside one streaming PID.
+    """
+
+    if not bool(getattr(config, "voice_orchestrator_enabled", False)):
+        return False
+    if not bool(getattr(config, "proactive_audio_enabled", False)):
+        return False
+    proactive_device = _proactive_audio_capture_device(config)
+    voice_device = _voice_orchestrator_capture_device(config)
+    if not proactive_device or not voice_device:
+        return False
+    if not config_targets_respeaker(proactive_device):
+        return False
+    if not config_targets_respeaker(voice_device):
+        return False
+    return capture_device_identity(proactive_device) == capture_device_identity(voice_device)
+
+
 def _normalize_text_tuple(values: Any) -> tuple[str, ...]:
     """Normalize sequence-like config input to one tuple of non-blank strings."""
 
@@ -621,7 +645,6 @@ __all__ = [
     "_DISPLAY_ATTENTION_ACTIVE_RUNTIME_STATES",
     "_DISPLAY_ATTENTION_CUE_ONLY_RUNTIME_STATES",
     "_LOGGER",
-    "_VISION_REVIEW_FAIL_OPEN_TRIGGERS",
     "_assistant_output_active",
     "_display_attention_refresh_allowed_runtime_status",
     "_emit_key_value_line",
@@ -633,6 +656,7 @@ __all__ = [
     "_preserve_local_attention_on_audio_block",
     "_proactive_audio_capture_device",
     "_proactive_pcm_capture_conflicts_with_voice_orchestrator",
+    "_proactive_respeaker_host_control_conflicts_with_voice_orchestrator",
     "_record_component_warning",
     "_record_respeaker_dead_capture_blocker",
     "_respeaker_capture_probe_duration_ms",

@@ -136,6 +136,12 @@ def load_runtime_memory_config(context: ConfigLoadContext) -> dict[str, object]:
             1.0,
             minimum=0.1,
         ),
+        "long_term_memory_remote_watchdog_probe_mode": (
+            get_value("TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_PROBE_MODE", "auto")
+            or "auto"
+        )
+        .strip()
+        .lower(),
         "long_term_memory_remote_watchdog_probe_timeout_s": _parse_float(
             get_value("TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_PROBE_TIMEOUT_S"),
             15.0,

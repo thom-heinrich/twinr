@@ -114,8 +114,34 @@ def conversation_recap_query_variants(query_text: str | None) -> tuple[str, ...]
     return tuple(variants)
 
 
+def conversation_recap_specific_terms(query_text: str | None) -> tuple[str, ...]:
+    """Return informative non-recap terms that make one recap query specific.
+
+    Generic recap questions like "What did we talk about?" should still widen
+    to recent conversation episodes. Queries such as "What did we say about
+    topic 045?" must keep their topic anchor instead of collapsing into an
+    arbitrary generic recap lane.
+    """
+
+    clean_query = _normalize_text(query_text)
+    if not clean_query:
+        return ()
+    query_terms = [
+        term
+        for term in retrieval_terms(clean_query)
+        if isinstance(term, str) and term
+    ]
+    specific_terms = {
+        term
+        for term in query_terms
+        if term not in _CONVERSATION_RECAP_SIGNAL_TERMS and (term.isdigit() or len(term) >= 4)
+    }
+    return tuple(sorted(specific_terms))
+
+
 __all__ = [
     "conversation_episode_recall_hints",
+    "conversation_recap_specific_terms",
     "conversation_recap_query_variants",
     "query_has_conversation_recap_semantics",
     "is_conversation_episode_object",

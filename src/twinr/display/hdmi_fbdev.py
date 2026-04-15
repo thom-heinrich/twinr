@@ -49,6 +49,7 @@ from twinr.display.hdmi_default_scene import (
 )
 from twinr.display.presentation_cues import DisplayPresentationCue
 from twinr.display.service_connect_cues import DisplayServiceConnectCue
+from twinr.display.wake_cues import DisplayWakeCue
 
 
 _FBIOGET_VSCREENINFO = 0x4600
@@ -335,6 +336,7 @@ class HdmiFramebufferDisplay:
         debug_signals: tuple[DisplayDebugSignal, ...] = (),
         animation_frame: int = 0,
         face_cue: DisplayFaceCue | None = None,
+        wake_cue: DisplayWakeCue | None = None,
         emoji_cue: DisplayEmojiCue | None = None,
         ambient_impulse_cue: DisplayAmbientImpulseCue | None = None,
         service_connect_cue: DisplayServiceConnectCue | None = None,
@@ -352,6 +354,7 @@ class HdmiFramebufferDisplay:
             debug_signals=debug_signals,
             animation_frame=animation_frame,
             face_cue=face_cue,
+            wake_cue=wake_cue,
             emoji_cue=emoji_cue,
             ambient_impulse_cue=ambient_impulse_cue,
             service_connect_cue=service_connect_cue,
@@ -445,6 +448,7 @@ class HdmiFramebufferDisplay:
         animation_frame: int = 0,
         ticker_text: str | None = None,
         face_cue: DisplayFaceCue | None = None,
+        wake_cue: DisplayWakeCue | None = None,
         emoji_cue: DisplayEmojiCue | None = None,
         ambient_impulse_cue: DisplayAmbientImpulseCue | None = None,
         service_connect_cue: DisplayServiceConnectCue | None = None,
@@ -495,6 +499,7 @@ class HdmiFramebufferDisplay:
             debug_signals=debug_signals,
             animation_frame=animation_frame,
             face_cue=face_cue,
+            wake_cue=wake_cue,
             emoji_cue=emoji_cue,
             ambient_impulse_cue=ambient_impulse_cue,
             service_connect_cue=service_connect_cue,
@@ -531,6 +536,7 @@ class HdmiFramebufferDisplay:
         animation_frame: int,
         ticker_text: str | None = None,
         face_cue: DisplayFaceCue | None = None,
+        wake_cue: DisplayWakeCue | None = None,
         emoji_cue: DisplayEmojiCue | None = None,
         ambient_impulse_cue: DisplayAmbientImpulseCue | None = None,
         service_connect_cue: DisplayServiceConnectCue | None = None,
@@ -550,6 +556,7 @@ class HdmiFramebufferDisplay:
             debug_signals=debug_signals,
             animation_frame=animation_frame,
             face_cue=face_cue,
+            wake_cue=wake_cue,
             emoji_cue=emoji_cue,
             ambient_impulse_cue=ambient_impulse_cue,
             service_connect_cue=service_connect_cue,

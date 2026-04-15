@@ -1,1 +1,8 @@
 obj-y += twinr_on_device_failsafe.o
+obj-y += twinr_on_device_failsafe_vertical_control.o
+obj-y += twinr_on_device_failsafe_disturbance_control.o
+obj-y += twinr_on_device_failsafe_telemetry.o
+obj-y += twinr_on_device_failsafe_protocol.o
+obj-y += twinr_on_device_failsafe_failsafe_control.o
+obj-y += twinr_on_device_failsafe_mission_control.o
+obj-y += twinr_on_device_failsafe_state_machine.o

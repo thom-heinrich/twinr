@@ -10,6 +10,7 @@ owned_concerns:
   - Surface calm ReSpeaker listening, heard-speech, direction-hint, and ring-semantic states without mirroring weak audio evidence
   - Persist and load optional HDMI face-expression cues so external triggers can steer gaze, brows, mouth, and subtle head drift without changing the generic runtime snapshot schema, and let directional cues calm the normal waiting-face idle churn instead of fighting it
   - Expose a producer-facing HDMI face-expression API so camera, proactive, or other runtime modules can set combinable gaze, brow, mouth, and blink cues without writing raw JSON
+  - Persist and load optional speculative HDMI wake cues so the remote transcript-first wake path can tint the fullscreen surface dark blue immediately without speculatively mutating the runtime status machine
   - Persist and load optional HDMI header debug-signal pills so operator-only camera and fusion states can be inspected in one bounded top-lane without changing the generic runtime snapshot schema
   - Persist and load optional HDMI emoji cues so capabilities can claim the free right-hand reserve area with one real Unicode symbol and soft accent halo instead of status-card chrome
   - Persist and load optional HDMI service-connect cues so bounded external pairing flows can temporarily claim the right-hand reserve area with short status copy and a scannable QR payload
@@ -32,6 +33,7 @@ owned_concerns:
   - Validate and load the configured Waveshare vendor driver with Twinr GPIO and SPI expectations
   - Persist authoritative display forward-progress heartbeats so ops health and supervision can detect hung companion threads
   - Persist one authoritative rendered-state artifact with the last successful bounded state fields and health verdict so display-side ERROR reports can be verified without reconstructing them from separate stores
+  - Expose one display-loop wakeup path that can notify both the in-process companion thread and the standalone supervisor-owned display-loop process immediately
   - Manage the optional companion display loop that shadows other runtime loops
 out_of_scope:
   - Runtime snapshot persistence, health collection, or loop-lock implementations
@@ -69,6 +71,8 @@ files:
     role: Shared adapter and payload contracts for display backends
   - path: debug_signals.py
     role: Persist and normalize optional HDMI header debug-signal pills for bounded operator inspection
+  - path: wake_cues.py
+    role: Persist and normalize optional speculative HDMI wake cues and expose a producer-facing controller for immediate dark-blue wake tinting
   - path: render_state.py
     role: Persist the last successfully rendered display state fields plus the health verdict that produced them
   - path: factory.py
@@ -160,6 +164,8 @@ files:
     role: Optional sidecar thread for the display loop
     exports:
       - optional_display_companion
+  - path: companion_signals.py
+    role: Display-loop wakeup registry and direct process-signal bridge for urgent speculative-wake or status updates
   - path: status_forensics.py
     role: Persistable operator-status cause records that reconcile rendered display state with runtime snapshot and ops health inputs
     exports:

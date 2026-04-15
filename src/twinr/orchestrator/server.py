@@ -4,6 +4,7 @@
 # SEC-1: Reject oversized frames, enforce per-connection rate limits, cap concurrent websockets, and validate browser Origin in insecure-loopback mode.
 # IMP-1: Switch websocket ingress to raw-frame parsing with explicit denial responses, idle/size/rate guardrails, and sanitized protocol errors.
 # IMP-2: Upgrade the voice path to a bounded real-time pipeline with stale-audio shedding, plus richer lifecycle cleanup and cancellation hooks.
+# IMP-3: Non-voice websocket sessions now reuse a shared OpenAI backend/provider bundle instead of cold-booting a new backend on every connection, reducing repeated probe-turn startup latency.
 # BREAKING: Default concurrent websocket connections are now capped (8 total) to protect Raspberry Pi deployments; set ORCHESTRATOR_MAX_CONNECTIONS=0 to restore unlimited behavior.
 # BREAKING: Oversized websocket frames are now rejected by default (4 MiB orchestrator / 1 MiB voice); tune with ORCHESTRATOR_MAX_MESSAGE_BYTES and ORCHESTRATOR_VOICE_MAX_MESSAGE_BYTES.
 
@@ -44,7 +45,12 @@ from twinr.orchestrator.remote_asr_service import (
     RemoteAsrHttpService,
     remote_asr_url_targets_local_orchestrator,
 )
-from twinr.orchestrator.session import EdgeOrchestratorSession, RemoteToolBridge
+from twinr.orchestrator.session import (
+    EdgeOrchestratorSession,
+    EdgeOrchestratorSessionFactory,
+    RemoteToolBridge,
+    coerce_prefetched_supervisor_decision,
+)
 from twinr.orchestrator.voice_contracts import (
     OrchestratorVoiceAudioFrame,
     OrchestratorVoiceErrorEvent,
@@ -249,7 +255,7 @@ class EdgeOrchestratorServer:
         voice_session_factory: Callable[[TwinrConfig], EdgeOrchestratorVoiceSession] | None = None,
     ) -> None:
         self.config = config
-        self._session_factory = session_factory or EdgeOrchestratorSession
+        self._session_factory = session_factory or EdgeOrchestratorSessionFactory(config)
         self._voice_session_factory = voice_session_factory or EdgeOrchestratorVoiceSession
         self._voice_forensics = WorkflowForensics.from_env(
             project_root=Path(self.config.project_root),
@@ -664,6 +670,9 @@ async def _run_turn(
             request.prompt,
             conversation=request.conversation,
             supervisor_conversation=request.supervisor_conversation,
+            prefetched_decision=coerce_prefetched_supervisor_decision(
+                request.prefetched_supervisor_decision
+            ),
             emit_event=thread_emit,
             tool_bridge=tool_bridge,
         )

@@ -24,7 +24,12 @@ prime_raspberry_pi_system_site_packages()
 
 from twinr.agent.base_agent.config import TwinrConfig  # noqa: E402
 from twinr.ops.locks import TwinrInstanceAlreadyRunningError  # noqa: E402
-_RUNTIME_SUPERVISOR_ENV_KEY = "TWINR_RUNTIME_SUPERVISOR_ACTIVE"
+from twinr.runtime_host import (  # noqa: E402
+    RUNTIME_SUPERVISOR_ENV_KEY as _RUNTIME_SUPERVISOR_ENV_KEY,
+    is_raspberry_pi_host as _runtime_host_is_raspberry_pi_host,
+    should_enable_display_surface as _should_enable_display_surface,
+    uses_pi_runtime_root as _runtime_host_uses_pi_runtime_root,
+)
 _WATCHDOG_ALREADY_RUNNING_EXIT_CODE = 75
 
 
@@ -213,30 +218,61 @@ def build_parser() -> argparse.ArgumentParser:
 def _uses_pi_runtime_root(env_file: str | Path) -> bool:
     """Return whether the provided env file targets the Pi acceptance checkout."""
 
-    env_path = Path(env_file).resolve()
-    pi_root = Path("/twinr").resolve()
-    return pi_root in env_path.parents or env_path == pi_root / ".env"
+    return _runtime_host_uses_pi_runtime_root(env_file)
 
 
 def _is_raspberry_pi_host() -> bool:
     """Detect whether the current machine reports itself as a Raspberry Pi."""
 
-    model_path = Path("/proc/device-tree/model")
-    try:
-        return "Raspberry Pi" in model_path.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        return False
+    return _runtime_host_is_raspberry_pi_host()
 
 
 def _should_enable_display_companion(config: TwinrConfig, env_file: str | Path) -> bool:
-    """Enable the display companion only for intended authoritative runtime hosts."""
+    """Enable the display companion only for intended authoritative runtime hosts.
 
-    if not _uses_pi_runtime_root(env_file):
-        return False
-    explicit_setting = getattr(config, "display_companion_enabled", None)
-    if explicit_setting is not None:
-        return bool(explicit_setting)
-    return _is_raspberry_pi_host()
+    Productive Pi voice runtimes still default fail closed for ``hdmi_wayland``
+    unless an operator explicitly opts the visible companion back in. That
+    keeps the old QRasterWindow retention concern as the default posture
+    without silently overriding an authoritative runtime's deliberate display
+    choice.
+    """
+
+    return _should_enable_display_surface(
+        config,
+        env_file,
+        suppress_when_supervisor_env=True,
+        uses_pi_runtime_root_fn=_uses_pi_runtime_root,
+        is_raspberry_pi_host_fn=_is_raspberry_pi_host,
+    )
+
+
+def _capture_photo_for_cli_output(
+    camera: Any,
+    *,
+    output_path: Path | None,
+    filename: str,
+) -> Any:
+    """Capture one photo while honoring explicit operator CLI output paths.
+
+    The camera module intentionally blocks arbitrary absolute writes unless an
+    output root is configured. For operator CLI commands, one explicit path is
+    the contract, so temporarily scope the allowed root to that parent
+    directory and keep the camera module's atomic/symlink-safe writer
+    authoritative.
+    """
+
+    if output_path is None:
+        return camera.capture_photo(filename=filename)
+
+    configured_output_root = getattr(camera, "output_root", None)
+    if output_path.is_absolute() and configured_output_root is None and hasattr(camera, "output_root"):
+        camera.output_root = output_path.parent.resolve(strict=False)
+        try:
+            return camera.capture_photo(output_path=output_path, filename=filename)
+        finally:
+            camera.output_root = configured_output_root
+
+    return camera.capture_photo(output_path=output_path, filename=filename)
 
 
 def _should_enable_respeaker_led_companion(config: TwinrConfig, env_file: str | Path) -> bool:
@@ -309,6 +345,27 @@ def _assert_pi_runtime_root(env_file: str | Path, *, command_name: str) -> None:
         )
 
 
+def _assert_authoritative_repo_runtime_root(env_file: str | Path, *, command_name: str) -> None:
+    """Reject non-Pi commands launched from anything except the leading repo."""
+
+    if _uses_pi_runtime_root(env_file):
+        _assert_pi_runtime_root(env_file, command_name=command_name)
+        return
+    repo_root = Path(__file__).resolve().parents[2]
+    cwd = Path.cwd().resolve()
+    if cwd != repo_root:
+        raise RuntimeError(f"{command_name} must be launched from {repo_root}, not {cwd}")
+    import twinr as twinr_package
+
+    package_file = getattr(twinr_package, "__file__", None)
+    package_root = Path(package_file).resolve().parent.parent if package_file else None
+    expected_source_root = repo_root / "src"
+    if package_root != expected_source_root:
+        raise RuntimeError(
+            f"{command_name} must import from {expected_source_root}, not {package_root}"
+        )
+
+
 def _build_runtime(config: TwinrConfig) -> Any:
     """Create the live runtime lazily so loop locks can be acquired first."""
 
@@ -341,6 +398,15 @@ def _resolve_runtime_config(config: TwinrConfig, args: argparse.Namespace) -> Tw
         return build_scoped_runtime_config(
             config,
             scope_name="whatsapp-channel",
+            restore_runtime_state_on_startup=True,
+        )
+    if args.orchestrator_probe_turn:
+        # The probe keeps an isolated runtime snapshot scope, but it must restore
+        # that scope so set/status acceptance turns observe the same bounded
+        # runtime-local state across separate probe invocations.
+        return build_scoped_runtime_config(
+            config,
+            scope_name="orchestrator-probe-turn",
             restore_runtime_state_on_startup=True,
         )
     scope_name = _resolve_direct_runtime_scope_name(args)
@@ -569,7 +635,7 @@ def _run_web_server(config: TwinrConfig, env_file: str | Path) -> int:
 def _run_orchestrator_server(config: TwinrConfig, env_file: str | Path) -> int:
     """Start the websocket orchestrator service without bootstrapping the runtime."""
 
-    _assert_pi_runtime_root(env_file, command_name="run-orchestrator-server")
+    _assert_authoritative_repo_runtime_root(env_file, command_name="run-orchestrator-server")
     from twinr.orchestrator import create_app
 
     try:
@@ -581,7 +647,15 @@ def _run_orchestrator_server(config: TwinrConfig, env_file: str | Path) -> int:
 
     create_app_factory = cast(Callable[[Path], Any], create_app)
     app = create_app_factory(Path(env_file))
-    uvicorn.run(app, host=config.orchestrator_host, port=config.orchestrator_port)
+    # Force Uvicorn's modern SansIO websocket backend. `ws="auto"` prefers the
+    # legacy `websockets` protocol when that package is installed, and that
+    # backend dropped live voice frames after `voice_hello` in production.
+    uvicorn.run(
+        app,
+        host=config.orchestrator_host,
+        port=config.orchestrator_port,
+        ws="websockets-sansio",
+    )
     return 0
 
 
@@ -1038,14 +1112,20 @@ def main() -> int:
             print(f"transcript={transcript}")
 
         if args.camera_capture_output and camera is not None:
-            capture = camera.capture_photo(output_path=args.camera_capture_output, filename=args.camera_capture_output.name)
+            capture = _capture_photo_for_cli_output(
+                camera,
+                output_path=args.camera_capture_output,
+                filename=args.camera_capture_output.name,
+            )
             print(f"camera_capture={args.camera_capture_output}")
             print(f"camera_capture_bytes={len(capture.data)}")
             print(f"camera_device={capture.source_device}")
             print(f"camera_input_format={capture.input_format or 'default'}")
 
         if args.proactive_observe_once:
-            provider_name = (getattr(config, "proactive_vision_provider", "local_first") or "local_first").strip().lower()
+            provider_name = (getattr(config, "proactive_vision_provider", "local") or "local").strip().lower()
+            if provider_name == "local_first":
+                provider_name = "local"
             observer: Any
             if provider_name == "openai":
                 if backend is None or camera is None:
@@ -1113,7 +1193,8 @@ def main() -> int:
                 if camera is None:
                     raise RuntimeError("Camera access is not configured for --vision-camera-capture")
                 capture_filename = args.vision_save_capture.name if args.vision_save_capture else "camera-capture.png"
-                capture = camera.capture_photo(
+                capture = _capture_photo_for_cli_output(
+                    camera,
                     output_path=args.vision_save_capture,
                     filename=capture_filename,
                 )

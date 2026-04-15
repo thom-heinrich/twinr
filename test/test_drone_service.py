@@ -17,7 +17,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
-from twinr.hardware.drone_service import DroneServiceConfig, RemoteDroneServiceClient
+from twinr.hardware.drone_service import DroneServiceConfig, DroneStateSnapshot, RemoteDroneServiceClient
 
 _SCRIPT_PATH = Path(__file__).resolve().parents[1] / "hardware" / "ops" / "drone_daemon.py"
 _SPEC = importlib.util.spec_from_file_location("twinr_drone_daemon_script", _SCRIPT_PATH)
@@ -105,6 +105,128 @@ class DroneServiceTests(unittest.TestCase):
         self.assertTrue(state.safety.can_arm)
         self.assertEqual(mission.state, "pending_manual_arm")
         self.assertEqual(cancelled.state, "cancelled")
+
+    def test_state_snapshot_parses_bounded_runtime_telemetry(self) -> None:
+        snapshot = DroneStateSnapshot.from_payload(
+            {
+                "service_status": "ready",
+                "active_mission_id": None,
+                "manual_arm_required": True,
+                "skill_layer_mode": "bounded_hover_test_only",
+                "radio_ready": True,
+                "pose": {
+                    "healthy": True,
+                    "tracking_state": "tracking",
+                    "confidence": 0.95,
+                    "source_timestamp": 123.0,
+                    "x_m": 0.0,
+                    "y_m": 0.0,
+                    "z_m": 0.0,
+                    "yaw_deg": 0.0,
+                },
+                "safety": {
+                    "can_arm": True,
+                    "manual_arm_required": True,
+                    "radio_ready": True,
+                    "pose_ready": True,
+                    "motion_mode": "bounded_hover_test_only",
+                    "reasons": [],
+                },
+                "telemetry": {
+                    "profile": "operator",
+                    "collected_at": "2026-04-12T00:00:00Z",
+                    "healthy": True,
+                    "failures": [],
+                    "freshness_by_signal": {"pm.vbat": 0.1},
+                    "catalog": {
+                        "log_group_count": 54,
+                        "log_variable_count": 552,
+                        "param_group_count": 52,
+                        "param_count": 341,
+                    },
+                    "deck": {"flags": {"bcAI": 1, "bcFlow2": 1}, "refreshed_age_s": 0.2},
+                    "power": {"vbat_v": 4.02, "battery_level": 85, "state": 0, "state_name": "battery"},
+                    "range": {
+                        "zrange_m": 0.23,
+                        "front_m": 0.8,
+                        "back_m": None,
+                        "left_m": 0.9,
+                        "right_m": 0.95,
+                        "up_m": 1.1,
+                        "downward_observed": True,
+                    },
+                    "flight": {
+                        "roll_deg": 0.0,
+                        "pitch_deg": 0.0,
+                        "yaw_deg": 0.0,
+                        "x_m": 0.0,
+                        "y_m": 0.0,
+                        "z_m": 0.23,
+                        "vx_mps": 0.0,
+                        "vy_mps": 0.0,
+                        "vz_mps": 0.0,
+                        "thrust": 31000.0,
+                        "motion_squal": 90,
+                        "supervisor_info": 8,
+                        "can_fly": True,
+                        "is_flying": False,
+                        "unsafe_supervisor_flags": [],
+                    },
+                    "link": {
+                        "radio_connected": True,
+                        "rssi_dbm": -42.0,
+                        "observation_age_s": 0.1,
+                        "latency_ms": 12.0,
+                        "link_quality": 100.0,
+                        "uplink_rssi": -42.0,
+                        "uplink_rate_hz": 100.0,
+                        "downlink_rate_hz": 100.0,
+                        "uplink_congestion": 0.0,
+                        "downlink_congestion": 0.0,
+                        "monitor_available": True,
+                        "monitor_failure": None,
+                    },
+                    "failsafe": {
+                        "loaded": True,
+                        "protocol_version": 7,
+                        "enabled": True,
+                        "state_code": 2,
+                        "state_name": "armed",
+                        "reason_code": 0,
+                        "reason_name": "ok",
+                        "heartbeat_age_ms": 25,
+                        "last_status_received_age_s": 0.05,
+                        "session_id": 9,
+                        "rejected_packets": 0,
+                        "last_reject_code": 0,
+                    },
+                    "command": {
+                        "mission_name": "run_hover_test",
+                        "phase": "hold",
+                        "phase_status": "begin",
+                        "age_s": 0.2,
+                        "target_height_m": 0.25,
+                        "hover_duration_s": 3.0,
+                        "forward_m": None,
+                        "left_m": None,
+                        "translation_velocity_mps": None,
+                        "takeoff_confirmed": True,
+                        "aborted": False,
+                        "abort_reason": None,
+                        "last_message": None,
+                    },
+                    "divergences": [],
+                    "available_blocks": ["operator-health"],
+                    "skipped_blocks": [],
+                },
+            }
+        )
+
+        assert snapshot.telemetry is not None
+        self.assertEqual(snapshot.telemetry.catalog.log_variable_count, 552)
+        self.assertEqual(snapshot.telemetry.deck.flags["bcAI"], 1)
+        self.assertEqual(snapshot.telemetry.failsafe.protocol_version, 7)
+        self.assertEqual(snapshot.telemetry.command.phase, "hold")
 
     def test_manual_arm_runs_stubbed_stationary_inspection_to_completion(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -16,6 +16,16 @@
 # BUG-5: Detect mid-stream "arecord stays alive but stops yielding bytes" stalls
 # too, so the Pi cannot sit forever on one healthy websocket with zero live
 # microphone audio after the first few frames.
+# BUG-6: Stop treating confirmed websocket outages as queue backpressure. Once
+# the transport is down, queued/live frames are stale for the transcript-first
+# gateway and must be discarded explicitly until reconnect succeeds instead of
+# accumulating drop-oldest churn.
+# BUG-7: Replaced the fake non-empty-frame `speech_probability=1.0` transport
+# attestation with fail-closed PCM speech evidence from the shared ReSpeaker
+# classifier. The remote transcript-first gateway remains Twinr's only wake and
+# commit authority; the Pi may attest acoustic speech evidence per frame, but it
+# must never lie about background noise or suppress failures behind a constant
+# "speech=yes" value.
 # SEC-1: BREAKING: ws:// is now rejected for non-loopback orchestrator endpoints
 # unless explicitly allowed via config.voice_orchestrator_allow_insecure_ws.
 # Raw senior-home microphone audio and shared secret transport must not traverse
@@ -43,6 +53,7 @@ back into the realtime loop.
 
 from __future__ import annotations
 
+from array import array
 from collections import deque
 from dataclasses import dataclass
 import ipaddress
@@ -62,9 +73,16 @@ from uuid import uuid4
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.workflows.forensics import WorkflowForensics
 from twinr.agent.workflows.respeaker_duplex_keepalive import build_respeaker_duplex_keepalive
-from twinr.agent.workflows.voice_frame_speech import EdgeVoiceFrameSpeechAnnotator
 from twinr.hardware.audio import resolve_capture_device
 from twinr.hardware.audio_env import build_audio_subprocess_env_for_mode
+from twinr.hardware.respeaker.pcm_content_classifier import (
+    classify_pcm_speech_likeness,
+    reset_pcm_speech_discriminator_stream,
+)
+from twinr.hardware.respeaker.voice_capture import (
+    project_respeaker_capture_frame,
+    resolve_respeaker_voice_capture_contract,
+)
 from twinr.hardware.respeaker_capture_recovery import recover_stalled_respeaker_capture
 from twinr.ops.streaming_memory_probe import StreamingMemoryProbe
 from twinr.orchestrator.voice_client import OrchestratorVoiceWebSocketClient
@@ -78,6 +96,7 @@ from twinr.orchestrator.voice_contracts import (
     OrchestratorVoiceReadyEvent,
     OrchestratorVoiceRuntimeStateEvent,
     OrchestratorVoiceTranscriptCommittedEvent,
+    OrchestratorVoiceWakeSpeculativeEvent,
     OrchestratorVoiceWakeConfirmedEvent,
 )
 from twinr.orchestrator.voice_activation import VoiceActivationMatch
@@ -97,6 +116,7 @@ class _QueuedAudioFrame:
     """One captured PCM frame waiting for websocket transport."""
 
     pcm_bytes: bytes
+    speech_probability: float
     captured_at_monotonic: float
 
 
@@ -124,6 +144,8 @@ class EdgeVoiceOrchestrator:
     _DEFAULT_CAPTURE_RESTART_BASE_S = 0.5
     _DEFAULT_CAPTURE_RESTART_MAX_S = 6.0
     _QUEUE_POLL_TIMEOUT_S = 0.1
+    _CAPTURE_LEVEL_LOG_INTERVAL_S = 1.0
+    _REQUIRED_EDGE_SPEECH_BACKEND = "silero-onnx+dsp"
 
     def __init__(
         self,
@@ -132,9 +154,11 @@ class EdgeVoiceOrchestrator:
         emit: Callable[[str], None],
         playback_coordinator=None,
         on_voice_activation: Callable[[VoiceActivationMatch], bool],
-        on_transcript_committed: Callable[[str, str], bool],
-        on_follow_up_closed: Callable[[str], None] | None = None,
+        on_transcript_committed: Callable[[str, str, str | None, str | None], bool],
+        on_follow_up_closed: Callable[[str, str | None, str | None], None] | None = None,
         on_barge_in_interrupt: Callable[[], bool],
+        on_speculative_wake: Callable[[OrchestratorVoiceWakeSpeculativeEvent], object] | None = None,
+        on_speculative_wake_cleared: Callable[[str], object] | None = None,
         on_recent_remote_audio: Callable[[bytes, str], object] | None = None,
         forensics: WorkflowForensics | None = None,
     ) -> None:
@@ -144,6 +168,8 @@ class EdgeVoiceOrchestrator:
         self._on_transcript_committed = on_transcript_committed
         self._on_follow_up_closed = on_follow_up_closed
         self._on_barge_in_interrupt = on_barge_in_interrupt
+        self._on_speculative_wake = on_speculative_wake
+        self._on_speculative_wake_cleared = on_speculative_wake_cleared
         self._on_recent_remote_audio = on_recent_remote_audio
 
         resolved_device = resolve_capture_device(
@@ -160,7 +186,14 @@ class EdgeVoiceOrchestrator:
         self._chunk_ms = max(20, int(config.audio_chunk_ms))
         self._speech_threshold = max(0, int(config.audio_speech_threshold))
         self._frame_samples = max(160, int(round(self._sample_rate * (self._chunk_ms / 1000.0))))
+        self._capture_contract = resolve_respeaker_voice_capture_contract(
+            capture_device=self._device,
+            transport_channels=self._channels,
+        )
+        self._capture_channels = int(self._capture_contract.capture_channels)
+        self._capture_extract_channel_index = self._capture_contract.extract_channel_index
         self._frame_bytes = max(320, self._frame_samples * self._channels * 2)
+        self._capture_frame_bytes = max(320, self._frame_samples * self._capture_channels * 2)
 
         self._select_timeout_s = self._coerce_positive_float(
             self._config_value("voice_orchestrator_select_timeout_s", "TWINR_VOICE_SELECT_TIMEOUT_S"),
@@ -214,6 +247,12 @@ class EdgeVoiceOrchestrator:
             self._config_value("voice_orchestrator_capture_restart_max_s", "TWINR_VOICE_CAPTURE_RESTART_MAX_S"),
             default=self._DEFAULT_CAPTURE_RESTART_MAX_S,
         )
+        configured_send_timeout_s = self._coerce_positive_float(
+            self._config_value("voice_orchestrator_send_timeout_s", "TWINR_VOICE_SEND_TIMEOUT_S"),
+            default=2.0,
+            minimum=0.1,
+        )
+        self._send_timeout_s = self._resolve_transport_send_timeout_s(configured_send_timeout_s)
         self._allow_insecure_ws = self._coerce_bool(
             getattr(config, "voice_orchestrator_allow_insecure_ws", None),
             default=False,
@@ -227,14 +266,12 @@ class EdgeVoiceOrchestrator:
             ws_url,
             shared_secret=config.voice_orchestrator_shared_secret,
             on_event=self._handle_server_event,
+            send_timeout_seconds=self._send_timeout_s,
             require_tls=self._require_tls_for_url(ws_url),
         )
 
         self._session_id = f"voice-{uuid4().hex[:12]}"
-        self._frame_speech_annotator = EdgeVoiceFrameSpeechAnnotator(
-            sample_rate=self._sample_rate,
-            channels=self._channels,
-        )
+        self._speech_classifier_stream_id = f"{self._session_id}:edge_transport"
         self._stop_event = Event()
         self._paused = Event()
         self._lifecycle_lock = RLock()
@@ -252,6 +289,7 @@ class EdgeVoiceOrchestrator:
         self._next_reconnect_at = 0.0
         self._ws_reconnect_failures = 0
         self._capture_restart_failures = 0
+        self._next_capture_level_log_at = 0.0
 
         self._last_runtime_state: OrchestratorVoiceRuntimeStateEvent | None = None
         self._last_identity_profiles: OrchestratorVoiceIdentityProfilesEvent | None = None
@@ -267,6 +305,7 @@ class EdgeVoiceOrchestrator:
         )
         self._skipped_frame_count = 0
         self._queue_drop_count = 0
+        self._transport_gap_drop_count = 0
         self._queue_high_watermark = 0
         self._capture_memory_probe = StreamingMemoryProbe.from_config(
             config,
@@ -340,6 +379,19 @@ class EdgeVoiceOrchestrator:
         except (TypeError, ValueError):
             parsed = float(default)
         return max(float(minimum), parsed)
+
+    def _resolve_transport_send_timeout_s(self, requested_timeout_s: float) -> float:
+        """Bound websocket send latency to the live transport queue budget.
+
+        Transcript-first voice cannot recover frames that are older than the
+        bounded transport queue. Once one websocket send blocks longer than that
+        queue window, every captured frame behind it is already stale. Fail the
+        transport closed at that boundary instead of waiting longer and turning
+        a transient stall into user-visible latency.
+        """
+
+        queue_budget_s = max(0.1, self._transport_queue_ms / 1000.0)
+        return min(float(requested_timeout_s), queue_budget_s)
 
     @staticmethod
     def _coerce_bool(value: object | None, *, default: bool) -> bool:
@@ -424,6 +476,8 @@ class EdgeVoiceOrchestrator:
                 "device": self._device,
                 "sample_rate": self._sample_rate,
                 "channels": self._channels,
+                "capture_channels": self._capture_channels,
+                "capture_route": self._capture_contract.route_label,
                 "chunk_ms": self._chunk_ms,
                 "transport_queue_frames": self._transport_queue_frames,
                 "transport_queue_ms": self._transport_queue_ms,
@@ -442,6 +496,7 @@ class EdgeVoiceOrchestrator:
             return
         details = self._sent_frame_bucket.flush_details()
         details["queue_drop_count"] = self._queue_drop_count
+        details["transport_gap_drop_count"] = self._transport_gap_drop_count
         details["queue_high_watermark"] = self._queue_high_watermark
         self._trace_event(
             "voice_edge_frame_window_sent",
@@ -480,11 +535,12 @@ class EdgeVoiceOrchestrator:
             )
             self._skipped_frame_count = 0
             self._queue_drop_count = 0
+            self._transport_gap_drop_count = 0
             self._queue_high_watermark = 0
             self._sender_queue = queue.Queue(maxsize=self._transport_queue_frames)
-            self._frame_speech_annotator.reset()
             with self._recent_remote_frames_lock:
                 self._recent_remote_frames.clear()
+            reset_pcm_speech_discriminator_stream(self._speech_classifier_stream_id)
             if self._duplex_keepalive is not None:
                 self._duplex_keepalive.open()
 
@@ -540,7 +596,6 @@ class EdgeVoiceOrchestrator:
             sender_thread.join(timeout=max(1.0, self._ws_reconnect_max_s))
 
         self._close_client()
-        self._frame_speech_annotator.reset()
 
         self._flush_sent_frame_bucket()
         with self._lifecycle_lock:
@@ -553,6 +608,7 @@ class EdgeVoiceOrchestrator:
             with self._recent_remote_frames_lock:
                 self._recent_remote_frames.clear()
             self._drain_sender_queue()
+        reset_pcm_speech_discriminator_stream(self._speech_classifier_stream_id)
 
     def __enter__(self) -> "EdgeVoiceOrchestrator":
         return self.open()
@@ -576,6 +632,7 @@ class EdgeVoiceOrchestrator:
         state: str,
         detail: str | None = None,
         follow_up_allowed: bool = False,
+        wait_id: str | None = None,
         attention_state: str | None = None,
         interaction_intent_state: str | None = None,
         person_visible: bool | None = None,
@@ -595,6 +652,7 @@ class EdgeVoiceOrchestrator:
             state=state,
             detail=detail,
             follow_up_allowed=follow_up_allowed,
+            wait_id=wait_id,
             attention_state=attention_state,
             interaction_intent_state=interaction_intent_state,
             person_visible=person_visible,
@@ -627,6 +685,7 @@ class EdgeVoiceOrchestrator:
         state: str,
         detail: str | None = None,
         follow_up_allowed: bool = False,
+        wait_id: str | None = None,
         attention_state: str | None = None,
         interaction_intent_state: str | None = None,
         person_visible: bool | None = None,
@@ -646,6 +705,7 @@ class EdgeVoiceOrchestrator:
             state=state,
             detail=detail,
             follow_up_allowed=follow_up_allowed,
+            wait_id=wait_id,
             attention_state=attention_state,
             interaction_intent_state=interaction_intent_state,
             person_visible=person_visible,
@@ -772,6 +832,7 @@ class EdgeVoiceOrchestrator:
         state: str,
         detail: str | None = None,
         follow_up_allowed: bool = False,
+        wait_id: str | None = None,
         attention_state: str | None = None,
         interaction_intent_state: str | None = None,
         person_visible: bool | None = None,
@@ -791,6 +852,7 @@ class EdgeVoiceOrchestrator:
             state=state,
             detail=detail,
             follow_up_allowed=follow_up_allowed,
+            wait_id=wait_id,
             attention_state=attention_state,
             interaction_intent_state=interaction_intent_state,
             person_visible=person_visible,
@@ -820,6 +882,7 @@ class EdgeVoiceOrchestrator:
             initial_state=runtime_state.state if runtime_state is not None else "waiting",
             detail=runtime_state.detail if runtime_state is not None else None,
             follow_up_allowed=runtime_state.follow_up_allowed if runtime_state is not None else False,
+            wait_id=runtime_state.wait_id if runtime_state is not None else None,
             attention_state=runtime_state.attention_state if runtime_state is not None else None,
             interaction_intent_state=(
                 runtime_state.interaction_intent_state if runtime_state is not None else None
@@ -895,12 +958,20 @@ class EdgeVoiceOrchestrator:
         with self._lifecycle_lock:
             self._connected = False
             self._next_reconnect_at = time.monotonic() + retry_delay
+            dropped_queued_frames = self._drain_sender_queue(
+                count_as_transport_gap=True,
+                source="disconnect_queue_flush",
+            )
         self._close_client()
         self._trace_event(
             "voice_edge_client_disconnected",
             kind="warning",
             level="WARN",
-            details={"emit_message": emit_message, "retry_delay_s": retry_delay},
+            details={
+                "emit_message": emit_message,
+                "retry_delay_s": retry_delay,
+                "dropped_queued_frames": dropped_queued_frames,
+            },
         )
         self.emit(self._sanitize_emit_value(emit_message))
 
@@ -915,12 +986,60 @@ class EdgeVoiceOrchestrator:
                 except queue.Empty:
                     return
 
-    def _drain_sender_queue(self) -> None:
+    def _record_transport_gap_drops(
+        self,
+        *,
+        count: int,
+        source: str,
+        frame_age_ms: int | None = None,
+    ) -> None:
+        """Track frames discarded because the websocket was already unusable."""
+
+        normalized_count = max(0, int(count))
+        if normalized_count <= 0:
+            return
+
+        previous_total = self._transport_gap_drop_count
+        self._transport_gap_drop_count += normalized_count
+        crossed_emit_boundary = (
+            previous_total == 0
+            or (self._transport_gap_drop_count // 10) != (previous_total // 10)
+        )
+        if not crossed_emit_boundary:
+            return
+
+        details: dict[str, object] = {
+            "transport_gap_drop_count": self._transport_gap_drop_count,
+            "drop_batch_count": normalized_count,
+            "source": source,
+        }
+        if frame_age_ms is not None:
+            details["frame_age_ms"] = max(0, int(frame_age_ms))
+        self._trace_event(
+            "voice_edge_frame_dropped_transport_gap",
+            kind="warning",
+            level="WARN",
+            details=details,
+        )
+        self._emit_status("voice_orchestrator_transport_gap_drops", self._transport_gap_drop_count)
+
+    def _drain_sender_queue(
+        self,
+        *,
+        count_as_transport_gap: bool = False,
+        source: str = "drain",
+    ) -> int:
+        dropped_frames = 0
         while True:
             try:
-                self._sender_queue.get_nowait()
+                queued_item = self._sender_queue.get_nowait()
             except queue.Empty:
-                return
+                break
+            if queued_item is not None:
+                dropped_frames += 1
+        if count_as_transport_gap and dropped_frames > 0:
+            self._record_transport_gap_drops(count=dropped_frames, source=source)
+        return dropped_frames
 
     def _sender_loop(self) -> None:
         try:
@@ -928,6 +1047,8 @@ class EdgeVoiceOrchestrator:
                 try:
                     queued_frame = self._sender_queue.get(timeout=self._QUEUE_POLL_TIMEOUT_S)
                 except queue.Empty:
+                    if not self._connected:
+                        self._ensure_connected()
                     continue
                 if queued_frame is None:
                     break
@@ -956,14 +1077,17 @@ class EdgeVoiceOrchestrator:
                 return
 
             if not self._ensure_connected():
-                sleep_s = min(
-                    self._QUEUE_POLL_TIMEOUT_S,
-                    max(0.01, self._next_reconnect_at - time.monotonic()),
+                self._record_transport_gap_drops(
+                    count=1,
+                    source="sender_reconnect_gap",
+                    frame_age_ms=int(frame_age_s * 1000),
                 )
-                self._stop_event.wait(sleep_s)
-                continue
+                return
 
-            if self._send_frame_now(queued_frame.pcm_bytes):
+            if self._send_frame_now(
+                queued_frame.pcm_bytes,
+                speech_probability=queued_frame.speech_probability,
+            ):
                 return
 
     def _send_frame(self, pcm_bytes: bytes) -> None:
@@ -986,7 +1110,11 @@ class EdgeVoiceOrchestrator:
                     details={"skipped_frame_count": self._skipped_frame_count},
                 )
             return
-        self._send_frame_now(pcm_bytes)
+        speech_probability, _speech_backend = self._attest_edge_speech_frame(pcm_bytes)
+        self._send_frame_now(
+            pcm_bytes,
+            speech_probability=speech_probability,
+        )
 
     def _capture_loop(self) -> None:
         process: subprocess.Popen[bytes] | None = None
@@ -1020,6 +1148,7 @@ class EdgeVoiceOrchestrator:
                         first_frame_deadline_at = time.monotonic() + self._first_frame_timeout_s
                         last_capture_activity_at = None
                         self._capture_restart_failures = 0
+                        reset_pcm_speech_discriminator_stream(self._speech_classifier_stream_id)
                         self._record_memory_probe(
                             self._capture_memory_probe,
                             force=True,
@@ -1055,7 +1184,10 @@ class EdgeVoiceOrchestrator:
                             raise RuntimeError("Voice orchestrator capture produced no first frame before timeout")
                         continue
 
-                    pcm_chunk = self._read_stdout_chunk(stdout_fd, self._frame_bytes - len(pending_pcm))
+                    pcm_chunk = self._read_stdout_chunk(
+                        stdout_fd,
+                        self._capture_frame_bytes - len(pending_pcm),
+                    )
                     if not pcm_chunk:
                         if process.poll() is not None:
                             raise RuntimeError(self._process_error_message(process))
@@ -1072,10 +1204,20 @@ class EdgeVoiceOrchestrator:
 
                     last_capture_activity_at = time.monotonic()
                     pending_pcm.extend(pcm_chunk)
-                    while len(pending_pcm) >= self._frame_bytes:
-                        frame_bytes = bytes(pending_pcm[: self._frame_bytes])
-                        del pending_pcm[: self._frame_bytes]
-                        self._enqueue_frame(frame_bytes)
+                    while len(pending_pcm) >= self._capture_frame_bytes:
+                        captured_frame_bytes = bytes(pending_pcm[: self._capture_frame_bytes])
+                        del pending_pcm[: self._capture_frame_bytes]
+                        frame_bytes = self._project_capture_frame(captured_frame_bytes)
+                        if not frame_bytes:
+                            continue
+                        speech_probability, speech_backend = self._attest_edge_speech_frame(frame_bytes)
+                        self._maybe_emit_capture_level_snapshot(
+                            captured_frame_bytes,
+                            frame_bytes,
+                            speech_probability=speech_probability,
+                            speech_backend=speech_backend,
+                        )
+                        self._enqueue_frame(frame_bytes, speech_probability=speech_probability)
                         sent_any_frame = True
                         first_frame_deadline_at = None
                     self._record_memory_probe(self._capture_memory_probe)
@@ -1155,14 +1297,18 @@ class EdgeVoiceOrchestrator:
             if started_once:
                 self._emit_status("voice_orchestrator_capture", "stopped")
 
-    def _enqueue_frame(self, pcm_bytes: bytes) -> None:
+    def _enqueue_frame(self, pcm_bytes: bytes, *, speech_probability: float) -> None:
         if not pcm_bytes:
             return
 
         queued_frame = _QueuedAudioFrame(
             pcm_bytes=bytes(pcm_bytes),
+            speech_probability=float(speech_probability),
             captured_at_monotonic=time.monotonic(),
         )
+        if not self._connected:
+            self._record_transport_gap_drops(count=1, source="capture_while_disconnected")
+            return
         try:
             self._sender_queue.put_nowait(queued_frame)
         except queue.Full:
@@ -1205,22 +1351,57 @@ class EdgeVoiceOrchestrator:
         if queue_size > self._queue_high_watermark:
             self._queue_high_watermark = queue_size
 
-    def _send_frame_now(self, pcm_bytes: bytes) -> bool:
+    def _attest_edge_speech_frame(self, pcm_bytes: bytes) -> tuple[float, str]:
+        """Return fail-closed per-frame speech evidence for transport attestation."""
+
+        if not pcm_bytes:
+            return 0.0, "empty"
+        evidence = classify_pcm_speech_likeness(
+            pcm_bytes,
+            sample_rate=self._sample_rate,
+            channels=self._channels,
+            stream_id=self._speech_classifier_stream_id,
+            end_of_stream=False,
+        )
+        probability = evidence.speech_probability
+        if probability is None:
+            raise RuntimeError(
+                "Edge speech attestation returned no speech_probability for a non-empty transport frame."
+            )
+        backend = str(evidence.backend or "").strip()
+        if backend != self._REQUIRED_EDGE_SPEECH_BACKEND:
+            raise RuntimeError(
+                "Edge speech attestation requires "
+                f"{self._REQUIRED_EDGE_SPEECH_BACKEND}, got {backend or 'missing'}."
+            )
+        normalized_probability = float(probability)
+        if not math.isfinite(normalized_probability):
+            raise RuntimeError(
+                "Edge speech attestation returned a non-finite speech_probability for a non-empty transport frame."
+            )
+        return min(1.0, max(0.0, normalized_probability)), backend
+
+    def _classify_edge_speech_probability(self, pcm_bytes: bytes) -> float:
+        """Expose the current per-frame speech attestation for tests and callers."""
+
+        speech_probability, _backend = self._attest_edge_speech_frame(pcm_bytes)
+        return speech_probability
+
+    def _send_frame_now(self, pcm_bytes: bytes, *, speech_probability: float) -> bool:
         if not pcm_bytes:
             return True
 
         try:
             with self._state_lock:
                 latest_runtime_state = self._last_runtime_state
-            speech_evidence = self._frame_speech_annotator.classify_frame(pcm_bytes)
 
             with self._transport_send_lock:
                 self._client.send_audio_frame(
                     OrchestratorVoiceAudioFrame(
                         sequence=self._sequence,
                         pcm_bytes=pcm_bytes,
+                        speech_probability=speech_probability,
                         runtime_state=latest_runtime_state,
-                        speech_probability=speech_evidence.speech_probability,
                     )
                 )
 
@@ -1255,6 +1436,107 @@ class EdgeVoiceOrchestrator:
         )
         with self._recent_remote_frames_lock:
             self._recent_remote_frames.append(frame)
+
+    def _project_capture_frame(self, pcm_bytes: bytes) -> bytes:
+        """Map one raw capture frame into the mono transport contract."""
+
+        return project_respeaker_capture_frame(
+            pcm_bytes,
+            contract=self._capture_contract,
+        )
+
+    def _maybe_emit_capture_level_snapshot(
+        self,
+        captured_frame_bytes: bytes,
+        frame_bytes: bytes,
+        *,
+        speech_probability: float | None = None,
+        speech_backend: str | None = None,
+    ) -> None:
+        """Emit one bounded capture-level snapshot for live Pi debugging."""
+
+        if not captured_frame_bytes or not frame_bytes:
+            return
+        now = time.monotonic()
+        if now < self._next_capture_level_log_at:
+            return
+        self._next_capture_level_log_at = now + self._CAPTURE_LEVEL_LOG_INTERVAL_S
+
+        if self._capture_extract_channel_index is None or self._capture_channels <= 1:
+            rms = _pcm16_rms_bytes(frame_bytes)
+            level_parts = [
+                f"route={self._capture_contract.route_label}",
+                f"rms={rms}",
+            ]
+            if speech_probability is not None:
+                level_parts.append(f"speech_probability={speech_probability:.4f}")
+            if speech_backend:
+                level_parts.append(f"speech_backend={speech_backend}")
+            self._emit_status(
+                "voice_orchestrator_capture_level",
+                " ".join(level_parts),
+            )
+            trace_details: dict[str, object] = {
+                "route": self._capture_contract.route_label,
+                "rms": rms,
+            }
+            if speech_probability is not None:
+                trace_details["speech_probability"] = speech_probability
+            if speech_backend:
+                trace_details["speech_backend"] = speech_backend
+            self._trace_event(
+                "voice_edge_capture_level_snapshot",
+                kind="metric",
+                details=trace_details,
+            )
+            return
+
+        channel_rms = _pcm16_channel_rms(
+            captured_frame_bytes,
+            channels=self._capture_channels,
+        )
+        if not channel_rms:
+            return
+        selected_index = int(self._capture_extract_channel_index)
+        if selected_index < 0 or selected_index >= len(channel_rms):
+            raise RuntimeError(
+                "Voice orchestrator capture lane telemetry resolved an invalid selected channel index: "
+                f"{selected_index} for {len(channel_rms)} channels"
+            )
+        dominant_index = max(range(len(channel_rms)), key=channel_rms.__getitem__)
+        level_parts = [
+            f"route={self._capture_contract.route_label}",
+            f"selected_channel={selected_index + 1}",
+            f"selected_rms={channel_rms[selected_index]}",
+            f"dominant_channel={dominant_index + 1}",
+            f"dominant_rms={channel_rms[dominant_index]}",
+            "channel_rms=" + ",".join(str(value) for value in channel_rms),
+        ]
+        if speech_probability is not None:
+            level_parts.append(f"speech_probability={speech_probability:.4f}")
+        if speech_backend:
+            level_parts.append(f"speech_backend={speech_backend}")
+        self._emit_status(
+            "voice_orchestrator_capture_levels",
+            " ".join(level_parts),
+        )
+        trace_details = {
+            "route": self._capture_contract.route_label,
+            "selected_channel": selected_index + 1,
+            "selected_rms": channel_rms[selected_index],
+            "dominant_channel": dominant_index + 1,
+            "dominant_rms": channel_rms[dominant_index],
+            "channel_rms": list(channel_rms),
+        }
+        if speech_probability is not None:
+            trace_details["speech_probability"] = speech_probability
+        if speech_backend:
+            trace_details["speech_backend"] = speech_backend
+        self._trace_event(
+            "voice_edge_capture_level_snapshot",
+            kind="metric",
+            details=trace_details,
+        )
 
     def _recent_remote_audio_bytes(self) -> bytes:
         """Return the buffered remote-user audio window in chronological order."""
@@ -1297,7 +1579,35 @@ class EdgeVoiceOrchestrator:
             self._ws_reconnect_failures = 0
             return
 
+        if isinstance(event, OrchestratorVoiceWakeSpeculativeEvent):
+            self._trace_event(
+                "voice_edge_server_wake_speculative",
+                kind="decision",
+                details={
+                    "matched_phrase": event.matched_phrase,
+                    "ttl_ms": int(event.ttl_ms),
+                },
+            )
+            self._emit_status("voice_orchestrator_wake_speculative", event.matched_phrase or "unknown")
+            callback = self._on_speculative_wake
+            if callback is not None:
+                try:
+                    callback(event)
+                except Exception as exc:
+                    self._trace_event(
+                        "voice_edge_server_wake_speculative_callback_failed",
+                        kind="warning",
+                        level="WARN",
+                        details={"error_type": type(exc).__name__},
+                    )
+                    self._emit_status(
+                        "voice_orchestrator_wake_speculative_failed",
+                        type(exc).__name__,
+                    )
+            return
+
         if isinstance(event, OrchestratorVoiceWakeConfirmedEvent):
+            self._clear_speculative_wake(reason="wake_confirmed")
             self._emit_recent_remote_audio(source="wake")
             self._trace_event(
                 "voice_edge_server_wake_confirmed",
@@ -1323,25 +1633,41 @@ class EdgeVoiceOrchestrator:
             return
 
         if isinstance(event, OrchestratorVoiceTranscriptCommittedEvent):
+            self._clear_speculative_wake(reason="transcript_committed")
             self._emit_recent_remote_audio(source=event.source)
             self._trace_event(
                 "voice_edge_server_transcript_committed",
                 kind="decision",
-                details={"source": event.source, "transcript_chars": len(str(event.transcript or "").strip())},
+                details={
+                    "source": event.source,
+                    "wait_id": event.wait_id,
+                    "item_id": event.item_id,
+                    "transcript_chars": len(str(event.transcript or "").strip()),
+                },
             )
             self._emit_status("voice_orchestrator_transcript_committed", event.source)
-            self._on_transcript_committed(event.transcript, event.source)
+            self._on_transcript_committed(
+                event.transcript,
+                event.source,
+                event.wait_id,
+                event.item_id,
+            )
             return
 
         if isinstance(event, OrchestratorVoiceFollowUpClosedEvent):
+            self._clear_speculative_wake(reason="follow_up_closed")
             self._trace_event(
                 "voice_edge_server_follow_up_closed",
                 kind="mutation",
-                details={"reason": event.reason},
+                details={
+                    "reason": event.reason,
+                    "wait_id": event.wait_id,
+                    "item_id": event.item_id,
+                },
             )
             self._emit_status("voice_orchestrator_follow_up_closed", event.reason)
             if self._on_follow_up_closed is not None:
-                self._on_follow_up_closed(event.reason)
+                self._on_follow_up_closed(event.reason, event.wait_id, event.item_id)
             return
 
         if isinstance(event, OrchestratorVoiceBargeInInterruptEvent):
@@ -1355,6 +1681,7 @@ class EdgeVoiceOrchestrator:
             return
 
         if isinstance(event, OrchestratorVoiceErrorEvent):
+            self._clear_speculative_wake(reason="voice_error")
             if self._should_disable_identity_profiles_for_error(event.error):
                 self._identity_profiles_supported = False
                 self._last_identity_profiles_sent_at = 0.0
@@ -1380,6 +1707,24 @@ class EdgeVoiceOrchestrator:
 
         self._emit_status("voice_orchestrator_event", type(event).__name__)
 
+    def _clear_speculative_wake(self, *, reason: str) -> None:
+        callback = self._on_speculative_wake_cleared
+        if callback is None:
+            return
+        try:
+            callback(reason)
+        except Exception as exc:
+            self._trace_event(
+                "voice_edge_clear_speculative_wake_failed",
+                kind="warning",
+                level="WARN",
+                details={"reason": reason, "error_type": type(exc).__name__},
+            )
+            self._emit_status(
+                "voice_orchestrator_clear_speculative_wake_failed",
+                type(exc).__name__,
+            )
+
     def _start_process(self) -> subprocess.Popen[bytes]:
         arecord_path = shutil.which("arecord")
         if arecord_path is None:
@@ -1397,7 +1742,7 @@ class EdgeVoiceOrchestrator:
                 "-f",
                 "S16_LE",
                 "-c",
-                str(self._channels),
+                str(self._capture_channels),
                 "-r",
                 str(self._sample_rate),
                 "--period-size",
@@ -1426,6 +1771,11 @@ class EdgeVoiceOrchestrator:
             kind="io",
             details={
                 "frame_bytes": self._frame_bytes,
+                "capture_frame_bytes": self._capture_frame_bytes,
+                "capture_channels": self._capture_channels,
+                "transport_channels": self._channels,
+                "capture_route": self._capture_contract.route_label,
+                "capture_extract_channel_index": self._capture_extract_channel_index,
                 "capture_period_frames": self._capture_period_frames,
                 "capture_buffer_frames": self._capture_buffer_frames,
                 "select_timeout_s": self._select_timeout_s,
@@ -1433,6 +1783,12 @@ class EdgeVoiceOrchestrator:
                 "ongoing_frame_timeout_s": self._ongoing_frame_timeout_s,
             },
         )
+        self._emit_status("voice_orchestrator_capture_route", self._capture_contract.route_label)
+        if self._capture_extract_channel_index is not None:
+            self._emit_status(
+                "voice_orchestrator_capture_channel",
+                str(int(self._capture_extract_channel_index) + 1),
+            )
         self._emit_status("voice_orchestrator_capture", "started")
         return process
 
@@ -1495,7 +1851,7 @@ class EdgeVoiceOrchestrator:
         recovered = recover_stalled_respeaker_capture(
             device=self._device,
             sample_rate=self._sample_rate,
-            channels=self._channels,
+            channels=self._capture_channels,
             chunk_ms=self._chunk_ms,
             max_wait_s=self._capture_restart_max_s,
             should_stop=lambda: self._stop_event.is_set() or self._paused.is_set(),
@@ -1523,6 +1879,48 @@ class EdgeVoiceOrchestrator:
                         pipe.close()
                     except OSError:
                         pass
+
+
+def _pcm16_rms_bytes(pcm_bytes: bytes) -> int:
+    """Return the integer RMS for one PCM16 payload."""
+
+    if not pcm_bytes:
+        return 0
+    aligned_length = len(pcm_bytes) - (len(pcm_bytes) % 2)
+    if aligned_length <= 0:
+        return 0
+    samples = array("h")
+    samples.frombytes(pcm_bytes[:aligned_length])
+    if not samples:
+        return 0
+    square_sum = 0
+    for sample in samples:
+        square_sum += int(sample) * int(sample)
+    return int(math.isqrt(square_sum // len(samples)))
+
+
+def _pcm16_channel_rms(pcm_bytes: bytes, *, channels: int) -> tuple[int, ...]:
+    """Return one RMS value per channel for interleaved PCM16 frames."""
+
+    normalized_channels = max(1, int(channels))
+    aligned_length = len(pcm_bytes) - (len(pcm_bytes) % (normalized_channels * 2))
+    if aligned_length <= 0:
+        return tuple(0 for _ in range(normalized_channels))
+    samples = array("h")
+    samples.frombytes(pcm_bytes[:aligned_length])
+    if not samples:
+        return tuple(0 for _ in range(normalized_channels))
+    rms_values: list[int] = []
+    for channel_index in range(normalized_channels):
+        channel_samples = samples[channel_index::normalized_channels]
+        if not channel_samples:
+            rms_values.append(0)
+            continue
+        square_sum = 0
+        for sample in channel_samples:
+            square_sum += int(sample) * int(sample)
+        rms_values.append(int(math.isqrt(square_sum // len(channel_samples))))
+    return tuple(rms_values)
 
 
 __all__ = ["EdgeVoiceOrchestrator"]

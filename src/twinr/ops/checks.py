@@ -4,6 +4,7 @@
 # BUG-3: GPIO, display GPIO, and PIR checks now verify the configured gpiochip and line offsets through libgpiod/gpioinfo, eliminating false-green hardware checks.
 # BUG-4: Printer queues that are missing or unreachable now fail instead of warning, and CUPS scheduler state is checked explicitly.
 # BUG-5: Optional deep probes (ReSpeaker/Codex) are time-bounded so one hung probe cannot stall the whole audit.
+# BUG-6: Camera checks now fail closed on Pi libcamera/unicam `/dev/video*` nodes so misconfigured Pi camera lanes surface before inspect-camera turns burn the full ffmpeg timeout.
 # SEC-1: Runtime-state paths must now be absolute and are rejected when placed in shared/world-writable directories or writable non-owner files.
 # SEC-2: Probe subprocesses now resolve binaries to absolute paths and scrub dangerous loader-related environment variables before execution.
 # IMP-1: Added first-class Raspberry Pi camera-stack support for rpicam/libcamera and modern Pi OS camera deployments.
@@ -36,7 +37,6 @@ from twinr.hardware.respeaker import capture_respeaker_primitive_snapshot, confi
 
 _VALID_STATUSES = frozenset({"ok", "warn", "fail"})
 _ALLOWED_PIR_BIASES = frozenset({"pull-up", "pull-down", "disable", "disabled", "as-is", "none"})
-_ALLOWED_CAMERA_BACKENDS = frozenset({"", "auto", "v4l2", "usb", "libcamera", "rpicam", "picamera2"})
 _PRINTER_CHECK_TIMEOUT_SECONDS = 5.0
 _AUDIO_CHECK_TIMEOUT_SECONDS = 2.5
 _CAMERA_CHECK_TIMEOUT_SECONDS = 3.5
@@ -45,6 +45,9 @@ _RESPEAKER_CHECK_TIMEOUT_SECONDS = 3.0
 _CODEX_CHECK_TIMEOUT_SECONDS = 6.0
 _TOOL_ENV_DENYLIST = frozenset({"LD_PRELOAD", "LD_LIBRARY_PATH", "PYTHONHOME", "PYTHONPATH"})
 _GPIOD_LINE_BUSY_CONSUMER_ALLOWLIST = frozenset({"", "twinr", "twinr-agent", "twinr-display", "twinr-gpio"})
+_RPICAM_CAMERA_DEVICE_SCHEMES = ("rpicam://", "libcamera://")
+_AIDECK_CAMERA_DEVICE_SCHEME = "aideck://"
+_PI_LIBCAMERA_V4L2_MARKERS = ("driver name   : unicam", "card type     : unicam-image", "unicam-image")
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,53 +373,37 @@ def _printer_check(config: TwinrConfig) -> ConfigCheck:
 
 
 def _camera_check(config: TwinrConfig) -> ConfigCheck:
-    backend = _clean_config_text(getattr(config, "camera_backend", "auto")).lower() or "auto"
-    if backend not in _ALLOWED_CAMERA_BACKENDS:
+    raw_device = _clean_config_text(getattr(config, "camera_device", ""))
+    normalized_device = raw_device.lower()
+    ffmpeg_path = _clean_config_text(getattr(config, "camera_ffmpeg_path", "")) or "ffmpeg"
+    rpicam_binary = _detect_rpicam_binary(_clean_config_text(getattr(config, "camera_rpicam_binary", "")))
+
+    if not raw_device:
         return ConfigCheck(
             "camera",
             "Camera",
             "fail",
-            f"Unsupported camera backend `{_display_value(backend)}`.",
+            "No camera device is configured.",
         )
-
-    raw_device = _clean_config_text(getattr(config, "camera_device", ""))
-    ffmpeg_path = _clean_config_text(getattr(config, "camera_ffmpeg_path", "")) or "ffmpeg"
-    rpicam_binary = _detect_rpicam_binary(_clean_config_text(getattr(config, "camera_rpicam_binary", "")))
-
-    if backend in {"libcamera", "rpicam", "picamera2"}:
+    if normalized_device.startswith(_AIDECK_CAMERA_DEVICE_SCHEME):
+        return ConfigCheck(
+            "camera",
+            "Camera",
+            "ok",
+            f"AI-Deck camera device `{_display_value(raw_device)}` is explicitly configured.",
+        )
+    if normalized_device.startswith(_RPICAM_CAMERA_DEVICE_SCHEMES):
         return _libcamera_camera_check(rpicam_binary)
-
-    if backend in {"v4l2", "usb"}:
+    if Path(raw_device).expanduser().is_absolute():
         return _v4l2_camera_check(raw_device, ffmpeg_path)
-
-    libcamera_ready = _probe_rpicam_stack(rpicam_binary)
-    if libcamera_ready.status == "ok":
-        return ConfigCheck("camera", "Camera", "ok", libcamera_ready.detail)
-
-    if raw_device:
-        v4l2_check = _v4l2_camera_check(raw_device, ffmpeg_path)
-        if v4l2_check.status == "ok":
-            return v4l2_check
-        if libcamera_ready.status == "warn":
-            return ConfigCheck(
-                "camera",
-                "Camera",
-                "warn",
-                f"{v4l2_check.detail} Also, Raspberry Pi camera-stack probing was inconclusive: {libcamera_ready.detail}",
-            )
-        return v4l2_check
-
-    if libcamera_ready.status in {"warn", "fail"} and rpicam_binary is not None:
-        return ConfigCheck("camera", "Camera", libcamera_ready.status, libcamera_ready.detail)
-
-    if raw_device:
-        return _v4l2_camera_check(raw_device, ffmpeg_path)
-
     return ConfigCheck(
         "camera",
         "Camera",
         "fail",
-        "No camera device or supported Raspberry Pi camera backend is configured.",
+        (
+            "Unsupported camera device configuration. Use a V4L2 path such as `/dev/video0`, "
+            "a Pi camera URI such as `rpicam://0` or `libcamera://0`, or `aideck://host:port`."
+        ),
     )
 
 
@@ -470,6 +457,16 @@ def _v4l2_camera_check(raw_device: str, ffmpeg_value: str) -> ConfigCheck:
                 "fail",
                 _command_error_detail(v4l2_result, default=f"Camera device `{_display_value(device)}` is not queryable via V4L2."),
             )
+        if _looks_like_pi_libcamera_v4l2_device(_combine_command_output(v4l2_result)):
+            return ConfigCheck(
+                "camera",
+                "Camera",
+                "fail",
+                (
+                    f"Camera device `{_display_value(device)}` is a Raspberry Pi libcamera/unicam node. "
+                    "Configure an explicit `rpicam://0` or `libcamera://0` camera device instead of a `/dev/video*` node."
+                ),
+            )
     else:
         return ConfigCheck(
             "camera",
@@ -493,6 +490,11 @@ def _v4l2_camera_check(raw_device: str, ffmpeg_value: str) -> ConfigCheck:
         "ok",
         f"Camera device `{_display_value(device)}` is queryable via V4L2 and ffmpeg `{_display_value(ffmpeg_resolved)}` is available.",
     )
+
+
+def _looks_like_pi_libcamera_v4l2_device(probe_output: str) -> bool:
+    normalized = str(probe_output or "").strip().lower()
+    return any(marker in normalized for marker in _PI_LIBCAMERA_V4L2_MARKERS)
 
 
 def _probe_rpicam_stack(rpicam_binary: str | None) -> _ProbeOutcome:

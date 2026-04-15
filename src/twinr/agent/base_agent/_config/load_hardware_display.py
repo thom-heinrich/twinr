@@ -67,6 +67,13 @@ def load_hardware_display_config(context: ConfigLoadContext) -> dict[str, object
         "display_face_cue_ttl_s": _parse_float(
             get_value("TWINR_DISPLAY_FACE_CUE_TTL_S"), 4.0, minimum=0.1
         ),
+        "display_wake_cue_path": get_value(
+            "TWINR_DISPLAY_WAKE_CUE_PATH", "artifacts/stores/ops/display_wake_cue.json"
+        )
+        or "artifacts/stores/ops/display_wake_cue.json",
+        "display_wake_cue_ttl_s": _parse_float(
+            get_value("TWINR_DISPLAY_WAKE_CUE_TTL_S"), 4.5, minimum=0.1
+        ),
         "display_emoji_cue_path": get_value(
             "TWINR_DISPLAY_EMOJI_CUE_PATH", "artifacts/stores/ops/display_emoji.json"
         )
@@ -350,6 +357,11 @@ def load_hardware_display_config(context: ConfigLoadContext) -> dict[str, object
         "attention_servo_visible_retarget_tolerance_us": int(
             get_value("TWINR_ATTENTION_SERVO_VISIBLE_RETARGET_TOLERANCE_US", "40")
             or "40"
+        ),
+        "attention_servo_visible_retarget_cooldown_s": _parse_float(
+            get_value("TWINR_ATTENTION_SERVO_VISIBLE_RETARGET_COOLDOWN_S"),
+            0.0,
+            minimum=0.0,
         ),
         "attention_servo_soft_limit_margin_us": int(
             get_value("TWINR_ATTENTION_SERVO_SOFT_LIMIT_MARGIN_US", "70") or "70"

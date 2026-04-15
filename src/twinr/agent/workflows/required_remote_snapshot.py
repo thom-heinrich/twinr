@@ -11,6 +11,9 @@
 # BUG-4: Do not fail closed immediately on synthetic watchdog-timeout samples
 #        while the same deep probe is still alive and recent successful probe
 #        latencies prove a larger bounded inflight bridge is normal.
+# BUG-5: Gate green watchdog samples against the configured proof contract
+#        (`current_only` for live Pi watchdog-artifact mode, optional
+#        archive-inclusive elsewhere) instead of hard-coding archive-safe-only.
 # SEC-1: Hardened process-identity checks. Plain kill(pid, 0) is now augmented
 #        with pidfd-based existence checks and optional boot-id / process-start
 #        attestation to reduce PID-reuse confusion.
@@ -95,12 +98,34 @@ _PROBE_STARTED_MONOTONIC_PATHS = (
 _RECENT_SUCCESS_TIMEOUT_HEADROOM_RATIO = 0.5
 _RECENT_SUCCESS_TIMEOUT_MIN_HEADROOM_S = 2.0
 _RECENT_SUCCESS_TIMEOUT_MAX_HEADROOM_S = 10.0
+_SHALLOW_STATUS_READY_OVERRIDE_DETAIL = "query_surface_ready_despite_instance_flag_false"
+_WATCHDOG_PROBE_MODE_AUTO = "auto"
+_WATCHDOG_PROBE_MODE_CURRENT_ONLY = "current_only"
+_WATCHDOG_PROBE_MODE_ARCHIVE_INCLUSIVE = "archive_inclusive"
 
 
 def _normalize_text(value: Any) -> str:
     """Return a stripped textual representation."""
 
     return str(value or "").strip()
+
+
+def _required_watchdog_probe_mode(config: TwinrConfig) -> str:
+    """Resolve the required-remote watchdog proof contract for one runtime."""
+
+    configured_mode = str(
+        getattr(config, "long_term_memory_remote_watchdog_probe_mode", _WATCHDOG_PROBE_MODE_AUTO) or ""
+    ).strip().lower()
+    if configured_mode in {"archive", "archive_inclusive", "full"}:
+        return _WATCHDOG_PROBE_MODE_ARCHIVE_INCLUSIVE
+    if configured_mode in {"current", "current_only", "token_fast"}:
+        return _WATCHDOG_PROBE_MODE_CURRENT_ONLY
+    runtime_mode = str(
+        getattr(config, "long_term_memory_remote_runtime_check_mode", "direct") or "direct"
+    ).strip().lower()
+    if runtime_mode == "watchdog_artifact":
+        return _WATCHDOG_PROBE_MODE_CURRENT_ONLY
+    return _WATCHDOG_PROBE_MODE_ARCHIVE_INCLUSIVE
 
 
 def _coerce_int(value: Any) -> int | None:
@@ -278,9 +303,10 @@ def _read_proc_create_time_s(pid: int | None) -> float | None:
     start_ticks = _read_proc_stat_start_ticks(pid)
     boot_time_s = _linux_boot_time_s()
     clk_tck = _clock_ticks_per_second()
-    if start_ticks is None or boot_time_s is None or clk_tck in (None, 0.0):
+    if start_ticks is None or boot_time_s is None or clk_tck is None or clk_tck == 0.0:
         return None
-    return boot_time_s + (float(start_ticks) / float(clk_tck))
+    resolved_clk_tck = float(clk_tck)
+    return boot_time_s + (float(start_ticks) / resolved_clk_tck)
 
 
 def _pid_exists_via_pidfd(pid: int) -> bool | None:
@@ -480,6 +506,7 @@ def _watchdog_identity_problem(snapshot: RemoteMemoryWatchdogSnapshot) -> str | 
         )
 
     expected_start_ticks = _watchdog_expected_start_ticks(snapshot)
+    start_ticks_verified = False
     if expected_start_ticks is not None:
         current_start_ticks = _read_proc_stat_start_ticks(resolved_pid)
         if current_start_ticks is None:
@@ -492,9 +519,13 @@ def _watchdog_identity_problem(snapshot: RemoteMemoryWatchdogSnapshot) -> str | 
                 f"Remote memory watchdog PID {resolved_pid} no longer matches the "
                 "persisted start-time attestation."
             )
+        start_ticks_verified = True
 
     expected_create_time_s = _watchdog_expected_create_time_s(snapshot)
-    if expected_create_time_s is not None:
+    if expected_create_time_s is not None and not start_ticks_verified:
+        # `pid_create_time_s` is derived from epoch boot time and can drift after
+        # RTC/NTP corrections on long-lived Pi systems. Keep it as a legacy
+        # fallback only when the stronger start-ticks attestation is absent.
         current_create_time_s = _read_proc_create_time_s(resolved_pid)
         if current_create_time_s is None:
             return (
@@ -571,6 +602,42 @@ def _probe_attestation_text(snapshot: RemoteMemoryWatchdogSnapshot, field_name: 
     return text or None
 
 
+def _probe_warm_result_attestation(snapshot: RemoteMemoryWatchdogSnapshot, field_name: str) -> Any | None:
+    """Return one warm-result attestation field from the persisted probe payload."""
+
+    probe_payload = _probe_payload(snapshot)
+    if not isinstance(probe_payload, dict):
+        return None
+    return probe_payload.get(field_name)
+
+
+def _probe_satisfies_required_mode(
+    snapshot: RemoteMemoryWatchdogSnapshot,
+    *,
+    required_probe_mode: str,
+) -> bool:
+    """Return whether one persisted watchdog probe proves the required contract."""
+
+    archive_safe = _coerce_bool(_probe_warm_result_attestation(snapshot, "archive_safe"))
+    health_tier = _normalize_text(_probe_warm_result_attestation(snapshot, "health_tier")).lower() or None
+    contract_id = _normalize_text(_deep_get(snapshot, "current", "probe", "warm_result", "proof_contract", "contract_id"))
+    if required_probe_mode == _WATCHDOG_PROBE_MODE_ARCHIVE_INCLUSIVE:
+        if contract_id == "configured_namespace_current_only_readiness":
+            return False
+        if archive_safe is False:
+            return False
+        if health_tier is not None and health_tier != "ready":
+            return False
+        return True
+    if contract_id == "configured_namespace_archive_inclusive_readiness":
+        return archive_safe is True and (health_tier is None or health_tier == "ready")
+    if contract_id == "configured_namespace_current_only_readiness":
+        return health_tier is None or health_tier == "ready"
+    if archive_safe is True:
+        return health_tier is None or health_tier == "ready"
+    return health_tier is None or health_tier == "ready"
+
+
 @dataclass(frozen=True, slots=True)
 class RequiredRemoteWatchdogAssessment:
     """Summarize one external-watchdog readiness evaluation."""
@@ -585,6 +652,9 @@ class RequiredRemoteWatchdogAssessment:
     sample_ready: bool | None
     sample_required: bool | None
     sample_latency_ms: float | None
+    sample_seq: int | None = None
+    sample_captured_at: str | None = None
+    sample_captured_monotonic_ns: int | None = None
     watchdog_pid: int | None = None
     snapshot_updated_at: str | None = None
     snapshot_stale: bool = False
@@ -592,6 +662,7 @@ class RequiredRemoteWatchdogAssessment:
     heartbeat_updated_at: str | None = None
     probe_inflight: bool = False
     probe_age_s: float | None = None
+    watchdog_started_age_s: float | None = None
 
 
 def _watchdog_interval_s(config: TwinrConfig, snapshot: RemoteMemoryWatchdogSnapshot) -> float:
@@ -894,6 +965,7 @@ def _assessment_with_current(
     snapshot_stale: bool,
     heartbeat_age_s: float | None = None,
     probe_age_s: float | None = None,
+    watchdog_started_age_s: float | None = None,
 ) -> RequiredRemoteWatchdogAssessment:
     """Build one assessment using the current snapshot payload."""
 
@@ -908,6 +980,9 @@ def _assessment_with_current(
         sample_ready=_sample_ready_value(snapshot),
         sample_required=_sample_required_value(snapshot),
         sample_latency_ms=_coerce_float(_deep_get(snapshot, "current", "latency_ms")),
+        sample_seq=_coerce_int(_deep_get(snapshot, "current", "seq")),
+        sample_captured_at=_normalize_text(_deep_get(snapshot, "current", "captured_at")) or None,
+        sample_captured_monotonic_ns=_coerce_int(_deep_get(snapshot, "current", "captured_monotonic_ns")),
         watchdog_pid=_coerce_int(_deep_get(snapshot, "pid")),
         snapshot_updated_at=_deep_get(snapshot, "updated_at"),
         snapshot_stale=snapshot_stale,
@@ -915,6 +990,7 @@ def _assessment_with_current(
         heartbeat_updated_at=_deep_get(snapshot, "heartbeat_at"),
         probe_inflight=_probe_inflight_value(snapshot),
         probe_age_s=probe_age_s,
+        watchdog_started_age_s=watchdog_started_age_s,
     )
 
 
@@ -960,6 +1036,9 @@ def assess_required_remote_watchdog_snapshot(
             sample_ready=_sample_ready_value(snapshot),
             sample_required=_sample_required_value(snapshot),
             sample_latency_ms=_coerce_float(_deep_get(snapshot, "current", "latency_ms")),
+            sample_seq=_coerce_int(_deep_get(snapshot, "current", "seq")),
+            sample_captured_at=_normalize_text(_deep_get(snapshot, "current", "captured_at")) or None,
+            sample_captured_monotonic_ns=_coerce_int(_deep_get(snapshot, "current", "captured_monotonic_ns")),
             watchdog_pid=watchdog_pid,
             snapshot_updated_at=_deep_get(snapshot, "updated_at"),
             snapshot_stale=True,
@@ -1001,6 +1080,9 @@ def assess_required_remote_watchdog_snapshot(
             sample_ready=_sample_ready_value(snapshot),
             sample_required=_sample_required_value(snapshot),
             sample_latency_ms=_coerce_float(_deep_get(snapshot, "current", "latency_ms")),
+            sample_seq=_coerce_int(_deep_get(snapshot, "current", "seq")),
+            sample_captured_at=_normalize_text(_deep_get(snapshot, "current", "captured_at")) or None,
+            sample_captured_monotonic_ns=_coerce_int(_deep_get(snapshot, "current", "captured_monotonic_ns")),
             watchdog_pid=None,
             snapshot_updated_at=_deep_get(snapshot, "updated_at"),
             snapshot_stale=True,
@@ -1022,6 +1104,9 @@ def assess_required_remote_watchdog_snapshot(
             sample_ready=_sample_ready_value(snapshot),
             sample_required=_sample_required_value(snapshot),
             sample_latency_ms=_coerce_float(_deep_get(snapshot, "current", "latency_ms")),
+            sample_seq=_coerce_int(_deep_get(snapshot, "current", "seq")),
+            sample_captured_at=_normalize_text(_deep_get(snapshot, "current", "captured_at")) or None,
+            sample_captured_monotonic_ns=_coerce_int(_deep_get(snapshot, "current", "captured_monotonic_ns")),
             watchdog_pid=_coerce_int(_deep_get(snapshot, "pid")),
             snapshot_updated_at=_deep_get(snapshot, "updated_at"),
             snapshot_stale=True,
@@ -1043,6 +1128,9 @@ def assess_required_remote_watchdog_snapshot(
             sample_ready=_sample_ready_value(snapshot),
             sample_required=_sample_required_value(snapshot),
             sample_latency_ms=_coerce_float(_deep_get(snapshot, "current", "latency_ms")),
+            sample_seq=_coerce_int(_deep_get(snapshot, "current", "seq")),
+            sample_captured_at=_normalize_text(_deep_get(snapshot, "current", "captured_at")) or None,
+            sample_captured_monotonic_ns=_coerce_int(_deep_get(snapshot, "current", "captured_monotonic_ns")),
             watchdog_pid=_coerce_int(_deep_get(snapshot, "pid")),
             snapshot_updated_at=_deep_get(snapshot, "updated_at"),
             snapshot_stale=True,
@@ -1108,8 +1196,13 @@ def assess_required_remote_watchdog_snapshot(
             now_wall=resolved_now_wall,
             max_future_skew_s=max_future_skew_s,
         )
+    watchdog_started_age_s, watchdog_started_time_future = _age_from_wall_clock_timestamp(
+        _parse_utc_timestamp(_deep_get(snapshot, "started_at")),
+        now_wall=resolved_now_wall,
+        max_future_skew_s=max_future_skew_s,
+    )
 
-    if sample_time_future or heartbeat_time_future:
+    if sample_time_future or heartbeat_time_future or watchdog_started_time_future:
         detail = _FUTURE_TIMESTAMP_DETAIL
         if sample_time_future and heartbeat_time_future:
             detail = (
@@ -1120,6 +1213,8 @@ def assess_required_remote_watchdog_snapshot(
             detail = "Remote memory watchdog snapshot has a future-dated sample timestamp."
         elif heartbeat_time_future:
             detail = "Remote memory watchdog snapshot has a future-dated heartbeat timestamp."
+        elif watchdog_started_time_future:
+            detail = "Remote memory watchdog snapshot has a future-dated start timestamp."
         return _assessment_with_current(
             ready=False,
             detail=detail,
@@ -1130,6 +1225,7 @@ def assess_required_remote_watchdog_snapshot(
             snapshot_stale=True,
             heartbeat_age_s=heartbeat_age_s,
             probe_age_s=_probe_age_value_s(snapshot, now_monotonic_ns=resolved_now_mono_ns),
+            watchdog_started_age_s=watchdog_started_age_s,
         )
 
     max_steady_state_sample_age_s = _max_allowed_steady_state_sample_age_s(
@@ -1202,6 +1298,7 @@ def assess_required_remote_watchdog_snapshot(
             snapshot_stale=True,
             heartbeat_age_s=heartbeat_age_s,
             probe_age_s=inflight_probe_age_s,
+            watchdog_started_age_s=watchdog_started_age_s,
         )
 
     if sample_status != "ok" or sample_ready is not True:
@@ -1219,6 +1316,7 @@ def assess_required_remote_watchdog_snapshot(
                 snapshot_stale=False,
                 heartbeat_age_s=heartbeat_age_s,
                 probe_age_s=inflight_probe_age_s,
+                watchdog_started_age_s=watchdog_started_age_s,
             )
         detail = _normalize_text(_deep_get(snapshot, "current", "detail")) or (
             "Remote memory watchdog reports unavailable."
@@ -1233,14 +1331,30 @@ def assess_required_remote_watchdog_snapshot(
             snapshot_stale=False,
             heartbeat_age_s=heartbeat_age_s,
             probe_age_s=inflight_probe_age_s,
+            watchdog_started_age_s=watchdog_started_age_s,
         )
 
-    archive_safe = _probe_attestation_bool(snapshot, "archive_safe")
-    health_tier = _probe_attestation_text(snapshot, "health_tier")
-    if archive_safe is False or (health_tier is not None and health_tier != "ready"):
-        detail = "Remote memory watchdog sample is not archive-safe."
-        if health_tier and health_tier != "ready":
-            detail = f"Remote memory watchdog sample is {health_tier}, not archive-safe."
+    required_probe_mode = _required_watchdog_probe_mode(config)
+    archive_safe = _coerce_bool(_probe_warm_result_attestation(snapshot, "archive_safe"))
+    health_tier = _normalize_text(_probe_warm_result_attestation(snapshot, "health_tier")).lower() or None
+    proof_contract_satisfied = _probe_satisfies_required_mode(
+        snapshot,
+        required_probe_mode=required_probe_mode,
+    )
+    deep_ready_override = sample_status == "ok" and sample_ready is True and proof_contract_satisfied
+    if required_probe_mode == _WATCHDOG_PROBE_MODE_ARCHIVE_INCLUSIVE:
+        deep_ready_override = (
+            deep_ready_override
+            and archive_safe is True
+            and (health_tier is None or health_tier == "ready")
+        )
+    probe_remote_status_ready = _coerce_bool(_deep_get(snapshot, "current", "probe", "remote_status", "ready"))
+    if probe_remote_status_ready is False and not deep_ready_override:
+        detail = (
+            _normalize_text(_deep_get(snapshot, "current", "probe", "remote_status", "detail"))
+            or _normalize_text(_deep_get(snapshot, "current", "detail"))
+            or "Remote memory watchdog probe reports the required remote backend as not ready."
+        )
         return _assessment_with_current(
             ready=False,
             detail=detail,
@@ -1251,6 +1365,33 @@ def assess_required_remote_watchdog_snapshot(
             snapshot_stale=False,
             heartbeat_age_s=heartbeat_age_s,
             probe_age_s=inflight_probe_age_s,
+            watchdog_started_age_s=watchdog_started_age_s,
+        )
+
+    if not proof_contract_satisfied:
+        detail = "Remote memory watchdog sample does not satisfy the configured proof contract."
+        if required_probe_mode == _WATCHDOG_PROBE_MODE_ARCHIVE_INCLUSIVE:
+            detail = "Remote memory watchdog sample is not archive-safe."
+            if health_tier and health_tier != "ready":
+                detail = f"Remote memory watchdog sample is {health_tier}, not archive-safe."
+        elif health_tier and health_tier != "ready":
+            detail = (
+                "Remote memory watchdog sample is "
+                f"{health_tier}, not valid for the configured current-only contract."
+            )
+        elif archive_safe is False:
+            detail = "Remote memory watchdog sample is current-only and must be refreshed."
+        return _assessment_with_current(
+            ready=False,
+            detail=detail,
+            artifact_path=artifact_path,
+            snapshot=snapshot,
+            sample_age_s=sample_age_s,
+            max_sample_age_s=max_sample_age_s,
+            snapshot_stale=False,
+            heartbeat_age_s=heartbeat_age_s,
+            probe_age_s=inflight_probe_age_s,
+            watchdog_started_age_s=watchdog_started_age_s,
         )
 
     return _assessment_with_current(
@@ -1263,6 +1404,7 @@ def assess_required_remote_watchdog_snapshot(
         snapshot_stale=False,
         heartbeat_age_s=heartbeat_age_s,
         probe_age_s=inflight_probe_age_s,
+        watchdog_started_age_s=watchdog_started_age_s,
     )
 
 
@@ -1288,14 +1430,14 @@ def _watchdog_startup_poll_s(config: TwinrConfig) -> float:
 
 
 def _default_watchdog_env_file(config: TwinrConfig) -> str:
-    """Return the canonical dotenv path for detached watchdog recovery."""
+    """Return the canonical dotenv path for authoritative watchdog recovery."""
 
     project_root = Path(_normalize_text(getattr(config, "project_root", ""))).expanduser()
     return str(project_root / ".env")
 
 
 def _default_watchdog_recovery_starter(config: TwinrConfig, env_file: str) -> int | None:
-    """Best-effort spawn helper for a missing or dead external watchdog."""
+    """Best-effort recovery helper for a missing or dead external watchdog."""
 
     from twinr.ops.remote_memory_watchdog_companion import ensure_remote_memory_watchdog_process
 
@@ -1323,7 +1465,10 @@ def _assessment_warrants_watchdog_recovery(assessment: RequiredRemoteWatchdogAss
     return False
 
 
-def _assessment_allows_startup_wait(assessment: RequiredRemoteWatchdogAssessment) -> bool:
+def _assessment_allows_startup_wait(
+    config: TwinrConfig,
+    assessment: RequiredRemoteWatchdogAssessment,
+) -> bool:
     """Return whether a non-ready watchdog state still looks like startup."""
 
     if assessment.ready:
@@ -1343,6 +1488,13 @@ def _assessment_allows_startup_wait(assessment: RequiredRemoteWatchdogAssessment
     if "snapshot is missing" in detail:
         return True
     if "process" in detail and "not alive" in detail:
+        return True
+    if (
+        assessment.pid_alive
+        and assessment.watchdog_started_age_s is not None
+        and math.isfinite(assessment.watchdog_started_age_s)
+        and assessment.watchdog_started_age_s <= _watchdog_startup_wait_s(config)
+    ):
         return True
     return False
 
@@ -1377,7 +1529,9 @@ def ensure_required_remote_watchdog_snapshot_ready(
             return assessment
 
     startup_wait_s = _watchdog_startup_wait_s(config)
-    if startup_wait_s > 0.0 and (recovery_requested or _assessment_allows_startup_wait(assessment)):
+    if startup_wait_s > 0.0 and (
+        recovery_requested or _assessment_allows_startup_wait(config, assessment)
+    ):
         deadline_ns = time.monotonic_ns() + int(startup_wait_s * 1_000_000_000.0)
         poll_s = _watchdog_startup_poll_s(config)
         while True:
@@ -1388,7 +1542,7 @@ def ensure_required_remote_watchdog_snapshot_ready(
             assessment = assess_required_remote_watchdog_snapshot(config, store=watchdog_store)
             if assessment.ready:
                 return assessment
-            if not _assessment_allows_startup_wait(assessment):
+            if not _assessment_allows_startup_wait(config, assessment):
                 break
 
     if recovery_error is not None:

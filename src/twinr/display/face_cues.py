@@ -20,6 +20,8 @@ from __future__ import annotations
 #        the public dataclass API and the legacy flat JSON payload format compatible.
 # IMP-4: Added more robust timestamp/TTL parsing (ISO-8601 or Unix epoch seconds) and
 #        preserved drop-in compatibility for older flat payloads via a reserved _meta block.
+# BUG-5: signature() now excludes updated_at/expires_at so cue lifetime refreshes do not
+#        force semantically identical HDMI rerenders on hdmi_wayland.
 # BREAKING: save(..., hold_seconds=...) now refreshes updated_at/expires_at from the save time
 #           so the persisted deadline matches the caller's requested hold duration.
 # BREAKING: the persisted artifact now inherits mkstemp owner-only permissions by default
@@ -469,8 +471,6 @@ class DisplayFaceCue:
 
         return (
             self.source,
-            self.updated_at,
-            self.expires_at,
             self.gaze_x,
             self.gaze_y,
             self.head_dx,

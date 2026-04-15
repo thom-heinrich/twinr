@@ -595,6 +595,75 @@ class TwinrPersonalGraphStoreTests(unittest.TestCase):
         self.assertEqual(resolved.match.label, "Anna Schulz")
         self.assertEqual(resolved.match.phones, ("+15555552233",))
 
+    def test_contact_write_creates_new_person_when_only_surname_matches_existing_contact(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                user_display_name="Erika",
+            )
+            store = TwinrPersonalGraphStore.from_config(config)
+
+            existing = store.remember_contact(
+                given_name="Chris",
+                family_name="Becker",
+                email="chris.becker@example.com",
+                role="Physiotherapist",
+            )
+            created = store.remember_contact(
+                given_name="Anna",
+                family_name="Becker",
+                email="anna.becker@example.com",
+                role="Daughter",
+            )
+            resolved = store.lookup_contact(
+                name="Anna",
+                family_name="Becker",
+                role="Daughter",
+            )
+
+        self.assertEqual(existing.status, "created")
+        self.assertEqual(created.status, "created")
+        self.assertEqual(resolved.status, "found")
+        assert resolved.match is not None
+        self.assertEqual(resolved.match.label, "Anna Becker")
+        self.assertEqual(resolved.match.emails, ("anna.becker@example.com",))
+
+    def test_contact_write_enriches_exact_full_name_with_new_contact_value(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                user_display_name="Erika",
+            )
+            store = TwinrPersonalGraphStore.from_config(config)
+
+            created = store.remember_contact(
+                given_name="Corinna",
+                family_name="Maier",
+                email="corinna.maier@example.com",
+                role="Physiotherapist",
+            )
+            updated = store.remember_contact(
+                given_name="Corinna",
+                family_name="Maier",
+                phone="5551234",
+                role="Physiotherapist",
+            )
+            resolved = store.lookup_contact(
+                name="Corinna",
+                family_name="Maier",
+                role="Physiotherapist",
+            )
+
+        self.assertEqual(created.status, "created")
+        self.assertEqual(updated.status, "updated")
+        self.assertEqual(resolved.status, "found")
+        assert resolved.match is not None
+        self.assertEqual(resolved.match.label, "Corinna Maier")
+        self.assertIn("corinna.maier@example.com", resolved.match.emails)
+        self.assertIn("5551234", resolved.match.phones)
+
     def test_from_config_places_graph_lock_in_runtime_state_lock_dir(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(

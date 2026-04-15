@@ -12,6 +12,7 @@ workflow, and conversation callers use when they need ordered instruction string
 - merge memory, reminder, and automation context into loop-specific section sets
 - resolve runtime-owned memory/reminder/automation store paths against `config.project_root` before loading file-backed context
 - keep the fast supervisor bundle semantically lean: stable character/style stays available there, but volatile dynamic layers such as `MINDSHARE`, `CONTINUITY`, `PLACE`, `WORLD`, and `REFLECTION` stay out of that routing lane
+- cache remote-backed static sections separately from short-TTL dynamic bundles so tool-loop rebuilds do not keep rehydrating the same remote-managed `USER`/`PERSONALITY` context on the live voice path
 - cache rendered instruction bundles against local source signatures so steady-state Pi turns do not re-fetch unchanged prompt context from remote storage on every turn
 - cap optional prompt-memory and managed-context remote reads to a small prompt-time timeout so slow ChonkyDB spikes do not stall first host/Pi text turns on non-authoritative prompt decorations
 - turn ordered sections into model-facing instruction strings

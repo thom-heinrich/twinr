@@ -56,6 +56,8 @@ class _QueryOnlyObjectStore:
         self.event_objects = event_objects
         self.queries: list[tuple[str, int]] = []
         self.applied_reflections: list[LongTermReflectionResultV1] = []
+        self.event_allow_cold_calls: list[bool] = []
+        self.projection_allow_cold_calls: list[bool] = []
 
     def select_fast_topic_objects(self, *, query_text=None, limit=0):
         normalized_query = str(query_text or "")
@@ -85,7 +87,13 @@ class _QueryOnlyObjectStore:
     def load_objects(self):
         raise AssertionError("Live-near runtime selectors must not hydrate the full object snapshot.")
 
-    def load_objects_by_projection_filter(self, *, predicate):
+    def load_objects_by_projection_filter(
+        self,
+        *,
+        predicate,
+        allow_cold_remote_catalog_scan: bool = True,
+    ):
+        self.projection_allow_cold_calls.append(bool(allow_cold_remote_catalog_scan))
         selected: list[LongTermMemoryObjectV1] = []
         for item in self.projection_objects:
             payload = item.to_payload()
@@ -105,7 +113,13 @@ class _QueryOnlyObjectStore:
                 selected.append(item)
         return tuple(selected)
 
-    def load_objects_by_event_ids(self, event_ids):
+    def load_objects_by_event_ids(
+        self,
+        event_ids,
+        *,
+        allow_cold_remote_catalog_scan: bool = True,
+    ):
+        self.event_allow_cold_calls.append(bool(allow_cold_remote_catalog_scan))
         target_ids = {str(item).strip() for item in event_ids if str(item).strip()}
         return tuple(
             item
@@ -323,6 +337,8 @@ class LongTermRuntimeQuerySelectorTests(unittest.TestCase):
         )
 
         self.assertEqual({item.memory_id for item in selected}, {"fact:bread_preference"})
+        self.assertEqual(object_store.event_allow_cold_calls, [False])
+        self.assertEqual(object_store.projection_allow_cold_calls, [False])
 
     def test_sensor_neighborhood_selector_prefers_touched_domain_neighbors(self) -> None:
         seed_pattern = _pattern(
@@ -382,6 +398,8 @@ class LongTermRuntimeQuerySelectorTests(unittest.TestCase):
             {item.memory_id for item in selected},
             {"pattern:presence:2026-03-29:morning"},
         )
+        self.assertEqual(object_store.event_allow_cold_calls, [False])
+        self.assertEqual(object_store.projection_allow_cold_calls, [False])
 
     def test_run_reflection_uses_targeted_queries_without_full_snapshot_reads(self) -> None:
         relationship = _fact(

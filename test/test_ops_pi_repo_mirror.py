@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Any
+from typing import Any, cast
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -25,6 +25,14 @@ _TEST_PI_SSH_USER = "pi-test-user"
 _TEST_PI_SSH_PASSWORD = "placeholder-password"
 
 
+def _init_git_repo(root: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "Twinr Tests"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "tests@example.com"], cwd=root, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=root, check=True)
+
+
 def _completed(
     args: list[str],
     *,
@@ -33,6 +41,17 @@ def _completed(
     stderr: str = "",
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(args=args, returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def _test_connection_settings() -> Any:
+    return cast(
+        Any,
+        PiConnectionSettings(
+            host=_TEST_PI_HOST,
+            user=_TEST_PI_SSH_USER,
+            password=_TEST_PI_SSH_PASSWORD,
+        ),
+    )
 
 
 class _FakeClock:
@@ -61,6 +80,7 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
             supports_zstd=False,
             supports_fsync=False,
         )
+        watchdog._authoritative_source_is_snapshot = True
 
     def test_build_authoritative_repo_entry_digests_uses_mirror_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -81,6 +101,16 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
             (root / "src").mkdir()
             (root / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
             (root / "link-to-app").symlink_to("src/app.py")
+            _init_git_repo(root)
+            (root / "browser_automation" / "runtime_requirements.txt").write_text(
+                "playwright==1.52.0\n",
+                encoding="utf-8",
+            )
+            (root / "browser_automation" / "playwright_browsers.txt").write_text(
+                "chromium\n",
+                encoding="utf-8",
+            )
+            (root / "local-only.txt").write_text("untracked\n", encoding="utf-8")
 
             entries = build_authoritative_repo_entry_digests(root)
 
@@ -90,11 +120,14 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
         self.assertIn("link-to-app", entries_by_path)
         self.assertEqual(entries_by_path["link-to-app"].kind, "symlink")
         self.assertEqual(entries_by_path["link-to-app"].link_target, "src/app.py")
+        self.assertIn("browser_automation/runtime_requirements.txt", entries_by_path)
+        self.assertIn("browser_automation/playwright_browsers.txt", entries_by_path)
         self.assertNotIn(".env", entries_by_path)
         self.assertNotIn("state/runtime-state.json", entries_by_path)
         self.assertNotIn("pkg.egg-info/PKG-INFO", entries_by_path)
         self.assertNotIn("browser_automation/artifacts/trace.json", entries_by_path)
         self.assertNotIn("node_modules/index.js", entries_by_path)
+        self.assertNotIn("local-only.txt", entries_by_path)
 
     def test_materialize_authoritative_repo_snapshot_copies_only_mirror_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -108,9 +141,12 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
             (root / "src").mkdir()
             (root / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
             (root / "link-to-app").symlink_to("src/app.py")
+            _init_git_repo(root)
+            (root / "local-only.txt").write_text("untracked\n", encoding="utf-8")
 
             entries = materialize_authoritative_repo_snapshot(root, snapshot)
 
+            _init_git_repo(snapshot)
             snapshot_entries = build_authoritative_repo_entry_digests(snapshot)
             self.assertEqual(entries, snapshot_entries)
             self.assertTrue((snapshot / "README.md").is_file())
@@ -119,6 +155,36 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
             self.assertEqual(os.readlink(snapshot / "link-to-app"), "src/app.py")
             self.assertFalse((snapshot / ".env").exists())
             self.assertFalse((snapshot / "state" / "runtime-state.json").exists())
+            self.assertFalse((snapshot / "local-only.txt").exists())
+
+    def test_probe_once_materializes_a_tracked_file_snapshot_for_workspace_noise(self) -> None:
+        commands: list[list[str]] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "README.md").write_text("Twinr\n", encoding="utf-8")
+            _init_git_repo(root)
+            (root / "local-only.txt").write_text("untracked\n", encoding="utf-8")
+
+            def _runner(args, **kwargs):
+                command = [str(part) for part in args]
+                commands.append(command)
+                return _completed(command, stdout="")
+
+            watchdog = PiRepoMirrorWatchdog(
+                project_root=root,
+                connection_settings=_test_connection_settings(),
+                subprocess_runner=_runner,
+            )
+            self._seed_capabilities(watchdog)
+            watchdog._authoritative_source_is_snapshot = False
+
+            result = watchdog.probe_once()
+
+        self.assertFalse(result.drift_detected)
+        self.assertEqual(len(commands), 1)
+        self.assertIn("authoritative_repo/", commands[0][-2])
+        self.assertNotIn(str(root) + "/", commands[0][-2])
 
     def test_probe_once_reports_clean_repo_when_rsync_finds_no_changes(self) -> None:
         commands: list[list[str]] = []
@@ -138,11 +204,7 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
 
             watchdog = PiRepoMirrorWatchdog(
                 project_root=root,
-                connection_settings=PiConnectionSettings(
-                    host=_TEST_PI_HOST,
-                    user=_TEST_PI_SSH_USER,
-                    password=_TEST_PI_SSH_PASSWORD,
-                ),
+                connection_settings=_test_connection_settings(),
                 subprocess_runner=_runner,
             )
             self._seed_capabilities(watchdog)
@@ -191,11 +253,7 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
 
             watchdog = PiRepoMirrorWatchdog(
                 project_root=root,
-                connection_settings=PiConnectionSettings(
-                    host=_TEST_PI_HOST,
-                    user=_TEST_PI_SSH_USER,
-                    password=_TEST_PI_SSH_PASSWORD,
-                ),
+                connection_settings=_test_connection_settings(),
                 subprocess_runner=_runner,
             )
             self._seed_capabilities(watchdog)
@@ -229,11 +287,7 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
 
             watchdog = PiRepoMirrorWatchdog(
                 project_root=root,
-                connection_settings=PiConnectionSettings(
-                    host=_TEST_PI_HOST,
-                    user=_TEST_PI_SSH_USER,
-                    password=_TEST_PI_SSH_PASSWORD,
-                ),
+                connection_settings=_test_connection_settings(),
                 subprocess_runner=_runner,
             )
             self._seed_capabilities(watchdog)
@@ -270,11 +324,7 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
 
             watchdog = PiRepoMirrorWatchdog(
                 project_root=root,
-                connection_settings=PiConnectionSettings(
-                    host=_TEST_PI_HOST,
-                    user=_TEST_PI_SSH_USER,
-                    password=_TEST_PI_SSH_PASSWORD,
-                ),
+                connection_settings=_test_connection_settings(),
                 subprocess_runner=_runner,
             )
             self._seed_capabilities(watchdog)
@@ -287,6 +337,40 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
         self.assertTrue(result.checksum_used)
         self.assertEqual(result.change_count, 1)
         self.assertEqual(result.sampled_change_lines, (">f..t...... pyproject.toml",))
+        self.assertEqual(len(commands), 1)
+        self.assertIn("--dry-run", commands[0])
+        self.assertIn("--checksum", commands[0])
+
+    def test_probe_once_ignores_checksum_only_timestamp_drift(self) -> None:
+        commands: list[list[str]] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "README.md").write_text("Twinr\n", encoding="utf-8")
+
+            def _runner(args, **kwargs):
+                command = [str(part) for part in args]
+                commands.append(command)
+                return _completed(
+                    command,
+                    stdout=".f..t...... README.md\n.d..t...... docs/\n",
+                )
+
+            watchdog = PiRepoMirrorWatchdog(
+                project_root=root,
+                connection_settings=_test_connection_settings(),
+                subprocess_runner=_runner,
+            )
+            self._seed_capabilities(watchdog)
+
+            result = watchdog.probe_once(apply_sync=False, checksum=True, max_change_lines=5)
+
+        self.assertFalse(result.drift_detected)
+        self.assertFalse(result.sync_applied)
+        self.assertIsNone(result.verified_clean)
+        self.assertTrue(result.checksum_used)
+        self.assertEqual(result.change_count, 0)
+        self.assertEqual(result.sampled_change_lines, ())
         self.assertEqual(len(commands), 1)
         self.assertIn("--dry-run", commands[0])
         self.assertIn("--checksum", commands[0])
@@ -314,11 +398,7 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
 
             watchdog = PiRepoMirrorWatchdog(
                 project_root=root,
-                connection_settings=PiConnectionSettings(
-                    host=_TEST_PI_HOST,
-                    user=_TEST_PI_SSH_USER,
-                    password=_TEST_PI_SSH_PASSWORD,
-                ),
+                connection_settings=_test_connection_settings(),
                 subprocess_runner=_runner,
             )
             self._seed_capabilities(watchdog)
@@ -361,11 +441,7 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
 
             watchdog = PiRepoMirrorWatchdog(
                 project_root=root,
-                connection_settings=PiConnectionSettings(
-                    host=_TEST_PI_HOST,
-                    user=_TEST_PI_SSH_USER,
-                    password=_TEST_PI_SSH_PASSWORD,
-                ),
+                connection_settings=_test_connection_settings(),
                 subprocess_runner=_runner,
             )
             self._seed_capabilities(watchdog)
@@ -406,11 +482,7 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
 
             watchdog = PiRepoMirrorWatchdog(
                 project_root=root,
-                connection_settings=PiConnectionSettings(
-                    host=_TEST_PI_HOST,
-                    user=_TEST_PI_SSH_USER,
-                    password=_TEST_PI_SSH_PASSWORD,
-                ),
+                connection_settings=_test_connection_settings(),
                 subprocess_runner=_runner,
                 sleep_fn=clock.sleep,
                 monotonic_fn=clock.monotonic,

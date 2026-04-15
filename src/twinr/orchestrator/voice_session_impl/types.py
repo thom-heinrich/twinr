@@ -37,6 +37,10 @@ class _PendingTranscriptUtterance:
     """Track one same-stream utterance for transcript-first routing."""
 
     origin_state: str
+    wait_id: str | None = None
+    item_id: str | None = None
+    stage1_attempted: bool = False
+    stage1_seeded: bool = False
     frames: deque[_RecentFrame] = field(default_factory=deque)
     captured_ms: int = 0
     max_capture_ms: int = 0

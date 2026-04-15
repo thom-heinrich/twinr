@@ -157,6 +157,11 @@ The canonical Twinr env names for that path are:
 
 For migration convenience, the config also accepts legacy `CCODEX_MEMORY_BASE_URL` and `CCODEX_MEMORY_API_KEY` as fallbacks, but Twinr docs and code should refer to the backend as `chonkydb`.
 
+Externally readable ChonkyDB incident and operator-facing status reports now live
+under `docs/chonkydb/ext/`. These reports are written to be understandable without
+access to Twinr's internal artifact stores and are the right place for self-contained
+handoffs to ChonkyDB admins.
+
 ## Web interface
 
 Twinr exposes a web interface on port `1337` for local configuration.
@@ -341,6 +346,9 @@ Recommended runtime env knobs:
 - `TWINR_ATTENTION_SERVO_GPIO=18`
 - `TWINR_ATTENTION_SERVO_INVERT_DIRECTION=false`
 
+Direction check:
+If a person appears on the right side of the camera image and Twinr physically turns left instead of right, the mechanical mount is inverted relative to camera space and `TWINR_ATTENTION_SERVO_INVERT_DIRECTION=true` is required.
+
 Twinr's productive servo path is now single-Pi only: the attention-servo
 output must live on the main Pi. The active config loader rejects the retired
 helper-Pi `peer_pololu_maestro` / `TWINR_ATTENTION_SERVO_PEER_BASE_URL`
@@ -367,12 +375,18 @@ Optional tuning knobs:
 - `TWINR_ATTENTION_SERVO_MAX_JERK_US_PER_S3`
 - `TWINR_ATTENTION_SERVO_MIN_COMMAND_DELTA_US`
 - `TWINR_ATTENTION_SERVO_VISIBLE_RETARGET_TOLERANCE_US`
+- `TWINR_ATTENTION_SERVO_VISIBLE_RETARGET_COOLDOWN_S`
 - `TWINR_ATTENTION_SERVO_IDLE_RELEASE_S`
 - `TWINR_ATTENTION_SERVO_SETTLED_RELEASE_S`
 - `TWINR_ATTENTION_SERVO_FOLLOW_EXIT_ONLY`
 - `TWINR_ATTENTION_SERVO_VISIBLE_RECENTER_INTERVAL_S`
 - `TWINR_ATTENTION_SERVO_VISIBLE_RECENTER_CENTER_TOLERANCE`
 - `TWINR_ATTENTION_SERVO_MECHANICAL_RANGE_DEGREES`
+
+If visible follow is directionally correct but still fidgets after each step,
+increase `TWINR_ATTENTION_SERVO_VISIBLE_RETARGET_TOLERANCE_US` and/or set a
+small `TWINR_ATTENTION_SERVO_VISIBLE_RETARGET_COOLDOWN_S` so the head briefly
+holds after a real move before it accepts another same-side micro-retarget.
 - `TWINR_ATTENTION_SERVO_EXIT_FOLLOW_MAX_DEGREES`
 - `TWINR_ATTENTION_SERVO_EXIT_ACTIVATION_DELAY_S`
 - `TWINR_ATTENTION_SERVO_CONTINUOUS_MAX_SPEED_DEGREES_PER_S`
@@ -621,7 +635,9 @@ TWINR_OPENAI_ENABLE_WEB_SEARCH=true
 TWINR_OPENAI_WEB_SEARCH_CONTEXT_SIZE=medium
 TWINR_USER_DISPLAY_NAME=Thom
 OPENAI_VISION_DETAIL=auto
-TWINR_CAMERA_DEVICE=/dev/video0
+TWINR_CAMERA_DEVICE=rpicam://0
+# For a USB or UVC camera instead:
+# TWINR_CAMERA_DEVICE=/dev/video0
 # For the Bitcraze AI-Deck WiFi streamer instead:
 # TWINR_CAMERA_DEVICE=aideck://192.168.4.1:5000
 TWINR_CAMERA_WIDTH=640
@@ -679,10 +695,10 @@ PYTHONPATH=src ./.venv/bin/python -m twinr --env-file /twinr/.env --proactive-ob
 PYTHONPATH=src ./.venv/bin/python -m twinr --env-file /twinr/.env --proactive-audio-observe-once
 ```
 
-The vision path requires `ffmpeg` on the device when Twinr captures still images from V4L2. When `TWINR_CAMERA_DEVICE` is set to `aideck://192.168.4.1:5000`, Twinr instead reads one bounded AI-Deck WiFi frame directly, debayers raw streamer output into a normal PNG on demand, and then sends one or more images to the OpenAI Responses API in a single request. In that mode, the Twinr host itself must already be connected to the AI-Deck access point.
+The vision path requires `ffmpeg` on the device when Twinr captures still images from V4L2. For Raspberry Pi libcamera stacks, set `TWINR_CAMERA_DEVICE=rpicam://0` (or `libcamera://0`) so Twinr uses the explicit Pi camera lane; Twinr no longer switches from a `/dev/video*` node into `rpicam-still` automatically. When `TWINR_CAMERA_DEVICE` is set to `aideck://192.168.4.1:5000`, Twinr instead reads one bounded AI-Deck WiFi frame directly, debayers raw streamer output into a normal PNG on demand, and then sends one or more images to the OpenAI Responses API in a single request. In that mode, the Twinr host itself must already be connected to the AI-Deck access point.
 The active realtime and streaming loops can also trigger the camera automatically for typical visual requests such as "Schau mich mal an", "Was zeige ich dir?", or "Wie sehe ich heute aus?".
 With `TWINR_PROACTIVE_ENABLED=true`, the active runtime loops also start the proactive monitor and let it issue bounded conversation starters while Twinr is idle.
-With `TWINR_PROACTIVE_VISION_REVIEW_ENABLED=true`, image-driven proactive prompts are reviewed against a short buffered frame sequence before Twinr speaks. That second opinion is conservative: if the recent frames look empty or ambiguous, Twinr skips the proactive prompt instead of speaking.
+With `TWINR_PROACTIVE_VISION_REVIEW_ENABLED=true`, image-driven proactive prompts are reviewed against a short buffered frame sequence before Twinr speaks. That second opinion is conservative: if the recent frames look empty or ambiguous, or if buffered review is unavailable, Twinr skips the proactive prompt instead of speaking.
 With `TWINR_VOICE_ORCHESTRATOR_ENABLED=true`, the Pi keeps one live websocket stream open to the transcript-first voice gateway and leaves wake detection there. The same remote stream stays authoritative for wake, transcript commit, continuation, and follow-up closure. Twinr has no separate local wake or STT path in the live product flow.
 On `/twinr`, those voice-gateway URLs must point to the development-host LAN bridge or mDNS name, not `127.0.0.1`; loopback there only points back to the Pi itself and will break live wake/reconnect.
 When the current development-host `:8797` bridge is used, both the text orchestrator probe path and the live voice gateway still run over plain `ws://` transport without TLS termination. Set `TWINR_ORCHESTRATOR_ALLOW_INSECURE_WS=true` for the text `/ws/orchestrator` endpoint and `TWINR_VOICE_ORCHESTRATOR_ALLOW_INSECURE_WS=true` for `/ws/orchestrator/voice` on that attested LAN bridge; prefer `wss://` whenever a TLS terminator is available.

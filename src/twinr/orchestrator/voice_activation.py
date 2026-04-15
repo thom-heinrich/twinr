@@ -2,10 +2,10 @@
 # BUG-1: Fixed utterance-head false negatives caused by punctuation/empty tokens and hyphenated ASR output.
 # BUG-2: Fixed silent backend/preprocessing failures by surfacing structured error metadata instead of collapsing them into plain "no match".
 # BUG-3: Fixed accidental enablement of risky "*winner" recovery in contextual-bias mode, which could raise false activations.
+# BUG-4: Removed wake-specific STT prompting from the productive matcher because guided activation prompts could distort generic transcript-first windows into unrelated text or empty matches.
 # SEC-1: Added PCM frame-alignment, duration/size guards, and 16 kHz mono conditioning before remote upload to reduce practical Pi 4 DoS/cost risk.
-# IMP-1: Upgraded prompting from a raw name list to a bounded guided prompt with contamination fallback.
-# IMP-2: Added compatibility with structured 2026 ASR responses (text, words, timings, confidence, backend labels) while remaining drop-in for legacy str backends.
-# IMP-3: Added timestamp/confidence-aware matching, bounded fuzzy prefix recovery, and more precise remainder extraction.
+# IMP-1: Added compatibility with structured 2026 ASR responses (text, words, timings, confidence, backend labels) while remaining drop-in for legacy str backends.
+# IMP-2: Added timestamp/confidence-aware matching, bounded fuzzy prefix recovery, and more precise remainder extraction.
 
 """Match transcript-first voice activations on the remote thh1986 stream.
 
@@ -63,23 +63,13 @@ _CONTEXTUAL_TYNNA_VOICE_ACTIVATION_PHRASES: tuple[str, ...] = (
     "tynna",
 )
 
-_PROMPT_CONTAMINATION_MARKERS = (
-    "if a name sounds close",
-    "use that spelling exactly",
-    "the clip may include",
-    "wake word variants",
-    "return only what was actually spoken",
-)
 _GENERIC_ACTIVATION_WORDS = frozenset({"hey", "hallo", "he", "hi", "ok", "okay"})
 _DEFAULT_MIN_PREFIX_RATIO = 0.9
 _DEFAULT_MIN_FUZZY_WORD_RATIO = 0.84
-_FALLBACK_PROMPT_NAMES = ("Twinr", "Twinna", "Twina", "Twinner")
 _DEFAULT_TARGET_SAMPLE_RATE = 16_000
 _DEFAULT_TARGET_CHANNELS = 1
 _DEFAULT_MAX_AUDIO_SECONDS = 8.0
 _DEFAULT_MAX_WAV_BYTES = 2_000_000
-_DEFAULT_PROMPT_MAX_WORDS = 12
-_DEFAULT_PROMPT_MAX_CHARS = 220
 _TEXT_EDGE_STRIP_CHARS = " \t\r\n,.;:!?…-–—'\"`()[]{}<>"
 
 _TWI_HEURISTIC_PREFIX = "twi"
@@ -257,25 +247,7 @@ class VoiceActivationPhraseMatcher:
                 audio_duration_s=prepared_audio.duration_s,
             )
 
-        primary_prompt = voice_activation_primary_prompt(self.phrases)
-        transcript_result = self._safe_transcribe(prepared_audio, prompt=primary_prompt)
-        if transcript_result.text and _looks_like_prompt_contamination(
-            transcript_result.text,
-            prompt=primary_prompt,
-        ):
-            transcript_result = self._safe_transcribe(prepared_audio, prompt=None)
-            if _looks_like_prompt_contamination(transcript_result.text, prompt=None):
-                return VoiceActivationMatch(
-                    detected=False,
-                    transcript="",
-                    normalized_transcript="",
-                    backend=transcript_result.backend,
-                    detector_label=transcript_result.detector_label,
-                    error=transcript_result.error or "prompt_contamination",
-                    transcript_confidence=transcript_result.confidence,
-                    audio_duration_s=prepared_audio.duration_s,
-                )
-
+        transcript_result = self._safe_transcribe(prepared_audio, prompt=None)
         return self.match_transcript_result(
             transcript_result,
             audio_duration_s=prepared_audio.duration_s,
@@ -401,36 +373,6 @@ class VoiceActivationTailExtractor:
         if normalized_transcript in self.phrases:
             return ""
         return transcript
-
-
-def voice_activation_primary_prompt(phrases: tuple[str, ...] | list[str]) -> str | None:
-    """Build one bounded transcription prompt from the configured activation names."""
-
-    prompt_words: list[str] = []
-    seen_words: set[str] = set()
-    for phrase in _normalize_phrases(phrases):
-        for word in phrase.split():
-            if word in _GENERIC_ACTIVATION_WORDS:
-                continue
-            if word not in seen_words:
-                seen_words.add(word)
-                prompt_words.append(word.title())
-
-    if not prompt_words:
-        if not _normalize_phrases(phrases):
-            return None
-        prompt_words = list(_FALLBACK_PROMPT_NAMES)
-
-    prompt_words = prompt_words[:_DEFAULT_PROMPT_MAX_WORDS]
-    prompt = (
-        "Return only what was actually spoken. "
-        "If a name sounds close to one of these activation names, use that spelling exactly: "
-        + ", ".join(prompt_words)
-        + ". The clip may include wake word variants."
-    )
-    if len(prompt) > _DEFAULT_PROMPT_MAX_CHARS:
-        prompt = prompt[: _DEFAULT_PROMPT_MAX_CHARS].rstrip(" ,.;:") + "."
-    return prompt
 
 
 def match_voice_activation_transcript(
@@ -995,6 +937,8 @@ def _coerce_fuzzy_ratio(value: object) -> float:
 def _coerce_positive_int(value: object, default: int) -> int:
     if isinstance(value, bool):
         return default
+    if not isinstance(value, (int, float, str, bytes, bytearray)):
+        return default
     try:
         coerced = int(value)
     except (TypeError, ValueError):
@@ -1009,6 +953,8 @@ def _coerce_target_channels(value: object, default: int) -> int:
 def _coerce_positive_float(value: object | None) -> float | None:
     if value is None or isinstance(value, bool):
         return None
+    if not isinstance(value, (int, float, str, bytes, bytearray)):
+        return None
     try:
         coerced = float(value)
     except (TypeError, ValueError):
@@ -1020,6 +966,8 @@ def _coerce_positive_float(value: object | None) -> float | None:
 
 def _coerce_optional_float(value: object | None) -> float | None:
     if value is None or isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, float, str, bytes, bytearray)):
         return None
     try:
         coerced = float(value)
@@ -1035,30 +983,6 @@ def _coerce_optional_unit_float(value: object | None) -> float | None:
     if coerced is None:
         return None
     return max(0.0, min(1.0, coerced))
-
-
-def _looks_like_prompt_contamination(text: str, *, prompt: str | None = None) -> bool:
-    normalized = _normalize_phrase_text(text)
-    if not normalized:
-        return False
-    if any(marker in normalized for marker in _PROMPT_CONTAMINATION_MARKERS):
-        return True
-    normalized_prompt = _normalize_phrase_text(prompt)
-    if not normalized_prompt:
-        return False
-    prompt_words = tuple(word for word in normalized_prompt.split() if word)
-    transcript_words = tuple(word for word in normalized.split() if word)
-    prompt_word_set = set(prompt_words)
-    transcript_word_set = set(transcript_words)
-    if len(prompt_word_set) >= 2 and normalized == normalized_prompt:
-        return True
-    if (
-        len(prompt_word_set) >= 2
-        and len(transcript_word_set) >= 2
-        and transcript_word_set.issubset(prompt_word_set)
-    ):
-        return True
-    return False
 
 
 def _coerce_transcription_result(value: object, *, default_backend: str) -> TranscriptionResult:
@@ -1480,5 +1404,4 @@ __all__ = [
     "match_voice_activation_transcript",
     "normalize_activation_detector_label",
     "phrase_from_activation_detector_label",
-    "voice_activation_primary_prompt",
 ]

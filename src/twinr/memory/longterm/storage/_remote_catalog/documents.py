@@ -176,11 +176,13 @@ class RemoteCatalogDocumentMixin(RemoteCatalogMixinBase):
         per-item `documents/full` reads once the query has already narrowed the
         candidate set.
         """
-
-        entry_by_id = {
-            entry.item_id: entry
-            for entry in self.load_catalog_entries(snapshot_kind=snapshot_kind)
-        }
+        catalog_entries = _run_timed_workflow_step(
+            name="longterm_remote_catalog_selection_lookup_catalog_entries",
+            kind="retrieval",
+            details={"snapshot_kind": snapshot_kind},
+            operation=lambda: self.load_catalog_entries(snapshot_kind=snapshot_kind),
+        )
+        entry_by_id = {entry.item_id: entry for entry in catalog_entries}
         ordered_entries: list[LongTermRemoteCatalogEntry] = []
         for raw_item_id in item_ids:
             item_id = self._normalize_item_id(raw_item_id)
@@ -189,9 +191,31 @@ class RemoteCatalogDocumentMixin(RemoteCatalogMixinBase):
             entry = entry_by_id.get(item_id)
             if entry is not None:
                 ordered_entries.append(entry)
-        loaded = self._load_selection_item_payloads_from_entries(
+        return self.load_selection_item_payloads_from_entries(
             snapshot_kind=snapshot_kind,
             entries=tuple(ordered_entries),
+        )
+
+    def load_selection_item_payloads_from_entries(
+        self,
+        *,
+        snapshot_kind: str,
+        entries: Iterable[LongTermRemoteCatalogEntry],
+    ) -> tuple[dict[str, object], ...]:
+        """Load query-time payloads directly from already selected catalog entries."""
+
+        ordered_entries = tuple(entries)
+        loaded = _run_timed_workflow_step(
+            name="longterm_remote_catalog_selection_payloads_from_entries",
+            kind="retrieval",
+            details={
+                "snapshot_kind": snapshot_kind,
+                "entry_count": len(ordered_entries),
+            },
+            operation=lambda: self._load_selection_item_payloads_from_entries(
+                snapshot_kind=snapshot_kind,
+                entries=ordered_entries,
+            ),
         )
         resolved: list[dict[str, object]] = []
         for payload in loaded:
@@ -217,6 +241,7 @@ class RemoteCatalogDocumentMixin(RemoteCatalogMixinBase):
         *,
         snapshot_kind: str,
         entries: Iterable[LongTermRemoteCatalogEntry],
+        allow_retrieve_fallback: bool = True,
     ) -> tuple[dict[str, object] | None, ...]:
         """Load query-time payloads from projections or retrieve batches only."""
 
@@ -243,7 +268,7 @@ class RemoteCatalogDocumentMixin(RemoteCatalogMixinBase):
                 )
                 continue
             unresolved_entries.append(entry)
-        if unresolved_entries:
+        if unresolved_entries and allow_retrieve_fallback:
             loaded_by_item_id.update(
                 self._load_item_payloads_via_retrieve(
                     snapshot_kind=snapshot_kind,

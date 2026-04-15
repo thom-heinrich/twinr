@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 from pathlib import Path
+import base64
 import socket
 import struct
 import subprocess
@@ -9,16 +10,43 @@ import unittest
 from types import SimpleNamespace
 from typing import Any, Literal, cast
 from unittest.mock import patch
-from urllib.error import URLError
 import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
-from twinr.hardware.aideck_camera import AIDeckStillCamera
-from twinr.hardware.camera import CameraCaptureFailedError, CameraCaptureTimeoutError, V4L2StillCamera
+from twinr.hardware.aideck_camera import AIDeckStillCamera, AIDeckStreamStalledError
+from twinr.hardware.camera import (
+    CameraCaptureFailedError,
+    CameraCaptureTimeoutError,
+    CameraConfigurationError,
+    RPiCamStillCamera,
+    V4L2StillCamera,
+)
 
-_PNG_BYTES = b"\x89PNG\r\n\x1a\nPNGDATA"
+_PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl9l2sAAAAASUVORK5CYII="
+)
+_RAW_BAYER_BYTES = bytes(
+    [
+        10,
+        40,
+        20,
+        50,
+        60,
+        90,
+        70,
+        100,
+        30,
+        80,
+        40,
+        90,
+        100,
+        140,
+        110,
+        150,
+    ]
+)
 
 
 class _FakeUrlopenResponse:
@@ -58,6 +86,12 @@ class _FakeSocket:
         chunk = self._payload[self._offset : end]
         self._offset = end
         return chunk
+
+    def recv_into(self, buffer, size: int) -> int:
+        chunk = self.recv(size)
+        view = memoryview(buffer)
+        view[: len(chunk)] = chunk
+        return len(chunk)
 
 
 class _TimeoutOnRecvSocket(_FakeSocket):
@@ -173,85 +207,132 @@ class V4L2StillCameraTests(unittest.TestCase):
                 capture = camera.capture_photo()
 
         self.assertEqual(capture.data, _PNG_BYTES)
-        self.assertEqual(capture.input_format, "yuyv422")
+        self.assertEqual(capture.input_format, "mjpeg")
         self.assertEqual(run_mock.call_count, 2)
 
-    def test_capture_photo_uses_rpicam_still_fallback_for_unicam_busy_device(self) -> None:
+    def test_capture_photo_does_not_switch_to_rpicam_still_after_v4l2_failure(self) -> None:
         camera = V4L2StillCamera(
             device="/dev/video0",
             width=640,
             height=480,
             framerate=30,
+        )
+
+        responses = [
+            SimpleNamespace(returncode=1, stdout=b"", stderr=b"Device or resource busy"),
+            SimpleNamespace(returncode=1, stdout=b"", stderr=b"Device or resource busy"),
+            SimpleNamespace(returncode=1, stdout=b"", stderr=b"Device or resource busy"),
+            SimpleNamespace(returncode=1, stdout=b"", stderr=b"Device or resource busy"),
+        ]
+
+        with patch("twinr.hardware.camera.shutil.which", side_effect=self._which):
+            with patch("twinr.hardware.camera.subprocess.run", side_effect=responses) as run_mock:
+                with self.assertRaises(CameraCaptureFailedError):
+                    camera.capture_photo()
+
+        self.assertEqual(run_mock.call_count, 4)
+        self.assertTrue(
+            all(call.args[0][0] == "/usr/bin/ffmpeg" for call in run_mock.call_args_list)
+        )
+
+    def test_capture_photo_raises_configuration_error_when_ffmpeg_is_missing(self) -> None:
+        camera = V4L2StillCamera(
+            device="/dev/video0",
+            width=640,
+            height=480,
+            framerate=30,
+        )
+
+        with patch("twinr.hardware.camera.shutil.which", return_value=None):
+            with self.assertRaises(CameraConfigurationError) as context:
+                camera.capture_photo()
+
+        self.assertIn("rpicam://<index>", str(context.exception))
+
+    def test_capture_photo_raises_timeout_for_v4l2_lane(self) -> None:
+        camera = V4L2StillCamera(
+            device="/dev/video0",
+            width=640,
+            height=480,
+            framerate=30,
+        )
+
+        with patch("twinr.hardware.camera.shutil.which", return_value="/usr/bin/ffmpeg"):
+            with patch(
+                "twinr.hardware.camera.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(cmd=["ffmpeg"], timeout=10.0),
+            ):
+                with self.assertRaises(CameraCaptureTimeoutError):
+                    camera.capture_photo()
+
+    def test_capture_photo_rejects_unicam_v4l2_lane_with_configuration_error(self) -> None:
+        camera = V4L2StillCamera(
+            device="/dev/video0",
+            width=640,
+            height=480,
+            framerate=30,
+        )
+
+        def which_side_effect(binary: str) -> str | None:
+            if binary == "v4l2-ctl":
+                return "/usr/bin/v4l2-ctl"
+            if binary == "ffmpeg":
+                return "/usr/bin/ffmpeg"
+            return None
+
+        v4l2_result = SimpleNamespace(
+            returncode=0,
+            stdout=b"Driver name   : unicam\nCard type     : unicam-image\n",
+            stderr=b"",
+        )
+
+        with patch("twinr.hardware.camera.shutil.which", side_effect=which_side_effect):
+            with patch("twinr.hardware.camera.subprocess.run", return_value=v4l2_result) as run_mock:
+                with self.assertRaises(CameraConfigurationError) as context:
+                    camera.capture_photo()
+
+        self.assertIn("rpicam://<index>", str(context.exception))
+        self.assertEqual(run_mock.call_count, 1)
+        self.assertEqual(run_mock.call_args.args[0][0], "/usr/bin/v4l2-ctl")
+
+    def test_from_config_uses_explicit_rpicam_device_uri(self) -> None:
+        config = SimpleNamespace(
+            camera_device="rpicam://0",
+            camera_width=640,
+            camera_height=480,
+            camera_framerate=30,
+            camera_input_format=None,
+            camera_ffmpeg_path="ffmpeg",
+            camera_proxy_snapshot_url=None,
+            camera_capture_timeout_seconds=4.0,
+            camera_capture_output_dir=None,
+        )
+
+        camera = V4L2StillCamera.from_config(cast(TwinrConfig, config))
+
+        self.assertIsInstance(camera, RPiCamStillCamera)
+
+    def test_explicit_rpicam_camera_capture_uses_rpicam_still(self) -> None:
+        camera = RPiCamStillCamera(
+            camera_index=0,
+            width=640,
+            height=480,
+            capture_timeout_seconds=4.0,
         )
 
         def run_side_effect(command: list[str], **_kwargs):
-            if command[0] == "/usr/bin/ffmpeg":
-                return SimpleNamespace(returncode=1, stdout=b"", stderr=b"Device or resource busy")
-            if command[0] == "/usr/bin/rpicam-still":
-                output_path = Path(command[command.index("--output") + 1])
-                output_path.write_bytes(_PNG_BYTES)
-                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
-            raise AssertionError(command)
+            self.assertEqual(command[0], "/usr/bin/rpicam-still")
+            output_path = Path(command[command.index("--output") + 1])
+            output_path.write_bytes(_PNG_BYTES)
+            return SimpleNamespace(returncode=0, stdout=b"{}", stderr=b"")
 
         with patch("twinr.hardware.camera.shutil.which", side_effect=self._which):
-            with patch.object(camera, "_device_sysfs_name", return_value="unicam-image"):
-                with patch("twinr.hardware.camera.subprocess.run", side_effect=run_side_effect) as run_mock:
-                    capture = camera.capture_photo()
+            with patch("twinr.hardware.camera.subprocess.run", side_effect=run_side_effect):
+                capture = camera.capture_photo()
 
         self.assertEqual(capture.data, _PNG_BYTES)
         self.assertEqual(capture.input_format, "rpicam-still")
-        self.assertEqual(capture.source_device, "/dev/video0")
-        self.assertEqual(run_mock.call_count, 4)
-        self.assertEqual(run_mock.call_args.args[0][0], "/usr/bin/rpicam-still")
-
-    def test_capture_photo_uses_rpicam_still_fallback_when_default_video0_is_missing(self) -> None:
-        camera = V4L2StillCamera(
-            device="/dev/video0",
-            width=640,
-            height=480,
-            framerate=30,
-        )
-
-        def run_side_effect(command: list[str], **_kwargs):
-            if command[0] == "/usr/bin/ffmpeg":
-                return SimpleNamespace(
-                    returncode=1,
-                    stdout=b"",
-                    stderr=b"Cannot open video device /dev/video0: No such file or directory",
-                )
-            if command[0] == "/usr/bin/rpicam-still":
-                output_path = Path(command[command.index("--output") + 1])
-                output_path.write_bytes(_PNG_BYTES)
-                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
-            raise AssertionError(command)
-
-        with patch("twinr.hardware.camera.shutil.which", side_effect=self._which):
-            with patch.object(camera, "_device_sysfs_name", return_value=""):
-                with patch("twinr.hardware.camera.subprocess.run", side_effect=run_side_effect) as run_mock:
-                    capture = camera.capture_photo()
-
-        self.assertEqual(capture.data, _PNG_BYTES)
-        self.assertEqual(capture.input_format, "rpicam-still")
-        self.assertEqual(capture.source_device, "/dev/video0")
-        self.assertEqual(run_mock.call_count, 4)
-        self.assertEqual(run_mock.call_args.args[0][0], "/usr/bin/rpicam-still")
-
-    def test_capture_photo_raises_timeout_when_busy_fallback_is_not_available(self) -> None:
-        camera = V4L2StillCamera(
-            device="/dev/video0",
-            width=640,
-            height=480,
-            framerate=30,
-        )
-
-        with patch("twinr.hardware.camera.shutil.which", side_effect=lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None):
-            with patch.object(camera, "_device_sysfs_name", return_value="unicam-image"):
-                with patch(
-                    "twinr.hardware.camera.subprocess.run",
-                    side_effect=subprocess.TimeoutExpired(cmd=["ffmpeg"], timeout=10.0),
-                ):
-                    with self.assertRaises(CameraCaptureTimeoutError):
-                        camera.capture_photo()
+        self.assertEqual(capture.source_device, "rpicam://0")
 
     def test_from_config_fetches_snapshot_from_peer_proxy_when_url_is_configured(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -267,12 +348,19 @@ class V4L2StillCameraTests(unittest.TestCase):
                 camera_capture_output_dir=temp_dir,
             )
             camera = V4L2StillCamera.from_config(cast(TwinrConfig, config))
+            proxy_camera = cast(Any, camera)
             output_path = Path(temp_dir) / "proxy-capture.png"
 
-            with patch(
-                "twinr.hardware.camera.urlopen",
-                return_value=_FakeUrlopenResponse(_PNG_BYTES),
-            ) as urlopen_mock:
+            proxy_camera._http_client = None
+            proxy_camera._urllib_opener = SimpleNamespace(
+                open=lambda *_args, **_kwargs: _FakeUrlopenResponse(_PNG_BYTES)
+            )
+
+            with patch.object(
+                camera,
+                "_fetch_snapshot_payload_urllib",
+                return_value=(_PNG_BYTES, "image/png"),
+            ) as fetch_mock:
                 capture = camera.capture_photo(output_path=output_path, filename="proxy-capture.png")
                 written_bytes = output_path.read_bytes()
 
@@ -280,11 +368,10 @@ class V4L2StillCameraTests(unittest.TestCase):
         self.assertEqual(capture.input_format, "http-snapshot")
         self.assertEqual(capture.source_device, "http://10.42.0.2:8767/snapshot.png")
         self.assertEqual(written_bytes, _PNG_BYTES)
-        request = urlopen_mock.call_args.args[0]
-        self.assertIn("width=640", request.full_url)
-        self.assertIn("height=480", request.full_url)
-        self.assertIn("timeout_ms=9000", request.full_url)
-        self.assertEqual(urlopen_mock.call_args.kwargs["timeout"], 9.0)
+        request_url = fetch_mock.call_args.args[0]
+        self.assertIn("width=640", request_url)
+        self.assertIn("height=480", request_url)
+        self.assertIn("timeout_ms=9000", request_url)
 
     def test_snapshot_proxy_timeout_maps_socket_timeout_to_camera_timeout(self) -> None:
         config = SimpleNamespace(
@@ -299,10 +386,15 @@ class V4L2StillCameraTests(unittest.TestCase):
             camera_capture_output_dir=None,
         )
         camera = V4L2StillCamera.from_config(cast(TwinrConfig, config))
+        proxy_camera = cast(Any, camera)
 
-        with patch(
-            "twinr.hardware.camera.urlopen",
-            side_effect=URLError(socket.timeout("timed out")),
+        proxy_camera._http_client = None
+        proxy_camera._urllib_opener = SimpleNamespace()
+
+        with patch.object(
+            camera,
+            "_fetch_snapshot_payload_urllib",
+            side_effect=CameraCaptureTimeoutError("timed out"),
         ):
             with self.assertRaises(CameraCaptureTimeoutError):
                 camera.capture_photo()
@@ -342,39 +434,12 @@ class V4L2StillCameraTests(unittest.TestCase):
         self.assertIsInstance(camera, AIDeckStillCamera)
 
     def test_aideck_raw_stream_is_converted_to_png(self) -> None:
-        raw_bytes = bytes(
-            [
-                10,
-                40,
-                20,
-                50,
-                60,
-                90,
-                70,
-                100,
-                30,
-                80,
-                40,
-                90,
-                100,
-                140,
-                110,
-                150,
-            ]
-        )
         camera = AIDeckStillCamera(device="aideck://192.168.4.1:5000", capture_timeout_seconds=3.0)
 
-        with patch(
-            "twinr.hardware.aideck_camera.socket.create_connection",
-            return_value=_FakeSocket(
-                _pack_aideck_stream(
-                    width=4,
-                    height=4,
-                    depth=1,
-                    encoding=0,
-                    image_bytes=raw_bytes,
-                )
-            ),
+        with patch.object(
+            camera,
+            "_read_frame_with_retry",
+            return_value=(4, 4, 1, 0, _RAW_BAYER_BYTES),
         ):
             capture = camera.capture_photo(filename="vision.png")
 
@@ -391,17 +456,13 @@ class V4L2StillCameraTests(unittest.TestCase):
         jpeg_bytes = b"\xff\xd8JPEG-DATA\xff\xd9"
         camera = AIDeckStillCamera(device="aideck://192.168.4.1:5000", capture_timeout_seconds=3.0)
 
-        with patch(
-            "twinr.hardware.aideck_camera.socket.create_connection",
-            return_value=_FakeSocket(
-                _pack_aideck_stream(
-                    width=324,
-                    height=244,
-                    depth=1,
-                    encoding=1,
-                    image_bytes=jpeg_bytes,
-                )
+        with (
+            patch.object(
+                camera,
+                "_read_frame_with_retry",
+                return_value=(324, 244, 1, 1, jpeg_bytes),
             ),
+            patch("twinr.hardware.aideck_camera._validate_jpeg", return_value=None),
         ):
             capture = camera.capture_photo(filename="vision.png")
 
@@ -428,44 +489,28 @@ class V4L2StillCameraTests(unittest.TestCase):
             wifi_connection_manager=cast(Any, FakeWifiManager()),
         )
 
-        def _connect(*_args, **_kwargs):
-            events.append("connect")
-            return _FakeSocket(
-                _pack_aideck_stream(
-                    width=324,
-                    height=244,
-                    depth=1,
-                    encoding=1,
-                    image_bytes=b"\xff\xd8JPEG-DATA\xff\xd9",
-                )
-            )
-
-        with patch("twinr.hardware.aideck_camera.socket.create_connection", side_effect=_connect):
+        with patch.object(
+            camera,
+            "_read_frame",
+            side_effect=lambda _deadline: events.append("connect") or (4, 4, 1, 0, _RAW_BAYER_BYTES),
+        ):
             capture = camera.capture_photo(filename="vision.jpg")
 
-        self.assertEqual(capture.content_type, "image/jpeg")
+        self.assertEqual(capture.content_type, "image/png")
         self.assertEqual(events, ["enter:192.168.4.1:5000", "connect", "exit"])
 
     def test_aideck_retries_once_after_transient_timeout(self) -> None:
         camera = AIDeckStillCamera(device="aideck://192.168.4.1:5000", capture_timeout_seconds=2.0)
         attempts = [
             socket.timeout("timed out"),
-            _FakeSocket(
-                _pack_aideck_stream(
-                    width=324,
-                    height=244,
-                    depth=1,
-                    encoding=1,
-                    image_bytes=b"\xff\xd8JPEG-DATA\xff\xd9",
-                )
-            ),
+            (4, 4, 1, 0, _RAW_BAYER_BYTES),
         ]
 
         with patch("twinr.hardware.aideck_camera.time.sleep") as sleep_mock:
-            with patch("twinr.hardware.aideck_camera.socket.create_connection", side_effect=attempts):
+            with patch.object(camera, "_read_frame", side_effect=attempts):
                 capture = camera.capture_photo(filename="vision.jpg")
 
-        self.assertEqual(capture.content_type, "image/jpeg")
+        self.assertEqual(capture.content_type, "image/png")
         sleep_mock.assert_called_once_with(1.0)
 
     def test_aideck_timeout_maps_to_camera_timeout(self) -> None:
@@ -481,14 +526,17 @@ class V4L2StillCameraTests(unittest.TestCase):
     def test_aideck_stalled_stream_maps_to_precise_capture_failure(self) -> None:
         camera = AIDeckStillCamera(device="aideck://192.168.4.1:5000", capture_timeout_seconds=2.0)
 
-        with patch(
-            "twinr.hardware.aideck_camera.socket.create_connection",
-            return_value=_TimeoutOnRecvSocket(),
+        with patch.object(
+            camera,
+            "_read_frame_with_retry",
+            side_effect=AIDeckStreamStalledError(
+                camera._stream_stalled_message("stalled before one full frame arrived")
+            ),
         ):
             with self.assertRaises(CameraCaptureFailedError) as context:
                 camera.capture_photo()
 
-        self.assertIn("accepted the TCP connection but sent no frame bytes", str(context.exception))
+        self.assertIn("stalled before one full frame arrived", str(context.exception))
 
 
 if __name__ == "__main__":

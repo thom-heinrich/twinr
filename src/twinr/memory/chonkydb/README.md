@@ -11,6 +11,7 @@ used by Twinr's long-term memory flows.
 - keep that client on a pooled, redirect-fail-closed transport so repeated Pi memory reads/writes do not pay a fresh DNS/TLS setup every call
 - preserve HTTP error metadata such as `Retry-After` on `ChonkyDBError`, so higher storage layers can treat transient `429 queue_saturated` write pressure as bounded retryable backend overload instead of a generic opaque failure
 - keep `ChonkyDBError` compatible with normal Python exception chaining and traceback reassignment, so readiness/probe context managers surface the real backend failure instead of masking it with a secondary runtime error
+- preserve any Twinr-imposed explicit read-timeout cap across `clone_with_timeout(...)`, so upper storage/prompt layers can keep hot-path remote reads fail-closed even when a lower helper clones the client again
 - define typed request and response models for record, retrieve, and graph endpoints
 - expose typed `graph/store_many` requests so Twinr can persist versioned graph generations without falling back to whole-graph snapshot blobs
 - expose a one-shot `topk_records` retrieval contract that returns structured payloads from ChonkyDB in a single roundtrip
@@ -23,6 +24,8 @@ used by Twinr's long-term memory flows.
 - persist the personal graph as graph-native topology generations plus fine-grained `graph_nodes` / `graph_edges` current-view heads instead of mirroring one whole-graph snapshot blob
 - validate that a claimed remote graph current view is actually hydratable before treating it as healthy, and when a local graph cache exists repair broken `graph_nodes` / `graph_edges` current-view documents by rewriting the generation instead of silently trusting stale same-URI records
 - carry a bounded `selection_projection` on `graph_nodes` / `graph_edges` catalog entries and hydrate current-view reads from that projection before exact item-document fetches, because live `documents/full` responses can resolve the origin lookup without returning a usable payload body
+- carry a bounded enriched `search_text` on projection-only `graph_nodes` catalog entries as well, so ambiguous contact-method queries such as `Anna Becker email` still surface the correct person node without reviving the duplicate item-document lane
+- promote owning person nodes into the same bounded seed pool when query-first graph search directly matches a contact-method node, so `Anna Becker email` cannot seed only `email:anna...` plus a distractor `Chris Becker` person hit
 - prefer query-first remote subgraph selection for prompt-context and subtext building by combining current-view search, graph-path expansion, and graph-neighbor expansion before hydrating any node or edge payloads
 - keep query-first remote subgraph selection fresh-reader-safe by falling back to current-head catalog entries plus their `selection_projection` payloads when exact graph item documents lag behind the already visible current head
 - consume a small bounded retry budget around remote `graph_path` and `graph_neighbors` expansion calls so one transient backend `503` does not eject the first turn out of query-first subgraph mode
@@ -31,6 +34,7 @@ used by Twinr's long-term memory flows.
 - support adding and deleting graph-backed contacts, preferences, and plans so discovery corrections can keep structured memory consistent
 - build prompt-context and subtext payloads from persisted graph memory
 - keep final prompt/subtext overlap checks permissive enough for exact short domain tokens such as `tea` or `sms`, so query-first graph selection is not nullified by an over-strict length filter on the last ranking step
+- treat surname-only overlap as insufficient contact identity evidence during `remember_contact(...)` / `lookup_contact(...)`, so a pre-existing `Chris Becker` cannot block or absorb a requested `Anna Becker` write when the given name, role, or contact value disagree
 - probe graph readiness through the current-view heads so required-remote watchdog recovery does not depend on legacy graph snapshot blobs
 - cap readiness-only direct graph current-head probes to a small fail-closed timeout instead of the colder origin-resolution budget, so unhealthy remote memory surfaces quickly and does not drag service shutdown behind a long same-URI head read
 - let fresh-reader bootstrap fall back from a lagging fixed-URI graph head to the already-written small compatibility current-head payload in a strictly read-only way, so cross-process readiness does not reseed or re-promote the whole graph just because direct head visibility lags

@@ -70,7 +70,12 @@ class _RecordingProcessFactory:
         self.processes: list[_FakeProcess] = []
 
     def __call__(self, argv, *, cwd, env):
-        key = "watchdog" if "--watch-remote-memory" in argv else "streaming"
+        if "--watch-remote-memory" in argv:
+            key = "watchdog"
+        elif "--run-display-loop" in argv:
+            key = "display"
+        else:
+            key = "streaming"
         process = _FakeProcess(key)
         self.processes.append(process)
         self.calls.append(
@@ -358,7 +363,7 @@ class RuntimeSupervisorTests(unittest.TestCase):
             "unix:/run/user/1234/pulse/native",
         )
 
-    def test_run_delays_streaming_until_watchdog_startup_grace_expires(self) -> None:
+    def test_run_keeps_streaming_blocked_while_watchdog_is_not_ready(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config = self._build_config(root)
@@ -387,9 +392,38 @@ class RuntimeSupervisorTests(unittest.TestCase):
 
             supervisor.run(duration_s=6.0)
 
-        self.assertEqual([call["key"] for call in factory.calls], ["watchdog", "streaming"])
-        streaming_start = next(call["started_at"] for call in factory.calls if call["key"] == "streaming")
-        self.assertGreaterEqual(streaming_start, 5.0)
+        self.assertEqual([call["key"] for call in factory.calls], ["watchdog"])
+
+    def test_run_starts_display_loop_while_streaming_gate_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self._build_config(root, display_companion_enabled=True)
+            clock = _FakeClock()
+            factory = _RecordingProcessFactory(clock)
+            supervisor = TwinrRuntimeSupervisor(
+                config=config,
+                env_file="/twinr/.env",
+                process_factory=factory,
+                snapshot_store=_FreshSnapshotStore(clock),
+                health_collector=lambda *_args, **_kwargs: _build_health(display_running=True),
+                watchdog_assessor=lambda _config: _build_assessment(
+                    ready=False,
+                    detail="Remote memory watchdog snapshot is missing.",
+                    sample_status=None,
+                    sample_ready=False,
+                    sample_age_s=None,
+                ),
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+                utcnow=clock.utcnow,
+                watchdog_startup_grace_s=5.0,
+                streaming_health_grace_s=999.0,
+                restart_backoff_s=0.0,
+            )
+
+            supervisor.run(duration_s=0.0)
+
+        self.assertEqual([call["key"] for call in factory.calls], ["watchdog", "display"])
 
     def test_run_can_consume_external_watchdog_without_spawning_watchdog_child(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -518,7 +552,7 @@ class RuntimeSupervisorTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual([call["key"] for call in factory.calls], ["streaming"])
 
-    def test_run_delays_streaming_until_external_watchdog_startup_grace_expires(self) -> None:
+    def test_run_keeps_streaming_blocked_while_external_watchdog_is_not_ready(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config = self._build_config(root)
@@ -548,8 +582,7 @@ class RuntimeSupervisorTests(unittest.TestCase):
 
             supervisor.run(duration_s=6.0)
 
-        self.assertEqual([call["key"] for call in factory.calls], ["streaming"])
-        self.assertGreaterEqual(factory.calls[0]["started_at"], 5.0)
+        self.assertEqual(factory.calls, [])
 
     def test_run_attempts_external_watchdog_recovery_when_external_owner_is_dead(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -971,7 +1004,7 @@ class RuntimeSupervisorTests(unittest.TestCase):
         self.assertGreaterEqual(health_call_count, 2)
         self.assertEqual([call["key"] for call in factory.calls].count("streaming"), 1)
 
-    def test_run_waits_for_current_watchdog_startup_progress_before_restarting_stale_artifact(self) -> None:
+    def test_run_keeps_streaming_blocked_while_current_watchdog_startup_progresses(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config = self._build_config(root)
@@ -1003,7 +1036,7 @@ class RuntimeSupervisorTests(unittest.TestCase):
 
             supervisor.run(duration_s=12.0)
 
-        self.assertEqual([call["key"] for call in factory.calls], ["watchdog", "streaming"])
+        self.assertEqual([call["key"] for call in factory.calls], ["watchdog"])
 
     def test_run_waits_for_current_child_to_refresh_runtime_snapshot_before_enforcing_snapshot_health(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1149,7 +1182,7 @@ class RuntimeSupervisorTests(unittest.TestCase):
 
             supervisor.run(duration_s=12.0)
 
-        self.assertEqual([call["key"] for call in factory.calls].count("streaming"), 1)
+        self.assertEqual([call["key"] for call in factory.calls].count("streaming"), 0)
 
     def test_required_remote_error_restarts_streaming_once_watchdog_recovers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

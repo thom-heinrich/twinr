@@ -45,6 +45,14 @@ _HOST_CONTENTION_FAILURE_MARKERS = (
     "without a stable document id",
     "could not be read back",
 )
+_POST_REPAIR_RETRY_BLOCKING_SIGNALS = frozenset(
+    {
+        "public_query_unhealthy",
+        "backend_query_unhealthy",
+        "active_system_conflicts",
+        "active_user_conflicts",
+    }
+)
 
 
 def _parse_optional_int(value: object) -> int | None:
@@ -165,6 +173,32 @@ def _refresh_backend_repair_diagnosis(
         "error": "empty_post_stabilization_diagnosis",
     }
     return None, empty_payload
+
+
+def _post_repair_retry_blocked(
+    diagnosis: Mapping[str, object] | None,
+) -> bool:
+    """Return whether the host is still too noisy to retry after backend repair.
+
+    Backend repair only proves that the dedicated service came back. The retry
+    must still fail closed when the shared-host quiet-hold already broke again
+    or the public/backend query surfaces are unhealthy, otherwise the canary
+    just burns another write attempt into the same contention window.
+    """
+
+    if diagnosis is None:
+        return True
+    if not bool(diagnosis.get("available")):
+        return True
+    raw_signals = diagnosis.get("contention_signals")
+    if not isinstance(raw_signals, list):
+        return False
+    signals = {
+        str(item).strip()
+        for item in raw_signals
+        if str(item).strip()
+    }
+    return bool(signals & _POST_REPAIR_RETRY_BLOCKING_SIGNALS)
 
 
 def diagnose_retention_canary_host_contention(
@@ -370,4 +404,33 @@ def stabilize_retention_canary_host(
         if repair.ok
         else str(repair.diagnosis or result.get("diagnosis") or "").strip()
     )
+    if not repair.ok:
+        return result
+    post_repair_diagnosis = diagnose_retention_canary_host_contention(
+        project_root=resolved_root,
+        probe_timeout_s=probe_timeout_s,
+        ssh_timeout_s=ssh_timeout_s,
+    )
+    result["diagnosis_after_backend_repair"] = post_repair_diagnosis
+    if not _post_repair_retry_blocked(post_repair_diagnosis):
+        return result
+    post_repair_stabilization = stabilize_remote_chonkydb_host(
+        settings=settings,
+        probe_timeout_s=probe_timeout_s,
+        ssh_timeout_s=ssh_timeout_s,
+        settle_s=settle_s,
+    )
+    result["post_repair_stabilization"] = post_repair_stabilization.to_dict()
+    post_repair_diagnosis_after = diagnose_retention_canary_host_contention(
+        project_root=resolved_root,
+        probe_timeout_s=probe_timeout_s,
+        ssh_timeout_s=ssh_timeout_s,
+    )
+    result["diagnosis_after_post_repair_stabilization"] = post_repair_diagnosis_after
+    if (
+        not bool(post_repair_stabilization.ok)
+        or _post_repair_retry_blocked(post_repair_diagnosis_after)
+    ):
+        result["ok"] = False
+        result["diagnosis"] = "post_repair_contention_persisted_after_host_restabilization"
     return result

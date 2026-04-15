@@ -388,7 +388,10 @@ class SemanticRouterTests(unittest.TestCase):
             with mock.patch(
                 "twinr.agent.routing.user_intent_bundle._get_onnxruntime",
                 return_value=fake_ort,
-            ), mock.patch.dict(sys.modules, {"onnxruntime": fake_ort}):
+            ), mock.patch.dict(sys.modules, {"onnxruntime": fake_ort}), mock.patch(
+                "twinr.agent.routing.user_intent_bundle._validate_tokenizer",
+                side_effect=AssertionError("Deferred runtime validation must not load the tokenizer."),
+            ):
                 bundle = load_user_intent_bundle(
                     bundle_dir,
                     eager_runtime_validation=False,
@@ -401,6 +404,17 @@ class SemanticRouterTests(unittest.TestCase):
         self.assertIsNone(bundle.resolved_output_name)
         self.assertEqual(bundle.embedding_dim, 4)
         self.assertEqual(inference_module._PRELOADED_ORT_SESSIONS, {})
+
+    def test_user_intent_bundle_keeps_tokenizer_validation_on_eager_load(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            bundle_dir = _write_user_intent_bundle(Path(temp_dir))
+
+            with mock.patch(
+                "twinr.agent.routing.user_intent_bundle._validate_tokenizer"
+            ) as validate_tokenizer:
+                load_user_intent_bundle(bundle_dir)
+
+        validate_tokenizer.assert_called_once()
 
     def test_local_semantic_router_applies_authority_policy(self) -> None:
         with TemporaryDirectory() as temp_dir:

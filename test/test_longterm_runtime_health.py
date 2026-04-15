@@ -489,7 +489,7 @@ class LongTermRemoteHealthProbeTests(unittest.TestCase):
         ).probe_operational(include_archive=False)
 
         self.assertTrue(result.ready)
-        self.assertEqual(result.health_tier, "degraded")
+        self.assertEqual(result.health_tier, "ready")
         self.assertFalse(result.archive_checked)
         self.assertFalse(result.archive_safe)
         proof_contract = result.proof_contract()

@@ -22,6 +22,7 @@ _MAX_EMAIL_LENGTH = 254
 _MAX_PHONE_LENGTH = 64
 _MAX_EMIT_VALUE_LENGTH = 160
 _MAX_EVENT_METADATA_LENGTH = 512
+_MAX_REVIEW_LIMIT = 32
 
 
 def _ensure_arguments_mapping(arguments: dict[str, object]) -> dict[str, object]:
@@ -118,6 +119,31 @@ def _get_runtime_scalar_attr(obj: object, attr_name: str, *, required: bool = Fa
     if isinstance(raw_value, (str, int, float, bool)):
         return raw_value
     return str(raw_value)
+
+
+def _get_int_argument(
+    arguments: Mapping[str, object],
+    key: str,
+    *,
+    required: bool = False,
+    default: int | None = None,
+    minimum: int = 1,
+    maximum: int = _MAX_REVIEW_LIMIT,
+) -> int | None:
+    # AUDIT-FIX(#11): Validate bounded integer tool arguments up front instead of relying on downstream coercion.
+    raw_value = arguments.get(key)
+    if raw_value is None:
+        if required:
+            raise RuntimeError(f"Cannot continue without `{key}`.")
+        return default
+    if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+        raise RuntimeError(f"Invalid `{key}` value.")
+    value = int(raw_value)
+    if float(raw_value) != float(value):
+        raise RuntimeError(f"Invalid `{key}` value.")
+    if value < minimum or value > maximum:
+        raise RuntimeError(f"`{key}` must be between {minimum} and {maximum}.")
+    return value
 
 
 def _coerce_runtime_iterable(
@@ -283,6 +309,62 @@ def handle_remember_memory(owner: Any, arguments: dict[str, object]) -> dict[str
         "kind": _get_runtime_scalar_attr(entry, "kind", required=True),
         "summary": _get_runtime_text_attr(entry, "summary", required=True),
         "memory_id": _get_runtime_scalar_attr(entry, "entry_id", required=True),
+    }
+
+
+def handle_review_saved_memories(owner: Any, arguments: dict[str, object]) -> dict[str, object]:
+    """Inspect explicit durable memories saved for later turns.
+
+    Args:
+        owner: Tool executor owner exposing runtime access and telemetry hooks.
+        arguments: Tool payload with optional ``kind`` and ``limit`` filters.
+
+    Returns:
+        JSON-safe payload with saved explicit durable memories.
+
+    Raises:
+        SensitiveActionConfirmationRequired: If spoken confirmation is required
+            before revealing saved durable memories.
+        RuntimeError: If arguments are invalid or runtime entries are malformed.
+    """
+
+    arguments = _ensure_arguments_mapping(arguments)
+    kind = _get_text_argument(arguments, "kind", max_length=_MAX_IDENTIFIER_LENGTH)
+    limit = _get_int_argument(arguments, "limit", minimum=1, maximum=_MAX_REVIEW_LIMIT)
+    require_sensitive_voice_confirmation(owner, arguments, action_label="inspect saved durable memories")
+
+    entries = owner.runtime.review_saved_memories(kind=kind, limit=limit)
+    payload = [
+        {
+            "entry_id": _get_runtime_scalar_attr(entry, "entry_id", required=True),
+            "kind": _get_runtime_text_attr(entry, "kind", required=True),
+            "summary": _get_runtime_text_attr(entry, "summary", required=True),
+            "details": _get_runtime_text_attr(entry, "details"),
+            "created_at": _get_runtime_text_attr(entry, "created_at", required=True),
+            "updated_at": _get_runtime_text_attr(entry, "updated_at", required=True),
+        }
+        for entry in _coerce_runtime_iterable(entries, field_name="saved_memories", allow_none=True)
+    ]
+
+    _safe_emit(owner, "saved_memory_review_tool_call", True)
+    _safe_record_event(
+        owner,
+        "saved_memories_reviewed",
+        "Explicit durable memories were inspected.",
+        kind=kind or "",
+        limit=limit if limit is not None else "",
+        memory_count=len(payload),
+    )
+    if not payload:
+        return {
+            "status": "no_saved_memories",
+            "memory_count": 0,
+            "memories": [],
+        }
+    return {
+        "status": "ok",
+        "memory_count": len(payload),
+        "memories": payload,
     }
 
 

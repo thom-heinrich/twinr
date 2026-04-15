@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 import time
 
+from twinr.agent.workflows.forensics import workflow_span
 from twinr.memory.fulltext import FullTextDocument, FullTextSelector
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 
@@ -19,9 +20,8 @@ from .shared import (
     _CachedSearchResult,
     _LEGACY_CATALOG_VERSION,
     _RemoteCollectionDefinition,
+    _segment_ref_supports_uri_only_contract,
 )
-
-_URI_ONLY_SEGMENT_REF_SNAPSHOT_KINDS = frozenset({"graph_edges", "graph_nodes"})
 
 
 class RemoteCatalogCatalogMixin(RemoteCatalogMixinBase):
@@ -147,11 +147,7 @@ class RemoteCatalogCatalogMixin(RemoteCatalogMixinBase):
                     entries=entries,
                     expires_at_monotonic=expires_at_monotonic + ttl_s,
                 )
-                self._local_search_selector_cache[snapshot_kind] = _CachedLocalSearchSelector(
-                    selector=self._build_local_search_selector(entries=entries),
-                    by_item_id={entry.item_id: entry for entry in entries},
-                    expires_at_monotonic=expires_at_monotonic + ttl_s,
-                )
+                self._local_search_selector_cache.pop(snapshot_kind, None)
             if recent_ttl_s > 0.0:
                 self._recent_catalog_entries_cache[snapshot_kind] = _CachedCatalogEntries(
                     entries=entries,
@@ -197,8 +193,28 @@ class RemoteCatalogCatalogMixin(RemoteCatalogMixinBase):
                 return None
             if len(cached.by_item_id) != len(entries):
                 self._local_search_selector_cache.pop(snapshot_kind, None)
-                return None
-            return cached
+            else:
+                return cached
+
+        with workflow_span(
+            name="longterm_remote_catalog_build_local_selector",
+            kind="retrieval",
+            details={
+                "snapshot_kind": str(snapshot_kind or "").strip(),
+                "catalog_entry_count": len(entries),
+            },
+        ):
+            built = _CachedLocalSearchSelector(
+                selector=self._build_local_search_selector(entries=entries),
+                by_item_id={entry.item_id: entry for entry in entries},
+                expires_at_monotonic=time.monotonic() + ttl_s,
+            )
+        with self._cache_lock:
+            cached = self._local_search_selector_cache.get(snapshot_kind)
+            if cached is not None and cached.expires_at_monotonic > time.monotonic() and len(cached.by_item_id) == len(entries):
+                return cached
+            self._local_search_selector_cache[snapshot_kind] = built
+            return built
 
     def _cached_item_payload(self, *, snapshot_kind: str, item_id: str) -> dict[str, object] | None:
         ttl_s = self._persistent_read_cache_ttl_s()
@@ -333,26 +349,31 @@ class RemoteCatalogCatalogMixin(RemoteCatalogMixinBase):
     ) -> bool:
         """Return whether one segmented head is readable for fresh processes.
 
-        Structured current heads (`objects/conflicts/archive/midterm` and the
-        prompt/context collections that share this catalog adapter) hydrate
-        segment payloads through exact-id batch reads. A non-empty head that
-        advertises segment refs without stable `document_id`s is therefore not
-        a supported current contract, even if the schema/version fields look
-        fine. Projection-only graph heads keep their existing URI-first
-        contract because readers can rebuild from the current-head projection.
+        Structured current heads prefer exact-id batch reads for segment docs,
+        but versioned segment URIs that include the immutable token remain
+        strong enough to hydrate directly when the backend omits
+        `document_id` on same-URI `documents/full` responses. Plain unversioned
+        segment URIs still require a stable document id because they are not a
+        specific immutable record selector.
         """
 
         if not isinstance(segments, list):
             return False
-        require_document_id = definition.snapshot_kind not in _URI_ONLY_SEGMENT_REF_SNAPSHOT_KINDS
         for raw_segment in segments:
             if not isinstance(raw_segment, Mapping):
                 return False
             if self._normalize_segment_index(raw_segment.get("segment_index")) is None:
                 return False
-            if not self._normalize_text(raw_segment.get("uri")):
+            uri = self._normalize_text(raw_segment.get("uri"))
+            if not uri:
                 return False
-            if require_document_id and not self._normalize_text(raw_segment.get("document_id")):
+            if (
+                not _segment_ref_supports_uri_only_contract(
+                    snapshot_kind=definition.snapshot_kind,
+                    uri=uri,
+                )
+                and not self._normalize_text(raw_segment.get("document_id"))
+            ):
                 return False
         return True
 
@@ -374,11 +395,14 @@ class RemoteCatalogCatalogMixin(RemoteCatalogMixinBase):
         snapshot_kind: str,
         payload: Mapping[str, object] | None = None,
         bypass_cache: bool = False,
+        fast_fail: bool = False,
+        include_selection_projection: bool = True,
     ) -> tuple[LongTermRemoteCatalogEntry, ...]:
         """Load and normalize the current catalog entries for one collection."""
 
         definition = self._require_definition(snapshot_kind)
-        if payload is None and not bypass_cache:
+        cacheable_read = include_selection_projection
+        if payload is None and not bypass_cache and cacheable_read:
             cached_entries = self._cached_catalog_entries(snapshot_kind=snapshot_kind)
             if cached_entries is not None:
                 return cached_entries
@@ -387,13 +411,22 @@ class RemoteCatalogCatalogMixin(RemoteCatalogMixinBase):
         if not isinstance(payload, Mapping):
             return ()
         if self._is_segmented_catalog_payload(definition=definition, payload=payload):
-            entries = self._load_segmented_catalog_entries(definition=definition, payload=payload)
-            if payload is not None:
+            entries = self._load_segmented_catalog_entries(
+                definition=definition,
+                payload=payload,
+                fast_fail=fast_fail,
+                include_selection_projection=include_selection_projection,
+            )
+            if payload is not None and cacheable_read:
                 self._store_catalog_entries(snapshot_kind=snapshot_kind, entries=entries)
             return entries
         if self._is_legacy_catalog_payload(definition=definition, payload=payload):
-            entries = self._load_legacy_catalog_entries(definition=definition, payload=payload)
-            if payload is not None:
+            entries = self._load_legacy_catalog_entries(
+                definition=definition,
+                payload=payload,
+                include_selection_projection=include_selection_projection,
+            )
+            if payload is not None and cacheable_read:
                 self._store_catalog_entries(snapshot_kind=snapshot_kind, entries=entries)
             return entries
         return ()

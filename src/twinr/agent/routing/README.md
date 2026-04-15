@@ -79,6 +79,10 @@ The live streaming runtime now also defers the optional user-intent ORT
 validation session during idle startup. On the Pi this avoids holding a giant
 validation-only session in `waiting` before the first real transcript; the
 actual ORT model still validates when the shared encoder is first used.
+The same lazy-runtime path now also defers heavyweight user-intent tokenizer
+validation, because loading the large `tokenizer.json` through `tokenizers`
+could otherwise retain a large native heap during idle startup even before the
+first transcript arrives.
 
 ## Usage
 

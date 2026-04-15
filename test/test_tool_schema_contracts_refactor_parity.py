@@ -61,6 +61,7 @@ ALL_TOOL_NAMES = (
     "pause_skill_activation",
     "reactivate_skill_activation",
     "remember_memory",
+    "review_saved_memories",
     "remember_contact",
     "lookup_contact",
     "send_whatsapp_message",
@@ -86,9 +87,9 @@ ALL_TOOL_NAMES = (
 )
 
 _EXPECTED_GOLDEN_DIGESTS = {
-    "canonical": "a136e2537f58f407c519d700dbe30447e6cc276e2b36618749495e8b52ade136",
-    "compact": "e719f9f336f4b1f9629da3851670397b6631f2206221e5632c0037c9650a4706",
-    "realtime": "5fd2587aa63047bc2b1c2809b4a8a3151e85039be88bf21754b9e285b6b18362",
+    "canonical": "5b72418747e9685c47d0c483c0071cac9efd8c80e89efbcbd74b27256ba5a3a5",
+    "compact": "27497a6e7963befbefebf80ee7c7174e7b36c6828d73a8091ac8bb141a685f34",
+    "realtime": "dd458c9a248a38ee4821d4e5e477cc1d8e53eb837e86c866ff5a86979efa25d5",
 }
 
 _EXPECTED_TIME_RULES = [

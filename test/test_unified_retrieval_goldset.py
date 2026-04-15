@@ -9,6 +9,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent import TwinrConfig
+from twinr.memory.chonkydb.personal_graph import TwinrGraphContactOption, TwinrGraphWriteResult
 from twinr.memory.longterm.evaluation._unified_retrieval_shared import (
     UnifiedRetrievalGoldsetCase,
     UnifiedRetrievalGoldsetCaseResult,
@@ -19,6 +20,7 @@ from twinr.memory.longterm.evaluation._unified_retrieval_shared import (
     unified_retrieval_case_summary,
     wait_for_unified_retrieval_cases,
 )
+from twinr.memory.longterm.evaluation.eval import _seed_contacts
 from twinr.memory.longterm.runtime.service import LongTermMemoryService
 
 
@@ -117,6 +119,59 @@ class UnifiedRetrievalGoldsetSharedTests(unittest.TestCase):
         self.assertEqual(total_cases, 2)
         self.assertEqual(passed_cases, 2, failed_case_ids)
         self.assertFalse(failed_case_ids)
+
+    def test_mixed_graph_seed_creates_anna_becker_after_existing_becker_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            (project_root / "personality").mkdir(parents=True, exist_ok=True)
+            service = LongTermMemoryService.from_config(_config(temp_dir))
+            try:
+                _seed_contacts(service.graph_store)
+                seed_unified_retrieval_fixture(service)
+                lookup = service.graph_store.lookup_contact(
+                    name="Anna",
+                    family_name="Becker",
+                    role="Daughter",
+                )
+            finally:
+                service.shutdown(timeout_s=30.0)
+
+        self.assertEqual(lookup.status, "found")
+        assert lookup.match is not None
+        self.assertEqual(lookup.match.label, "Anna Becker")
+        self.assertEqual(lookup.match.emails, ("anna.becker@example.com",))
+
+    def test_seed_fixture_fails_closed_when_graph_contact_seed_needs_clarification(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            (project_root / "personality").mkdir(parents=True, exist_ok=True)
+            service = LongTermMemoryService.from_config(_config(temp_dir))
+            original_remember_contact = service.graph_store.remember_contact
+
+            def _side_effect(*args, **kwargs):
+                if kwargs.get("given_name") == "Anna" and kwargs.get("family_name") == "Becker":
+                    return TwinrGraphWriteResult(
+                        status="needs_clarification",
+                        label="Anna",
+                        node_id="",
+                        question="Did you mean Chris Becker?",
+                        options=(
+                            TwinrGraphContactOption(
+                                person_node_id="person:chris_becker",
+                                label="Chris Becker",
+                                role="Physiotherapist",
+                                emails=("chris.becker@example.com",),
+                            ),
+                        ),
+                    )
+                return original_remember_contact(*args, **kwargs)
+
+            try:
+                with patch.object(service.graph_store, "remember_contact", side_effect=_side_effect):
+                    with self.assertRaisesRegex(RuntimeError, "Anna Becker"):
+                        seed_unified_retrieval_fixture(service)
+            finally:
+                service.shutdown(timeout_s=30.0)
 
     def test_wait_for_unified_retrieval_cases_reruns_only_pending_cases(self) -> None:
         cases = (

@@ -62,6 +62,7 @@ _CONVERSATION_LAB_TOOL_NAMES: tuple[str, ...] = (
     "update_sensor_automation",
     "delete_automation",
     "remember_memory",
+    "review_saved_memories",
     "remember_contact",
     "lookup_contact",
     "get_memory_conflicts",

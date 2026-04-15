@@ -26,7 +26,7 @@ class TwinrConfigTests(unittest.TestCase):
 
             config = TwinrConfig.from_env(env_path)
 
-        self.assertEqual(config.openai_search_model, "gpt-5.4-mini")
+        self.assertEqual(config.openai_search_model, "gpt-4o-mini-search-preview")
         self.assertEqual(config.openai_search_max_output_tokens, 1024)
         self.assertEqual(config.openai_search_retry_max_output_tokens, 1536)
         self.assertEqual(config.streaming_first_word_model, "gpt-5.4-mini")
@@ -39,11 +39,12 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.streaming_final_lane_watchdog_timeout_ms, 4000)
         self.assertEqual(config.streaming_final_lane_hard_timeout_ms, 15000)
         self.assertEqual(config.streaming_search_final_lane_watchdog_timeout_ms, 6000)
-        self.assertEqual(config.streaming_search_final_lane_hard_timeout_ms, 30000)
+        self.assertEqual(config.streaming_search_final_lane_hard_timeout_ms, 90000)
         self.assertEqual(config.streaming_supervisor_model, "gpt-5.4-mini")
         self.assertEqual(config.streaming_supervisor_max_output_tokens, 80)
         self.assertEqual(config.streaming_supervisor_prefetch_min_chars, 8)
         self.assertEqual(config.streaming_supervisor_prefetch_wait_ms, 80)
+        self.assertEqual(config.streaming_supervisor_prefetch_hard_timeout_ms, 2000)
         self.assertEqual(config.streaming_specialist_model, "gpt-5.4-mini")
         self.assertEqual(config.streaming_specialist_reasoning_effort, "low")
         self.assertEqual(config.local_semantic_router_mode, "off")
@@ -193,6 +194,11 @@ class TwinrConfigTests(unittest.TestCase):
                 ):
                     TwinrConfig(proactive_vision_provider=provider_name)
 
+    def test_direct_config_normalizes_legacy_local_first_camera_provider_alias(self) -> None:
+        config = TwinrConfig(proactive_vision_provider="local_first")
+
+        self.assertEqual(config.proactive_vision_provider, "local")
+
     def test_from_env_aideck_camera_defaults_to_aideck_openai_provider(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
@@ -260,7 +266,7 @@ class TwinrConfigTests(unittest.TestCase):
             config = TwinrConfig.from_env(env_path)
 
         self.assertEqual(config.default_model, "gpt-5.4-mini")
-        self.assertEqual(config.openai_search_model, "gpt-5.4-mini")
+        self.assertEqual(config.openai_search_model, "gpt-4o-mini-search-preview")
         self.assertEqual(config.streaming_first_word_model, "gpt-5.4-mini")
         self.assertEqual(config.streaming_supervisor_model, "gpt-5.4-mini")
         self.assertEqual(config.streaming_specialist_model, "gpt-5.4-mini")
@@ -351,6 +357,8 @@ class TwinrConfigTests(unittest.TestCase):
                     [
                         "TWINR_DISPLAY_FACE_CUE_PATH=state/custom/face.json",
                         "TWINR_DISPLAY_FACE_CUE_TTL_S=7.5",
+                        "TWINR_DISPLAY_WAKE_CUE_PATH=state/custom/wake.json",
+                        "TWINR_DISPLAY_WAKE_CUE_TTL_S=5.5",
                         "TWINR_DISPLAY_ATTENTION_REFRESH_INTERVAL_S=1.4",
                         "TWINR_DISPLAY_ATTENTION_SESSION_FOCUS_HOLD_S=5.25",
                     ]
@@ -363,6 +371,8 @@ class TwinrConfigTests(unittest.TestCase):
 
         self.assertEqual(config.display_face_cue_path, "state/custom/face.json")
         self.assertEqual(config.display_face_cue_ttl_s, 7.5)
+        self.assertEqual(config.display_wake_cue_path, "state/custom/wake.json")
+        self.assertEqual(config.display_wake_cue_ttl_s, 5.5)
         self.assertEqual(config.display_attention_refresh_interval_s, 1.4)
         self.assertEqual(config.display_attention_session_focus_hold_s, 5.25)
 
@@ -402,6 +412,7 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_ATTENTION_SERVO_REST_MAX_JERK_US_PER_S3=420.0",
                         "TWINR_ATTENTION_SERVO_MIN_COMMAND_DELTA_US=9",
                         "TWINR_ATTENTION_SERVO_VISIBLE_RETARGET_TOLERANCE_US=44",
+                        "TWINR_ATTENTION_SERVO_VISIBLE_RETARGET_COOLDOWN_S=0.35",
                         "TWINR_ATTENTION_SERVO_SOFT_LIMIT_MARGIN_US=55",
                         "TWINR_ATTENTION_SERVO_IDLE_RELEASE_S=1.4",
                         "TWINR_ATTENTION_SERVO_SETTLED_RELEASE_S=0.7",
@@ -459,6 +470,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.attention_servo_rest_max_jerk_us_per_s3, 420.0)
         self.assertEqual(config.attention_servo_min_command_delta_us, 9)
         self.assertEqual(config.attention_servo_visible_retarget_tolerance_us, 44)
+        self.assertEqual(config.attention_servo_visible_retarget_cooldown_s, 0.35)
         self.assertEqual(config.attention_servo_soft_limit_margin_us, 55)
         self.assertEqual(config.attention_servo_idle_release_s, 1.4)
         self.assertEqual(config.attention_servo_settled_release_s, 0.7)
@@ -1160,6 +1172,7 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_LONG_TERM_MEMORY_REMOTE_WRITE_TIMEOUT_S=11.5",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_KEEPALIVE_INTERVAL_S=2.25",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_INTERVAL_S=1.5",
+                        "TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_PROBE_MODE=current_only",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_PROBE_TIMEOUT_S=22.5",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_STARTUP_PROBE_TIMEOUT_S=48.0",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_HISTORY_LIMIT=7200",
@@ -1494,6 +1507,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.long_term_memory_remote_write_timeout_s, 11.5)
         self.assertEqual(config.long_term_memory_remote_keepalive_interval_s, 2.25)
         self.assertEqual(config.long_term_memory_remote_watchdog_interval_s, 1.5)
+        self.assertEqual(config.long_term_memory_remote_watchdog_probe_mode, "current_only")
         self.assertEqual(config.long_term_memory_remote_watchdog_probe_timeout_s, 22.5)
         self.assertEqual(config.long_term_memory_remote_watchdog_startup_probe_timeout_s, 48.0)
         self.assertEqual(config.long_term_memory_remote_watchdog_history_limit, 7200)
@@ -1673,8 +1687,9 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.long_term_memory_remote_write_timeout_s, 15.0)
         self.assertEqual(config.long_term_memory_remote_keepalive_interval_s, 5.0)
         self.assertEqual(config.long_term_memory_remote_watchdog_interval_s, 1.0)
+        self.assertEqual(config.long_term_memory_remote_watchdog_probe_mode, "auto")
         self.assertEqual(config.long_term_memory_remote_watchdog_probe_timeout_s, 15.0)
-        self.assertEqual(config.long_term_memory_remote_watchdog_startup_probe_timeout_s, 45.0)
+        self.assertEqual(config.long_term_memory_remote_watchdog_startup_probe_timeout_s, 180.0)
         self.assertEqual(config.long_term_memory_remote_watchdog_history_limit, 3600)
         self.assertEqual(config.long_term_memory_remote_retry_attempts, 3)
         self.assertEqual(config.long_term_memory_remote_retry_backoff_s, 1.0)
@@ -1795,6 +1810,7 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_STREAMING_SEARCH_FINAL_LANE_HARD_TIMEOUT_MS=28000",
                         "TWINR_STREAMING_SUPERVISOR_MODEL=gpt-4o-mini",
                         "TWINR_STREAMING_SUPERVISOR_REASONING_EFFORT=low",
+                        "TWINR_STREAMING_SUPERVISOR_PREFETCH_HARD_TIMEOUT_MS=1800",
                         "TWINR_STREAMING_SPECIALIST_MODEL=gpt-5.2-chat-latest",
                         "TWINR_STREAMING_SPECIALIST_REASONING_EFFORT=medium",
                     ]
@@ -1821,6 +1837,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.streaming_search_final_lane_hard_timeout_ms, 28000)
         self.assertEqual(config.streaming_supervisor_model, "gpt-4o-mini")
         self.assertEqual(config.streaming_supervisor_reasoning_effort, "low")
+        self.assertEqual(config.streaming_supervisor_prefetch_hard_timeout_ms, 1800)
         self.assertEqual(config.streaming_specialist_model, "gpt-5.2-chat-latest")
         self.assertEqual(config.streaming_specialist_reasoning_effort, "medium")
 

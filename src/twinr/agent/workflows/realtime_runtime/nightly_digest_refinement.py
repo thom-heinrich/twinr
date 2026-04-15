@@ -413,30 +413,34 @@ def build_nightly_digest_refinement(
         candidate_sources=candidate_news_sources,
         limit=source_limit,
     )
-    new_insights = _compose_lines(
-        compose,
-        prompt=_insight_lines_prompt(
-            language=language,
-            target_day_text=target_day_text,
-            raw_new_insights=raw_new_insights,
+    new_insights = _bounded_lines(raw_new_insights, limit=insight_limit, max_len=_MAX_LINE)
+    if new_insights:
+        new_insights = _compose_lines(
+            compose,
+            prompt=_insight_lines_prompt(
+                language=language,
+                target_day_text=target_day_text,
+                raw_new_insights=raw_new_insights,
+                limit=insight_limit,
+            ),
             limit=insight_limit,
-        ),
-        limit=insight_limit,
-        max_len=max(180, insight_limit * 140),
-    ) or _bounded_lines(raw_new_insights, limit=insight_limit, max_len=_MAX_LINE)
-    continuity_shifts = _compose_lines(
-        compose,
-        prompt=_continuity_lines_prompt(
-            language=language,
-            target_day_text=target_day_text,
-            location_hint=location_hint,
-            raw_continuity_shifts=raw_continuity_shifts,
-            raw_headline_lines=headline_lines,
+            max_len=max(180, insight_limit * 140),
+        ) or new_insights
+    continuity_shifts = _bounded_lines(raw_continuity_shifts, limit=continuity_limit, max_len=_MAX_LINE)
+    if continuity_shifts:
+        continuity_shifts = _compose_lines(
+            compose,
+            prompt=_continuity_lines_prompt(
+                language=language,
+                target_day_text=target_day_text,
+                location_hint=location_hint,
+                raw_continuity_shifts=raw_continuity_shifts,
+                raw_headline_lines=headline_lines,
+                limit=continuity_limit,
+            ),
             limit=continuity_limit,
-        ),
-        limit=continuity_limit,
-        max_len=max(200, continuity_limit * 150),
-    ) or _bounded_lines(raw_continuity_shifts, limit=continuity_limit, max_len=_MAX_LINE)
+            max_len=max(200, continuity_limit * 150),
+        ) or continuity_shifts
     return NightlyDigestRefinement(
         headline_lines=_bounded_lines(headline_lines, limit=headline_limit, max_len=_MAX_LINE),
         live_news_summary=_bounded_optional_text(news_summary, max_len=_MAX_SUMMARY),

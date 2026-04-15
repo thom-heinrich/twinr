@@ -7,6 +7,7 @@
 # SEC-2: Disabled websocket compression and User-Agent fingerprinting by default, added outbound size limits, and enforced event/tool budgets for Pi-safe operation.
 # IMP-1: arun_turn now prefers the native websockets asyncio client instead of always hopping through a worker thread.
 # IMP-2: Added schema-first execution budgets plus optional handler context kwargs (call_id/tool_name/turn_request_id/deadline_monotonic/timeout_seconds).
+# IMP-3: The transport event stream now exposes `request_prepared` so probe tooling can separate local request-build time from the real websocket handshake.
 
 """Run websocket turns against a remote Twinr orchestrator.
 
@@ -220,11 +221,43 @@ class OrchestratorWebSocketClient:
                 on_ack=_threadsafe_ack if on_ack is not None else None,
             )
 
+        await self._emit_transport_event_async(
+            on_transport_event,
+            "request_prepare_tool_handlers",
+            handler_count=len(handlers),
+        )
         headers = self._build_headers()
+        await self._emit_transport_event_async(
+            on_transport_event,
+            "request_prepare_headers",
+            has_headers=headers is not None,
+        )
         connector_kwargs = self._build_connector_kwargs(self._async_connector, headers=headers)
+        await self._emit_transport_event_async(
+            on_transport_event,
+            "request_prepare_connector_kwargs",
+            kwarg_count=len(connector_kwargs),
+        )
         deadline = self._compute_deadline()
+        await self._emit_transport_event_async(
+            on_transport_event,
+            "request_prepare_deadline",
+            bounded=deadline is not None,
+        )
         request_payload = self._build_request_payload(request)
         expected_request_id = self._extract_expected_request_id(request_payload)
+        await self._emit_transport_event_async(
+            on_transport_event,
+            "request_prepare_payload",
+            request_id=expected_request_id or None,
+            conversation_messages=len(request.conversation),
+            supervisor_messages=len(request.supervisor_conversation),
+        )
+        await self._emit_transport_event_async(
+            on_transport_event,
+            "request_prepared",
+            request_id=expected_request_id or None,
+        )
         ack_records: deque[tuple[OrchestratorAckEvent, int]] = deque()
         ack_buffer_bytes = 0
         streamed_text_bytes = 0
@@ -359,11 +392,43 @@ class OrchestratorWebSocketClient:
         """Run one blocking websocket turn against the orchestrator server."""
 
         handlers = self._snapshot_tool_handlers(tool_handlers)
+        self._emit_transport_event_blocking(
+            on_transport_event,
+            "request_prepare_tool_handlers",
+            handler_count=len(handlers),
+        )
         headers = self._build_headers()
+        self._emit_transport_event_blocking(
+            on_transport_event,
+            "request_prepare_headers",
+            has_headers=headers is not None,
+        )
         connector_kwargs = self._build_connector_kwargs(self._connector, headers=headers)
+        self._emit_transport_event_blocking(
+            on_transport_event,
+            "request_prepare_connector_kwargs",
+            kwarg_count=len(connector_kwargs),
+        )
         deadline = self._compute_deadline()
+        self._emit_transport_event_blocking(
+            on_transport_event,
+            "request_prepare_deadline",
+            bounded=deadline is not None,
+        )
         request_payload = self._build_request_payload(request)
         expected_request_id = self._extract_expected_request_id(request_payload)
+        self._emit_transport_event_blocking(
+            on_transport_event,
+            "request_prepare_payload",
+            request_id=expected_request_id or None,
+            conversation_messages=len(request.conversation),
+            supervisor_messages=len(request.supervisor_conversation),
+        )
+        self._emit_transport_event_blocking(
+            on_transport_event,
+            "request_prepared",
+            request_id=expected_request_id or None,
+        )
         ack_records: deque[tuple[OrchestratorAckEvent, int]] = deque()
         ack_buffer_bytes = 0
         streamed_text_bytes = 0

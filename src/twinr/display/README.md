@@ -24,6 +24,9 @@ fallback backend, and the legacy Waveshare 4.2 V2 panel adapter.
   `state_fields`, headline, and health verdict so "display says ERROR" can be
   proven from exactly what the panel rendered instead of inferred from separate
   runtime/health stores
+- expose one shared fail-closed visible-state assessment from that rendered
+  artifact so probes and ops surfaces return `proved`, `unknown`, or `drift`
+  instead of reconstructing panel truth from heartbeat/service liveness
 - append one central operator-status transition event with before/after state
   and bounded decision reasons into the shared ops event stream so recurring
   `ok`/`warn`/`error` flapping can be proven from one authoritative history
@@ -45,6 +48,9 @@ fallback backend, and the legacy Waveshare 4.2 V2 panel adapter.
 - allow optional external face-expression cues on HDMI so other Twinr
   capabilities can steer gaze, brows, mouth, or tiny head drift without
   coupling those semantics into the generic runtime snapshot schema
+- persist and load optional speculative HDMI wake cues so the authoritative
+  remote wake path can flip the fullscreen background dark blue immediately
+  without mutating the runtime status into speculative `listening`
 - persist and load optional HDMI header debug signals so operator-only camera
   and fusion states such as `MOTION_STILL`, `POSE_UPRIGHT`, or
   `POSSIBLE_FALL` can appear in one bounded top-lane without leaking those
@@ -106,6 +112,10 @@ fallback backend, and the legacy Waveshare 4.2 V2 panel adapter.
   large-type operator UI that stays readable on the Pi monitor
 - keep an HDMI framebuffer fallback backend for Pi setups that do not expose a
   usable Wayland session
+- expose one display-loop wakeup signal path so speculative wake cues can
+  interrupt either the in-process companion thread or the standalone
+  supervisor-owned display-loop process instead of waiting for the next poll
+  window
 - run the optional companion display loop beside hardware/runtime loops
 
 `display` does **not** own:
@@ -117,13 +127,37 @@ The generated Waveshare vendor files should live under `state/display/vendor/`
 on the Pi so runtime deploy syncs do not wipe the driver package. The
 authoritative display heartbeat lives separately under
 `artifacts/stores/ops/display_heartbeat.json` so the unprivileged runtime can
-always refresh it even when the vendor directory is root-owned.
+always refresh it even when the vendor directory is root-owned. Like the other
+shared ops JSON artifacts, it stays operator-readable across Pi runtime users
+instead of falling back to a root-only file mode contract. Heartbeat writes
+must set that operator-readable mode before the atomic replace and surface mode
+write failures instead of silently swallowing them. When systemd
+`RuntimeDirectory=` is present, the canonical heartbeat lives on that tmpfs
+path, but the same serialized payload must still be mirrored to the legacy
+project-root artifact during rollout so mixed-version ops checks keep seeing a
+fresh `0644` heartbeat instead of a stale owner-only file.
 The last successfully rendered bounded display state now also lives under
 `artifacts/stores/ops/display_render_state.json`; that artifact mirrors the
 actual `state_fields`, computed `health.status`, and normalized operator-status
 reason payload used for the last successful frame so operator claims like
 "the display says ERROR" can be checked against a single authoritative
-display-side record.
+display-side record. Like the heartbeat artifact, the rendered-state file now
+stays operator-readable (`0644`) inside the otherwise protected ops directory
+so Pi acceptance probes can fail closed on the same fresh visible-state record
+the productive runtime writes. Heartbeat remains a liveness/progress signal
+only; visible-content claims must come from `display_render_state.json` or
+return `unknown`/`drift`.
+
+The speculative remote wake tint now lives in a separate display-only artifact
+under `artifacts/stores/ops/display_wake_cue.json`. The runtime still owns the
+canonical `waiting -> listening` transition; the wake cue only lets HDMI
+surfaces turn dark blue immediately when the remote transcript-first path has a
+credible stage-one wake candidate. `service.py` loads that cue opportunistically,
+folds it into render and telemetry signatures, and keeps the normal black
+background once the cue expires or is cleared. `companion_signals.py` lets the
+runtime nudge either the in-process companion thread or the standalone
+`--run-display-loop` process out of idle sleep immediately after writing or
+clearing that cue so the Pi does not wait for the next idle poll slot.
 
 For the Waveshare default face layout, Twinr keeps the `waiting` state static
 instead of animating it on a timer. That idle motion produced unnecessary
@@ -159,6 +193,15 @@ caller, GPIO snapshots, and throttling state so the first live stall can be
 proven directly from `journalctl` without stopping Twinr for the standalone
 probe script.
 
+On `hdmi_wayland`, the same opt-in trace flag now emits one bounded
+`display_trace=render_path ...` summary for each real status render and appends
+one `display_render_trace` ops event carrying the precise subphase boundaries
+for `snapshot.updated_at -> show_status() -> render_status_image() ->
+show_image() -> processEvents() -> internal_present`. That gives Pi probes one
+authoritative place to separate display-loop pickup delay from the Qt/Wayland
+render path instead of blaming the whole ~0.5 s block on one coarse
+`native_window_frame_presented` marker.
+
 For HDMI emoji cues, the runtime expects a real system emoji font. On Ubuntu
 Pi images that means `fonts-noto-color-emoji`, which provides
 `/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf`. When the font is missing
@@ -177,11 +220,16 @@ That path gives Twinr ownership of the visible fullscreen surface. Keep
 `hdmi_fbdev` only as a fallback for framebuffer-only environments where no
 usable Wayland session exists.
 
-The productive display companion does not start on every `/twinr` host by
+The productive display surface does not start on every `/twinr` host by
 default. Automatic startup remains limited to authoritative `/twinr` launches
 on real Raspberry Pi hosts so generic servers do not suddenly lose a monitor to
-the Twinr face. When an operator intentionally wants the visible companion on a
-different authoritative host, set:
+the Twinr face. Automatic startup is also fail-closed for productive
+`hdmi_wayland` voice runtimes because April 7, 2026 Pi evidence matched the
+documented QRasterWindow RSS-retention path and stalled live voice turns.
+That unsafe runtime combination therefore stays disabled by default unless an
+authoritative runtime explicitly opts the visible surface back in. When an
+operator intentionally wants the visible companion on an authoritative host,
+set:
 
 ```dotenv
 TWINR_DISPLAY_COMPANION_ENABLED=true
@@ -215,6 +263,10 @@ as `LOOKING_CONFIRMED`, `LOOKING_PROXY`, `HAND_NEAR`, `PERSON_1`,
 `POSE_UPRIGHT`, `MOTION_STILL`, `ATTENTION_WINDOW`, or `POSSIBLE_FALL`, but
 they must stay bounded to two rows with overflow compaction instead of
 turning the senior-facing header into an operator dashboard.
+The backing artifact at `artifacts/stores/ops/display_debug_signals.json`
+must stay operator-readable across Pi runtime users, matching the shared
+display heartbeat contract instead of silently landing owner-only after atomic
+replace.
 
 On larger HDMI outputs such as 1920x1080, the same rule still applies: do not
 let that free right-hand reserve turn into random chrome. Keep the content
@@ -345,7 +397,14 @@ the underlying Wayland/Qt retention path is removed completely. The same
 backend now also suppresses periodic default-layout repaint churn from footer
 clock and ticker-only changes, because Pi evidence after the animation fix
 still showed anonymous RSS rising across otherwise semantic-noop minute/ticker
-rerenders.
+rerenders. Pi evidence on 7 April 2026 then showed that operator/background
+overlay churn still retriggered fullscreen rerenders every ~5-6 seconds even
+after face-follow publishing was disabled: stale ReSpeaker HCI badges,
+short-lived header debug pills, and calm ambient reserve cards were enough to
+keep `rendered_at` advancing while QRasterWindow RSS kept climbing. Until the
+Wayland retention path is fully removed, `service.py` therefore fails closed
+for those non-essential overlay lanes on `hdmi_wayland` and leaves the senior
+surface static between meaningful runtime/interaction changes.
 
 External HDMI face triggers flow through `face_cues.py`. The runtime display
 loop loads one optional cue artifact and merges it only into the `default`
@@ -528,10 +587,19 @@ subscriptions. That keeps the bottom ticker, the right-hand ambient lane, and
 Twinr's own place/world awareness aligned to the same RSS source universe
 instead of maintaining separate news lists.
 
+Ticker source resolution is now current-head-only and bounded by the same
+display ticker timeout budget. The HDMI path probes and hydrates the
+authoritative world-intelligence current head read-only; it does not revive
+legacy snapshot-blob reads during display refresh. If the authoritative
+current head is missing while only a legacy blob remains, the ticker fails
+closed and surfaces the repair requirement instead of silently hydrating the
+old blob.
+
 For older Pi environments that still carry the legacy
 `TWINR_DISPLAY_NEWS_TICKER_FEED_URLS` variable, the ticker performs a one-way
 compatibility import into the world-intelligence subscription snapshot the
-first time it sees an otherwise empty source pool. After that, the shared
+first time it sees an otherwise empty source pool with no authoritative or
+legacy remote subscription contract present. After that, the shared
 world-intelligence pool remains the authoritative source.
 
 Behavior contract:
@@ -609,6 +677,12 @@ with optional_display_companion(config, enabled=True):
     realtime_loop.run(duration_s=15)
 ```
 
+Productive Pi supervisor runs now keep the visible screen alive through a
+standalone `--run-display-loop` child whenever the same authoritative display
+policy enables the surface. Supervisor-started streaming workers suppress the
+older in-process companion so required-remote gate blocks can still show a
+real Twinr screen instead of dropping back to the desktop.
+
 To activate the debug layout on the Pi/operator runtime, set:
 
 ```dotenv
@@ -630,11 +704,39 @@ forensics now prefer the live streaming-loop memory-owner detail written by
 events anchored to the concrete owner path (for example the HDMI Wayland
 surface/frame phase) instead of only repeating generic free-memory numbers.
 
-The visible `System` operator state is also deliberately de-escalation-stable
-now: `ERROR` and `WARN` still surface immediately, but recoveries only clear on
-the panel after a bounded stable hold window. That keeps short watchdog/DNS/
-memory jitters from bouncing the operator card between `ERROR`, `WARN`, and
-`OK` every few minutes.
+Cue render signatures are now deliberately visual-only: `face`, `emoji`,
+`ambient_impulse`, and `service_connect` signatures ignore `updated_at` /
+`expires_at` lifetime refreshes. Expiry is still enforced when the stores load
+active cues, but semantically identical TTL renewals no longer trigger fresh
+`hdmi_wayland` rerenders on the Pi.
+
+`hdmi_wayland` still suppresses non-camera operator overlay churn in the
+default layout: `ReSpeaker` HCI state rows and calm ambient reserve cards stay
+hidden there so low-priority operator badges do not keep waking the Wayland
+surface. HDMI header debug pills are visible again because they are the live
+operator truth surface for camera/servo state, while the current Pi
+attention-only IMX500 fast path now has fresh bounded proof.
+
+The visible `System` operator state is also deliberately de-escalation-stable,
+but it no longer keeps showing a stale `ERROR` after the underlying fault has
+already cleared. `ERROR` and `WARN` still surface immediately. Once a real
+`ERROR` recovers to a healthy raw decision, the panel now drops straight to a
+truthful recovery `WARN` (`recent_error_recovering`) and only clears to `OK`
+after a short continuous-stability window of about 30 seconds. A direct
+`WARN -> OK` recovery still uses that same short hold. That keeps short
+watchdog/DNS/memory jitters from bouncing the operator card between `ERROR`,
+`WARN`, and `OK` without falsely claiming that the device is still broken after
+the root cause is already gone. The recovery timer is keyed to the exact
+improving target decision rather than only to the previous severity, so a path
+like `ERROR -> WARN -> OK` or one warn cause replacing another resets the hold
+instead of clearing too early from a mixed unstable bounce.
+
+Operator-status transition forensics are also no longer coupled to physical
+rerenders only. If the visible HDMI/Waveshare frame stays unchanged but the
+underlying operator cause changes within the same visible severity, `service.py`
+still emits a fresh `display_operator_status_transition` event. That prevents
+same-label `WARN`/`ERROR` cause changes from disappearing just because the
+render signature did not need another frame.
 
 ## See also
 

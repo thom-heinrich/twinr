@@ -413,7 +413,6 @@ class ProactiveCoordinatorDisplayMixin:
                 config_attr="display_gesture_refresh_failure_backoff_s",
             ):
                 return False
-
             ok, runtime_status_value = self._read_runtime_status_value(
                 fault_event="proactive_display_gesture_runtime_status_failed",
                 fault_message="Failed to read runtime status for HDMI gesture refresh.",

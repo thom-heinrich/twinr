@@ -265,14 +265,17 @@ class LongTermRemoteReadinessResult:
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-safe summary for watchdog artifacts and debugging."""
 
+        remote_status_payload: dict[str, object] = {
+            "mode": self.remote_status.mode,
+            "ready": self.remote_status.ready,
+            "detail": self.remote_status.detail,
+        }
+        if getattr(self.remote_status, "operational_probe_allowed", False):
+            remote_status_payload["operational_probe_allowed"] = True
         payload: dict[str, object] = {
             "ready": self.ready,
             "detail": self.detail,
-            "remote_status": {
-                "mode": self.remote_status.mode,
-                "ready": self.remote_status.ready,
-                "detail": self.remote_status.detail,
-            },
+            "remote_status": remote_status_payload,
             "steps": [step.to_dict() for step in self.steps],
             "total_latency_ms": self.total_latency_ms,
         }

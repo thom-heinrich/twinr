@@ -2,6 +2,10 @@
 # BUG-1: Ensure interrupted sessions always reset runtime/listening/orchestrator state across all exit paths.
 # BUG-2: Prevent `_conversation_session_lock` leaks when session setup fails before entering the main turn loop.
 # BUG-3: Bound housekeeping worker burst loops to stop CPU-hogging hot spins on Raspberry Pi 4 when work stays continuously due.
+# BUG-4: Open the voice orchestrator before queuing the startup boot sound so the
+# productive ReSpeaker duplex guard claims `twinr_playback_softvol` before the
+# foreground earcon starts. Starting the earcon first let startup playback race
+# the guard and crash the runtime straight into `status=error`.
 # SEC-1: Sanitize externally sourced strings before `emit()` and bound transcript sizes to reduce log/event injection and transcript-driven DoS from remote inputs.
 # IMP-1: Coalesce required-remote refresh requests so degraded/offline periods do not create refresh storms.
 # IMP-2: Add lightweight duplicate-trigger suppression for remote wake events to match 2026 voice-agent debouncing practice.
@@ -35,10 +39,18 @@ from twinr.agent.workflows.voice_turn_latency import (
     mark_voice_turn_commit,
     mark_voice_turn_wake_confirmed,
 )
+from twinr.agent.workflows.realtime_runner_impl.streaming_memory import (
+    describe_proactive_monitor_probe,
+    describe_required_remote_watch_probe,
+    describe_runtime_heartbeat_probe,
+    describe_voice_orchestrator_probe,
+)
+from twinr.display.companion_signals import request_display_companion_wakeup
 from twinr.hardware.audio import AmbientAudioSampler
 from twinr.hardware.buttons import ButtonAction
 from twinr.ops.streaming_memory_probe import StreamingMemoryProbe
 from twinr.orchestrator.voice_activation import VoiceActivationMatch
+from twinr.orchestrator.voice_contracts import OrchestratorVoiceWakeSpeculativeEvent
 from twinr.orchestrator.voice_runtime_intent import VoiceRuntimeIntentContext
 from twinr.proactive import SocialTriggerDecision
 from twinr.proactive.runtime.gesture_wakeup_lane import GestureWakeupDecision
@@ -161,6 +173,36 @@ class TwinrRealtimeSessionMixin:
             ).maybe_record(force=force)
         except Exception:
             return
+
+    def _record_runtime_memory_checkpoint(
+        self,
+        key: str,
+        *,
+        label: str,
+        owner_label: str,
+        owner_detail: str,
+    ) -> None:
+        """Persist one forced memory checkpoint for a startup/background lane."""
+
+        self._record_streaming_memory_probe(
+            key,
+            label=label,
+            owner_label=owner_label,
+            owner_detail=owner_detail,
+            force=True,
+        )
+
+    def _record_runtime_memory_heartbeat(self, *, force: bool = False) -> None:
+        """Refresh the live run-loop memory heartbeat with current lane state."""
+
+        owner_label, owner_detail = describe_runtime_heartbeat_probe(self)
+        self._record_streaming_memory_probe(
+            "runtime.heartbeat",
+            label="realtime_runtime.heartbeat",
+            owner_label=owner_label,
+            owner_detail=owner_detail,
+            force=force,
+        )
 
     def _required_remote_refresh_min_interval_seconds(self) -> float:
         return self._float_config(
@@ -330,9 +372,15 @@ class TwinrRealtimeSessionMixin:
             kind="queue",
             details={"interval_s": self._required_remote_dependency_interval_seconds()},
         )
+        required_remote_owner_label, required_remote_owner_detail = describe_required_remote_watch_probe(self)
+        self._record_runtime_memory_checkpoint(
+            "runtime.required_remote_watch_started",
+            label="realtime_runtime.required_remote_watch_started",
+            owner_label=required_remote_owner_label,
+            owner_detail=required_remote_owner_detail,
+        )
         self._emit_status(force=True)
-        if getattr(getattr(self.runtime, "status", None), "value", None) != "error":
-            self._start_startup_boot_sound()
+        should_start_boot_sound = getattr(getattr(self.runtime, "status", None), "value", None) != "error"
         self._ensure_voice_activation_ack_prefetch_started()
         try:
             safe_poll_timeout = max(0.0, float(poll_timeout))
@@ -344,8 +392,27 @@ class TwinrRealtimeSessionMixin:
             if self.voice_orchestrator is not None:
                 self._prime_voice_orchestrator_waiting_state()
                 stack.enter_context(self.voice_orchestrator)
+                voice_owner_label, voice_owner_detail = describe_voice_orchestrator_probe(self)
+                self._record_runtime_memory_checkpoint(
+                    "runtime.voice_orchestrator_opened",
+                    label="realtime_runtime.voice_orchestrator_opened",
+                    owner_label=voice_owner_label,
+                    owner_detail=voice_owner_detail,
+                )
+            if should_start_boot_sound:
+                # Claim the productive softvol playback device through the voice
+                # orchestrator before the startup earcon uses the same speaker
+                # lane. This removes the boot-time ALSA ownership race.
+                self._start_startup_boot_sound()
             if self.proactive_monitor is not None:
                 stack.enter_context(self.proactive_monitor)
+                proactive_owner_label, proactive_owner_detail = describe_proactive_monitor_probe(self)
+                self._record_runtime_memory_checkpoint(
+                    "runtime.proactive_monitor_opened",
+                    label="realtime_runtime.proactive_monitor_opened",
+                    owner_label=proactive_owner_label,
+                    owner_detail=proactive_owner_detail,
+                )
             button_dispatcher = ButtonPressDispatcher(
                 handle_press=self.handle_button_press,
                 interrupt_current=self._request_active_turn_interrupt,
@@ -355,9 +422,20 @@ class TwinrRealtimeSessionMixin:
             housekeeping_stop, housekeeping_thread = self._start_idle_housekeeping_worker(
                 poll_timeout=safe_poll_timeout
             )
+            self._record_runtime_memory_checkpoint(
+                "runtime.housekeeping_started",
+                label="realtime_runtime.housekeeping_started",
+                owner_label="realtime_housekeeping.worker",
+                owner_detail=(
+                    "Realtime idle-housekeeping worker started. "
+                    f"poll_timeout_s={round(safe_poll_timeout, 6)}"
+                ),
+            )
+            self._record_runtime_memory_heartbeat(force=True)
             try:
                 while True:
                     try:
+                        self._record_runtime_memory_heartbeat()
                         if duration_s is not None and time.monotonic() - started_at >= duration_s:
                             self._trace_event(
                                 "workflow_run_duration_elapsed",
@@ -642,6 +720,16 @@ class TwinrRealtimeSessionMixin:
             )
             play_initial_beep = True
             if not seed_transcript:
+                self._ensure_live_audio_turn_supported(
+                    initial_source="voice_activation",
+                    listen_source="voice_activation",
+                )
+                if self.voice_orchestrator is not None:
+                    self._begin_audio_turn_listening(
+                        listen_source="voice_activation",
+                        proactive_trigger=None,
+                    )
+                    self._emit_status(force=True)
                 self._acknowledge_voice_activation()
                 play_initial_beep = False
             result = self._run_conversation_session(
@@ -724,6 +812,10 @@ class TwinrRealtimeSessionMixin:
                 confidence=round(float(decision.confidence), 4),
                 request_source=request_source,
             )
+            self._ensure_live_audio_turn_supported(
+                initial_source=request_source,
+                listen_source=request_source,
+            )
             return self._run_conversation_session(
                 initial_source=request_source,
                 play_initial_beep=True,
@@ -743,6 +835,10 @@ class TwinrRealtimeSessionMixin:
                 "Twinr opened a hands-free listening window after a proactive prompt.",
                 trigger=trigger.trigger_id,
                 timeout_s=self.config.conversation_follow_up_timeout_s,
+            )
+            self._ensure_live_audio_turn_supported(
+                initial_source="proactive",
+                listen_source="proactive",
             )
             return self._run_conversation_session(
                 initial_source="proactive",
@@ -915,6 +1011,10 @@ class TwinrRealtimeSessionMixin:
                         "pause_grace_ms": listening_window.pause_grace_ms,
                     },
                     trace_id=trace_id,
+                )
+                self._ensure_live_audio_turn_supported(
+                    initial_source=initial_source,
+                    listen_source="follow_up" if follow_up else initial_source,
                 )
                 audio_turn_completed = self._run_single_audio_turn(
                     initial_source=initial_source,
@@ -1119,12 +1219,14 @@ class TwinrRealtimeSessionMixin:
         *,
         detail: str | None = None,
         follow_up_allowed: bool = False,
+        wait_id: str | None = None,
     ) -> None:
         voice_orchestrator_runtime.notify_voice_orchestrator_state(
             self,
             state,
             detail=detail,
             follow_up_allowed=follow_up_allowed,
+            wait_id=wait_id,
         )
 
     def _prime_voice_orchestrator_waiting_state(self) -> None:
@@ -1133,7 +1235,94 @@ class TwinrRealtimeSessionMixin:
     def _refresh_voice_orchestrator_sensor_context(self) -> None:
         voice_orchestrator_runtime.refresh_voice_orchestrator_sensor_context(self)
 
-    def handle_remote_transcript_committed(self, transcript: str, source: str) -> bool:
+    def _show_speculative_wake_display_cue(
+        self,
+        event: OrchestratorVoiceWakeSpeculativeEvent,
+    ) -> None:
+        controller = getattr(self, "display_wake_cue_controller", None)
+        if controller is None:
+            return
+        self._pending_speculative_wake_display_clear_reason = None
+        hold_seconds = max(0.1, float(event.ttl_ms) / 1000.0)
+        controller.show_speculative_wake(
+            matched_phrase=self._sanitize_external_text(
+                event.matched_phrase,
+                max_chars=96,
+                default="",
+            )
+            or None,
+            backend=self._sanitize_external_text(event.backend, max_chars=48, default="remote_asr"),
+            detector_label=self._sanitize_external_text(
+                event.detector_label,
+                max_chars=48,
+                default="",
+            )
+            or None,
+            score=event.score,
+            hold_seconds=hold_seconds,
+        )
+        request_display_companion_wakeup(self.config)
+        self.emit("voice_orchestrator_speculative_wake_display=shown")
+        self._trace_event(
+            "voice_orchestrator_speculative_wake_display_shown",
+            kind="decision",
+            details={
+                "matched_phrase": event.matched_phrase,
+                "ttl_ms": int(event.ttl_ms),
+            },
+        )
+
+    def _clear_speculative_wake_display_cue(self, reason: str) -> None:
+        controller = getattr(self, "display_wake_cue_controller", None)
+        if controller is None:
+            return
+        runtime_status = getattr(getattr(getattr(self, "runtime", None), "status", None), "value", None)
+        if reason == "wake_confirmed" and runtime_status == "waiting":
+            self._pending_speculative_wake_display_clear_reason = reason
+            self.emit(
+                "voice_orchestrator_speculative_wake_display_clear_deferred="
+                f"{self._sanitize_external_text(reason, max_chars=48, default='unknown')}"
+            )
+            self._trace_event(
+                "voice_orchestrator_speculative_wake_display_clear_deferred",
+                kind="mutation",
+                details={"reason": reason, "runtime_status": runtime_status},
+            )
+            return
+        self._clear_speculative_wake_display_cue_now(reason=reason)
+
+    def _clear_speculative_wake_display_cue_now(self, *, reason: str) -> None:
+        controller = getattr(self, "display_wake_cue_controller", None)
+        self._pending_speculative_wake_display_clear_reason = None
+        if controller is not None:
+            controller.clear()
+            request_display_companion_wakeup(self.config)
+        self.emit(
+            "voice_orchestrator_speculative_wake_display_cleared="
+            f"{self._sanitize_external_text(reason, max_chars=48, default='unknown')}"
+        )
+        self._trace_event(
+            "voice_orchestrator_speculative_wake_display_cleared",
+            kind="mutation",
+            details={"reason": reason},
+        )
+
+    def _finalize_pending_speculative_wake_display_clear(self, *, status: str) -> None:
+        reason = getattr(self, "_pending_speculative_wake_display_clear_reason", None)
+        if not reason:
+            return
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status == "waiting":
+            return
+        self._clear_speculative_wake_display_cue_now(reason=reason)
+
+    def handle_remote_transcript_committed(
+        self,
+        transcript: str,
+        source: str,
+        wait_id: str | None,
+        item_id: str | None,
+    ) -> bool:
         normalized_transcript = self._normalize_transcript(
             transcript,
             max_chars=self._remote_transcript_max_chars(),
@@ -1143,16 +1332,37 @@ class TwinrRealtimeSessionMixin:
             self,
             normalized_transcript or "",
             self._sanitize_external_text(source, max_chars=48, default="remote"),
+            self._sanitize_external_text(wait_id, max_chars=96, default="") or None,
+            self._sanitize_external_text(item_id, max_chars=96, default="") or None,
         )
 
-    def handle_remote_follow_up_closed(self, reason: str) -> None:
+    def handle_remote_follow_up_closed(
+        self,
+        reason: str,
+        wait_id: str | None,
+        item_id: str | None,
+    ) -> None:
         voice_orchestrator_runtime.handle_remote_follow_up_closed(
             self,
             self._sanitize_external_text(reason, max_chars=48, default="unknown"),
+            self._sanitize_external_text(wait_id, max_chars=96, default="") or None,
+            self._sanitize_external_text(item_id, max_chars=96, default="") or None,
         )
 
     def _voice_orchestrator_owns_live_listening(self) -> bool:
         return voice_orchestrator_runtime.voice_orchestrator_owns_live_listening(self)
+
+    def _ensure_live_audio_turn_supported(
+        self,
+        *,
+        initial_source: str,
+        listen_source: str,
+    ) -> None:
+        voice_orchestrator_runtime.ensure_live_audio_turn_supported(
+            self,
+            initial_source=initial_source,
+            listen_source=listen_source,
+        )
 
     def _pause_voice_orchestrator_capture(self, *, reason: str) -> None:
         voice_orchestrator_runtime.pause_voice_orchestrator_capture(self, reason=reason)

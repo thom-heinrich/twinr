@@ -29,6 +29,7 @@ import stat
 if TYPE_CHECKING:
     from twinr.agent.base_agent.config import TwinrConfig
 
+from ..core.client import _should_send_project_header
 from ..core.instructions import (
     STT_MODEL_FALLBACKS,
     TTS_MODEL_FALLBACKS,
@@ -486,37 +487,33 @@ class OpenAISpeechMixin:
                 if not model or model in attempted_models:
                     continue
                 attempted_models.append(model)
-                response = None
                 try:
-                    with request_client.audio.speech.with_streaming_response.create(
-                        **self._build_tts_request(
-                            text,
-                            model=model,
-                            voice=voice,
-                            response_format=response_format,
-                            instructions=tts_instructions,
-                            for_stream=True,
-                            stream_format=stream_format,
-                        )
-                    ) as response:
-                        with response_lock:
-                            response_holder["response"] = response
-                        for chunk in response.iter_bytes(chunk_size):
-                            if stop_requested.is_set():
-                                return
-                            if chunk:
-                                yield bytes(chunk)
+                    request = self._build_tts_request(
+                        text,
+                        model=model,
+                        voice=voice,
+                        response_format=response_format,
+                        instructions=tts_instructions,
+                        for_stream=True,
+                        stream_format=stream_format,
+                    )
+                    for chunk in self._iter_streaming_tts_bytes(
+                        request_client=request_client,
+                        request=request,
+                        chunk_size=chunk_size,
+                        stop_requested=stop_requested,
+                        response_holder=response_holder,
+                        response_lock=response_lock,
+                    ):
+                        yield chunk
                     return
                 except Exception as exc:
                     if stop_requested.is_set():
                         return
-                    if not self._is_model_access_error(exc):
-                        raise
-                    last_error = exc
-                finally:
-                    with response_lock:
-                        if response_holder["response"] is response:
-                            response_holder["response"] = None
+                    normalized_exc = self._normalize_streaming_tts_exception(exc)
+                    if not self._is_model_access_error(normalized_exc):
+                        raise normalized_exc
+                    last_error = normalized_exc
 
             if last_error is not None:
                 candidate_list = ", ".join(attempted_models)
@@ -527,6 +524,114 @@ class OpenAISpeechMixin:
             raise RuntimeError("No model candidates were available for the OpenAI request")
 
         return _ClosableIterator(iterator(), close_callback=request_close)
+
+    def _iter_streaming_tts_bytes(
+        self,
+        *,
+        request_client: Any,
+        request: Mapping[str, Any],
+        chunk_size: int,
+        stop_requested: Event,
+        response_holder: dict[str, Any | None],
+        response_lock: Lock,
+    ) -> Iterator[bytes]:
+        """Stream TTS bytes over the shared HTTP transport when available.
+
+        The OpenAI SDK stream wrapper adds measurable first-chunk overhead on the
+        Pi. When Twinr has a real SDK client with a reusable HTTPX transport, hit
+        the same authenticated `/audio/speech` endpoint through that warmed
+        transport directly instead of reopening the slower wrapper path.
+        """
+
+        base_url = getattr(request_client, "base_url", None)
+        http_client = getattr(request_client, "_client", None)
+        stream_method = getattr(http_client, "stream", None) if http_client is not None else None
+        if callable(stream_method) and base_url is not None:
+            headers = self._streaming_tts_request_headers(request_client)
+            url = f"{str(base_url).rstrip('/')}/audio/speech"
+            response = None
+            try:
+                with stream_method("POST", url, headers=headers, json=dict(request)) as response:
+                    with response_lock:
+                        response_holder["response"] = response
+                    response.raise_for_status()
+                    for chunk in response.iter_bytes(chunk_size):
+                        if stop_requested.is_set():
+                            return
+                        if chunk:
+                            yield bytes(chunk)
+            finally:
+                with response_lock:
+                    if response_holder["response"] is response:
+                        response_holder["response"] = None
+            return
+
+        response = None
+        try:
+            with request_client.audio.speech.with_streaming_response.create(
+                **dict(request)
+            ) as response:
+                with response_lock:
+                    response_holder["response"] = response
+                for chunk in response.iter_bytes(chunk_size):
+                    if stop_requested.is_set():
+                        return
+                    if chunk:
+                        yield bytes(chunk)
+        finally:
+            with response_lock:
+                if response_holder["response"] is response:
+                    response_holder["response"] = None
+
+    def _streaming_tts_request_headers(self, request_client: Any) -> dict[str, str]:
+        """Build one authenticated header set for the raw HTTP streaming path."""
+
+        headers: dict[str, str] = {}
+        default_headers = getattr(request_client, "default_headers", None)
+        if isinstance(default_headers, Mapping):
+            for key, value in default_headers.items():
+                if isinstance(key, str) and isinstance(value, str) and value:
+                    headers[key] = value
+        if "Authorization" not in headers:
+            headers["Authorization"] = f"Bearer {self.config.openai_api_key}"
+        if _should_send_project_header(self.config):
+            project_id = self._normalize_optional_text(
+                str(getattr(self.config, "openai_project_id", "") or "")
+            )
+            if project_id is not None:
+                headers["OpenAI-Project"] = project_id
+        organization_id = self._normalize_optional_text(
+            str(
+                getattr(self.config, "openai_organization_id", None)
+                or getattr(self.config, "openai_organization", None)
+                or ""
+            )
+        )
+        if organization_id is not None:
+            headers["OpenAI-Organization"] = organization_id
+        return headers
+
+    def _normalize_streaming_tts_exception(self, exc: Exception) -> Exception:
+        """Attach HTTP status/body evidence so model-access detection still works."""
+
+        try:
+            import httpx
+        except ImportError:
+            return exc
+
+        if not isinstance(exc, httpx.HTTPStatusError):
+            return exc
+
+        wrapped = RuntimeError(str(exc))
+        response = exc.response
+        setattr(wrapped, "status_code", getattr(response, "status_code", None))
+        body: object
+        try:
+            body = response.json()
+        except Exception:
+            body = {"error": {"message": (getattr(response, "text", "") or "")[:512]}}
+        setattr(wrapped, "body", body)
+        return wrapped
 
     def _transcribe_upload(
         self,

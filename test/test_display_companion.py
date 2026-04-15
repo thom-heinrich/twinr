@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from threading import Event
+import os
+from threading import Event, Thread
+import time
 import unittest
+from unittest import mock
 
 from twinr.agent.base_agent import TwinrConfig
 from twinr.display.companion import optional_display_companion
+from twinr.display import companion_signals as companion_signals_mod
+from twinr.display.companion_signals import (
+    register_display_process_wakeup_listener,
+    request_display_companion_wakeup,
+)
 
 
 class _FakeDisplayLoop:
@@ -15,11 +23,15 @@ class _FakeDisplayLoop:
         self.stopped = Event()
         self.sleep = lambda _seconds: None
         self.stop_requested = lambda: False
+        self.sleep_calls = 0
+        self.sleep_started = Event()
 
     def run(self, *, duration_s: float | None = None) -> int:
         self.run_calls += 1
         self.started.set()
         while not self.stop_requested():
+            self.sleep_calls += 1
+            self.sleep_started.set()
             self.sleep(60.0)
         self.stopped.set()
         return 0
@@ -68,3 +80,48 @@ class DisplayCompanionTests(unittest.TestCase):
             pass
 
         self.assertFalse(created)
+
+    def test_optional_display_companion_wakeup_interrupts_idle_sleep(self) -> None:
+        loop = _FakeDisplayLoop()
+
+        with optional_display_companion(
+            TwinrConfig(display_poll_interval_s=0.0),
+            enabled=True,
+            emit=lambda _line: None,
+            loop_factory=lambda _config: loop,
+            lock_owner=lambda _config, _loop_name: None,
+            lock_factory=_fake_lock,
+        ):
+            self.assertTrue(loop.started.wait(timeout=1.0))
+            self.assertTrue(loop.sleep_started.wait(timeout=1.0))
+            self.assertEqual(loop.sleep_calls, 1)
+            request_display_companion_wakeup()
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline and loop.sleep_calls < 2:
+                time.sleep(0.01)
+            self.assertGreaterEqual(loop.sleep_calls, 2)
+
+    def test_display_process_wakeup_listener_sets_event_on_signal(self) -> None:
+        with register_display_process_wakeup_listener() as wake_event:
+            self.assertFalse(wake_event.is_set())
+
+            def _send_signal() -> None:
+                time.sleep(0.05)
+                os.kill(os.getpid(), companion_signals_mod._DISPLAY_COMPANION_WAKE_SIGNAL)
+
+            sender = Thread(target=_send_signal, daemon=True)
+            sender.start()
+            self.assertTrue(wake_event.wait(timeout=1.0))
+            sender.join(timeout=1.0)
+
+    def test_request_display_companion_wakeup_signals_external_display_loop_owner(self) -> None:
+        config = TwinrConfig(project_root="/tmp/twinr-display-signal")
+
+        with (
+            mock.patch.object(companion_signals_mod, "_display_loop_owner_pid", return_value=4321),
+            mock.patch.object(companion_signals_mod, "_signal_display_process", return_value=True) as signal_process,
+            mock.patch("os.getpid", return_value=1111),
+        ):
+            self.assertTrue(request_display_companion_wakeup(config))
+
+        signal_process.assert_called_once_with(4321)

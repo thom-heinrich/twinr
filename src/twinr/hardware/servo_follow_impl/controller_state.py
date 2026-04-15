@@ -280,6 +280,7 @@ class ControllerStateMixin(ControllerGeometryMixin):
         self._centered_since = None
         self._settled_since = None
         self._visible_target_pulse_width_us = None
+        self._clear_visible_retarget_cooldown()
         self._exit_cooldown_until_at = None
         self._reset_zero_return_cycle_state()
         self._clear_exit_pursuit(clear_recent_visible_targets=True)

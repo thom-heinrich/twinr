@@ -627,6 +627,7 @@ class AttentionServoControllerTests(unittest.TestCase):
         rest_max_jerk_us_per_s3: float = 450.0,
         min_command_delta_us: int = 1,
         visible_retarget_tolerance_us: int = 0,
+        visible_retarget_cooldown_s: float = 0.0,
         reference_interval_s: float = 0.2,
         soft_limit_margin_us: int = 70,
         idle_release_s: float = 1.0,
@@ -692,6 +693,7 @@ class AttentionServoControllerTests(unittest.TestCase):
                 rest_max_jerk_us_per_s3=rest_max_jerk_us_per_s3,
                 min_command_delta_us=min_command_delta_us,
                 visible_retarget_tolerance_us=visible_retarget_tolerance_us,
+                visible_retarget_cooldown_s=visible_retarget_cooldown_s,
                 reference_interval_s=reference_interval_s,
                 soft_limit_margin_us=soft_limit_margin_us,
                 idle_release_s=idle_release_s,
@@ -2416,6 +2418,78 @@ class AttentionServoControllerTests(unittest.TestCase):
         self.assertEqual(second.target_pulse_width_us, 1728)
         self.assertEqual(second.commanded_pulse_width_us, 1728)
         self.assertEqual(writer.writes, [("gpiochip0", 18, 1728)])
+
+    def test_update_holds_visible_target_retargets_during_post_move_cooldown(self) -> None:
+        controller, writer = self._build_controller(
+            max_step_us=400,
+            target_smoothing_s=0.0,
+            visible_retarget_tolerance_us=0,
+            visible_retarget_cooldown_s=0.35,
+        )
+
+        first = controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.80,
+            confidence=0.95,
+        )
+        held = controller.update(
+            observed_at=10.2,
+            active=True,
+            target_center_x=0.76,
+            confidence=0.95,
+        )
+        resumed = controller.update(
+            observed_at=10.4,
+            active=True,
+            target_center_x=0.76,
+            confidence=0.95,
+        )
+
+        self.assertEqual(first.commanded_pulse_width_us, 1728)
+        self.assertEqual(held.target_pulse_width_us, 1728)
+        self.assertEqual(held.commanded_pulse_width_us, 1728)
+        self.assertEqual(resumed.target_pulse_width_us, 1698)
+        self.assertEqual(resumed.commanded_pulse_width_us, 1698)
+        self.assertEqual(
+            writer.writes,
+            [
+                ("gpiochip0", 18, 1728),
+                ("gpiochip0", 18, 1698),
+            ],
+        )
+
+    def test_update_allows_large_visible_retarget_to_break_post_move_cooldown(self) -> None:
+        controller, writer = self._build_controller(
+            max_step_us=400,
+            target_smoothing_s=0.0,
+            visible_retarget_tolerance_us=0,
+            visible_retarget_cooldown_s=0.35,
+        )
+
+        first = controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.80,
+            confidence=0.95,
+        )
+        second = controller.update(
+            observed_at=10.2,
+            active=True,
+            target_center_x=0.62,
+            confidence=0.95,
+        )
+
+        self.assertEqual(first.commanded_pulse_width_us, 1728)
+        self.assertEqual(second.target_pulse_width_us, 1591)
+        self.assertEqual(second.commanded_pulse_width_us, 1591)
+        self.assertEqual(
+            writer.writes,
+            [
+                ("gpiochip0", 18, 1728),
+                ("gpiochip0", 18, 1591),
+            ],
+        )
 
     def test_update_allows_loss_projection_after_visible_target_hysteresis(self) -> None:
         controller, writer = self._build_controller(

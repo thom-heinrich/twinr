@@ -431,6 +431,7 @@ def _probe_remote_collection_head_status(
     probe_current_head_result = getattr(remote_records, "probe_current_head_result", None)
     if callable(probe_current_head_result):
         probe_kwargs: dict[str, object] = {"snapshot_kind": remote_snapshot_kind}
+        parameters: Mapping[str, inspect.Parameter]
         try:
             parameters = inspect.signature(probe_current_head_result).parameters
         except (TypeError, ValueError):
@@ -641,6 +642,11 @@ class ManagedContextFileStore:
                     local_entries,
                     replace_invalid_current_head=True,
                 )
+            # `unavailable` is not seedable absence. Re-publishing local prompt
+            # context during a transient remote outage stretches watchdog
+            # recovery probes and reintroduces a forbidden local rescue lane.
+            if probe_status != "missing":
+                return False
             if not local_entries:
                 return False
             return self._try_save_remote_entries(local_entries)
@@ -942,6 +948,12 @@ class PersistentMemoryMarkdownStore:
                     local_entries,
                     replace_invalid_current_head=True,
                 )
+            # `unavailable` is not seedable absence. Re-publishing local prompt
+            # memory during remote unavailability turns watchdog bootstrap into
+            # a slow local-rescue write path instead of a bounded read-only
+            # readiness check.
+            if probe_status != "missing":
+                return False
             if not local_entries:
                 return False
             return self._try_save_remote_entries(local_entries)

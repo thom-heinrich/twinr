@@ -17,17 +17,30 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 - play one bounded startup boot clip from `media/boot.mp3` through the same playback coordinator, trimmed from the calmer middle of the asset and faded so loop startup stays gentle and interruptible
 - render the first `0.8 s` of `media/dragon-studio-computer-startup-sound-effect-312870.mp3` as the default processing cue, prewarm that clip during loop startup/reload, and let a short tone fallback upgrade into the cached media path once the render finishes so THINKING does not stay on the synthetic hum for a whole turn
 - keep fatal Pi loop/bootstrap failures on one stable error screen by holding the runtime in `error` and refreshing its snapshot instead of crashing back to the desktop and letting the supervisor ping-pong
+- stamp mandatory post-start checkpoints plus a throttled realtime heartbeat into `streaming_memory_segments.json` so Pi memory-pressure warnings can be tied back to required-remote, voice-orchestrator, proactive-monitor, and housekeeping startup lanes instead of getting stuck on stale constructor-only attribution
 - execute each completed streaming transcript turn under one authoritative coordinator/state-machine owner for deadlines, speech lifecycle, cancellation, and completion
 - forward the completed tool-call history of a turn into runtime-side personality learning once the authoritative answer has been finalized, but keep that learning work off the user-facing audio-completion path so a slow background flush cannot leave Twinr visibly `speaking` after playback ends
 - keep GPIO polling responsive while long turns are active by dispatching button presses off the poll thread and interrupting active turns on a second green press
 - keep required remote-memory checks off the GPIO polling thread by gating live loops from the external remote-memory watchdog artifact while still failing closed when remote memory becomes unavailable
+- treat the external watchdog PID `start_ticks` attestation as authoritative when present and use epoch `pid_create_time_s` only as a legacy fallback, so RTC/NTP wall-clock corrections on the Pi cannot falsely flip a healthy required-remote watchdog into `error`
 - treat fresh external-watchdog heartbeats plus the observed recent watchdog sample cadence as a bounded bridge between healthy steady-state deep probes so the runtime does not false-fail `required_remote` while the watchdog is intentionally idling or persisting heartbeats on a slower Pi-safe cadence
+- keep the same bounded startup wait active for a freshly restarted external watchdog even when its first post-restart sample is a temporary non-ready fail, so Pi turns do not abort during `check system` while the watchdog is still converging on the next authoritative ready sample
 - keep synthetic watchdog-timeout samples bridged under the explicit watchdog startup/flush/learned probe budgets while the same deep probe is still heartbeating, so a 15s operator timeout marker on a much longer but still healthy archive-inclusive probe does not surface a false runtime `error`
+- honor green watchdog samples when their structured proof contract already satisfies the configured required-remote scope, even when the nested shallow `remote_status.ready` flag is still false, because the stronger deep readiness attestation already proved the required query/read surface and must outrank the lagging `/instance` bit
+- route direct `LongTermRemoteUnavailableError` entries through the same authoritative watchdog-snapshot threshold in `watchdog_artifact` mode, so one corroborated fail sample cannot bypass the shared transient-failure gate and force a visible runtime `error`
+- reject even `status=ok/ready=true` watchdog samples when their structured attestation does not satisfy the configured proof contract, and only let a nested `remote_status.ready=false` stand down when the stronger deep proof already satisfies that same contract
 - resynchronize runtime-local remote-memory cooldown state after a successful external watchdog attestation so foreground turns do not fail against a stale in-process circuit breaker while the Pi watchdog already proved the namespace healthy
 - keep streamed TTS abortable even before the first chunk arrives so a stalled provider request does not pin the runtime in `answering`
 - start the processing cue immediately when a submitted transcript moves the runtime into `processing`, including dual-lane bridge/direct-reply turns, so visible THINKING phases do not sit silent while the lane planner or fast bridge path is still working
+- for seeded/direct-text turns, commit the transcript and enter `processing` before speculative semantic-router, supervisor, first-word, or long-term prewarm work runs, so wake-confirmed voice turns do not surface a fake `listening` phase or sit silent behind post-commit warmups
+- reuse an already resolved dual-lane `direct` or `end_conversation` supervisor decision inside the final lane instead of discarding it and reopening the generic supervisor loop
+- wait for the shared speculative supervisor decision up to one bounded hard budget that still fits under the final-lane watchdog, so short direct turns on the Pi do not fall prematurely into the much slower generic supervisor stream
+- keep speculative supervisor and first-word prewarm provider I/O off `_speculation_lock`, so live tool-surface refresh and authorization never block on background OpenAI warmups
+- surface speculative warmup execution failures when a live turn explicitly waits on them, so provider/runtime errors fail closed instead of disappearing as fake warmup misses
+- surface invalid non-`@runtime_checkable` provider-contract types during realtime bootstrap instead of swallowing `TypeError` and silently continuing with a guessed callable match
 - keep coordinator-backed streamed TTS from preempting the processing cue until the first real speech chunk is ready, so long model/TTS startup gaps do not create dead air after only one or two thinking loops
 - stop processing/search feedback owners before waiting on streamed speech-output close, so feedback cannot keep reacquiring the speaker while the final reply is draining
+- short-circuit obvious reply-expected follow-up turns from the local closure fast path before any remote steering-cue refresh, so short spoken answers can reopen `listening` before playback visibly falls through `waiting`
 - only surface `answering` once spoken audio has actually started instead of when text is merely queued
 - separate "wait for audible playback to drain" from the final worker-thread shutdown budget so post-playback cleanup cannot strand the turn in `answering` after the user already heard the full reply
 - keep the runtime snapshot fresh during long spoken playback so the Pi supervisor does not false-kill an active answer as stale
@@ -35,7 +48,8 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 - gate spoken/display background delivery starts behind one shared idle-transition window so reminders, automations, and proactive prompts cannot cross from stale `waiting` snapshots into live conversation output
 - let the idle housekeeping worker trigger one bounded overnight orchestration pass that flushes long-term writers, refreshes world intelligence, prepares calm morning digest artifacts, and still prepares the next reserve-lane day plan before the user wakes up
 - persist explicit nightly `new_insights` and `continuity_shifts` lines so morning-facing surfaces can name what changed overnight instead of only showing aggregate counts
-- refine raw nightly news, sources, and overnight learning signals through one user-facing shaping layer so the morning digest does not leak raw provider/search artifacts
+- persist one explicit nightly personality attestation with flush status, history-read status, failure stage, and last commit evidence so operators can tell readable zero-delta nights from remote-blind degraded runs
+- refine raw nightly news, sources, and overnight learning signals through one user-facing shaping layer so the morning digest does not leak raw provider/search artifacts, and never invent `new_insights`/`continuity_shifts` when the raw overnight inputs are empty
 - thread configured place context into nightly weather/news live-search augmentation so prepared morning digests use the known city/region/country instead of asking for a missing location
 - package the latest ReSpeaker presence/audio policy facts into explicit governor-input context so proactive reservations carry the same channel/session/runtime view that chose display-first or speech
 - rearm spoken follow-up turns directly from `answering` back to `listening` so the display and operator cues do not briefly fall through `waiting` between a reply and the reopened microphone window
@@ -44,6 +58,7 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 - emit privacy-safe accountability events for committed follow-up transcripts, carryover-hint build/store decisions, and provider-context carryover injection so live wrong-answer turns can be reconstructed after the fact without logging raw speech
 - start the post-response closure guard while streamed speech is still draining so follow-up beeps do not sit behind a second model wait after the audible answer ends
 - keep the post-playback join against the closure guard bounded so a stalled steering, remote-memory, or closure-provider path cannot leave the runtime stuck in `answering` after speech has ended
+- if that closure guard is still unresolved after playback, clear `speaking` immediately; on remote transcript-first follow-up lanes, reopen the local runtime/display to `listening` through one atomic runtime fast path, confirm that reopen with the shared listen earcon before publishing `follow_up_open`, and collapse back to `waiting` later only if the closure result vetoes continuation
 - stamp live voice turns with one shared `wake -> commit -> supervisor -> remote-memory -> tts` latency breakdown so Pi journals show exactly which stage consumed the turn budget
 - translate structured personality turn-steering state into real follow-up runtime decisions so shared-thread topics can stay gently open while cooling topics are answered briefly and then released
 - build per-turn fast-lane supervisor instructions from stable routing policy plus the currently visible reserve-lane card so display-grounded turns can route on the actual shown topic without bloating the loop classes
@@ -52,17 +67,23 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 - wire the optional OpenAI streaming-transcript verifier from the provider bundle into the live streaming loop so suspicious short Deepgram turns, including empty results after a late speech start, are rechecked against the real captured audio before Twinr drops the turn
 - feed transcript-first interim and endpoint transcripts into long-term-memory materialized provider-answer-front prewarm so the live answer path can consume already-persisted long-term prompt blocks instead of waiting for a fresh synchronous remote rebuild after the user stops speaking
 - let a calibrated local semantic transcript router front-run high-confidence `web`, `memory`, and `tool` streaming turns while keeping `parametric` answers on the supervisor lane until offline eval says otherwise, including the optional two-stage user-intent-plus-backend path
-- when the local semantic router is enabled on the Pi, only warm its ONNX path after real transcript activity begins instead of during idle startup, and defer the optional user-intent ORT validation session in the same idle path, so `waiting` does not fault the router heap before the user speaks while still allowing one best-effort turn-near warmup
+- when the local semantic router is enabled on the Pi, defer the full router bundle build plus ONNX warmup until real transcript activity begins, and defer the optional user-intent ORT validation session in that same path, so `waiting` does not fault the router heap before the user speaks while still allowing one best-effort turn-near warmup
+- when a deferred local semantic-router reload does not become `ready`, keep any already-live router instance in place so authoritative `web`/`memory`/`tool` handoffs do not disappear mid-session
 - when the local semantic router front-runs an authoritative `web`, `memory`, or `tool` turn, generate the instant bridge line through the first-word LLM with a route-aware filler overlay and leave the bridge silent when that fast LLM path does not return usable text
 - derive dual-lane bridge speech from the fast supervisor decision as the authoritative first spoken lane whenever a supervisor decision provider is available; use the standalone first-word model only as a fallback when that supervisor lane does not exist, and do not fall back to canned watchdog speech
-- when the bridge and final lane both depend on the fast supervisor decision, reuse one shared speculative supervisor-decision worker; do not open parallel duplicate structured-decision calls for the same transcript, and if that shared worker misses its reuse budget, fall straight through to the generic supervisor loop instead of starting another structured-decision roundtrip
+- when the bridge and final lane both depend on the fast supervisor decision, reuse one shared speculative supervisor-decision worker; do not open parallel duplicate structured-decision calls for the same transcript, and if that shared worker misses its reuse budget, fall through to the generic supervisor loop on bounded `tiny_recent` tool context plus the slim supervisor context instead of starting another structured-decision roundtrip
+- prewarm the tool-loop base instruction bundle during OpenAI dual-lane loop construction so the first spoken specialist turn does not synchronously hydrate remote-managed static prompt context
+- merge that same tool-loop bundle back into per-turn live tool instructions, so freshly written prompt memory is visible on the very next specialist turn instead of waiting for a stale long-lived prompt snapshot to expire
+- treat a prefetched direct supervisor decision as authoritative for the final lane unless it explicitly declares `full_context`; do not reopen a second supervisor-decision roundtrip or build the heavy direct-memory context for ordinary direct replies
 - downgrade fast-lane decisions that declare `full_context` needs into a filler-plus-final-lane handoff so conversation-recall turns do not get answered from a memory-blind bridge lane
 - do not emit a separate supervisor bridge/filler for one-shot runtime-local handoffs that already carry `runtime_tool_name`; the direct runtime-local tool reply must be the only spoken confirmation
 - treat an incomplete one-shot runtime-local shortcut payload as a normal specialist handoff instead of executing it directly; this keeps ambiguous quiet-mode requests on the ask-a-duration path instead of throwing the live turn into `Thinking -> Error`
 - route resolved or prefetched dual-lane handoffs straight into the specialist path, using full tool-provider context for memory/general work while keeping pure search handoffs on the bounded search-only context
 - route `tiny_recent` runtime-local tool handoffs onto the bounded compact tool context instead of the heavy remote-backed tool-provider context, so status/control turns do not stall the final lane on synchronous long-term retrieval
+- keep single-lane live tool turns on the bounded compact tool context instead of synchronously opening heavy remote long-term retrieval on the first answer path
 - keep authoritative local `memory` routes on the fast bridge while preserving the full-context handoff, so recall turns still exercise the real long-term-memory path instead of silently downgrading to a recent-only shortcut
 - give tool/search handoffs their own wider final-lane timeout budget so live specialist turns are not cut off by the shorter direct-reply watchdog envelope
+- give unresolved spoken dual-lane turns the wider handoff/search timeout envelope when a real supervisor-provider final lane is still pending, because live web/search/tool turns can miss the speculative decision window and still need more than the generic direct-reply budget to finish cleanly
 - only prefetch first-word speech once a partial transcript has enough shape to be meaningful; one dangling tail word must not trigger a filler line on its own
 - keep dual-lane search turns to one bounded final-lane search execution instead of launching a speculative background search worker that can outlive the turn
 - wait briefly for active filler playback to drain before replacing it with the final lane so the fast acknowledgement is not cut off mid-sentence
@@ -75,6 +96,12 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 - stream bounded edge audio and runtime-state updates to the remote voice orchestrator while keeping the realtime loop as the single owner of physical runtime state changes
 - wait briefly for proven transient XVF3800 re-enumeration on the shared live-capture paths so a short USB drop does not instantly flip a listen turn into `error`
 - reconnect the edge voice websocket after transient server or network closures and replay the last known runtime state so hands-free wake detection does not stay dead until the Pi service restarts
+- bound each outbound edge voice websocket send to at most the live
+  transport-queue window and force a reconnect when the remote transport stops
+  draining, so the Pi does not sit on one stuck sender thread longer than the
+  speech backlog can remain fresh while `voice_orchestrator_backpressure_drops`
+  climbs indefinitely
+- discard queued and newly captured edge audio explicitly while that websocket reconnect is still pending, because transcript-first live speech cannot be replayed as stale backlog after a confirmed transport gap; keep `voice_orchestrator_backpressure_drops` reserved for real send-queue overload and expose disconnect loss separately
 - keep the live voice gateway server-only after wake: once the Pi has opened a voice turn on thh1986, the same remote stream must stay authoritative for wake, transcript commit, continuation, and follow-up closure instead of pausing capture and reopening a second Pi-local listen phase
 - keep answer-time interruption server-owned whenever the live voice gateway is active; do not reopen a second local Pi STT watcher while the remote thh1986 stream already owns barge-in
 - require `wss://` for non-loopback voice-gateway websockets by default, and use `TWINR_VOICE_ORCHESTRATOR_ALLOW_INSECURE_WS=true` only for the explicitly attested current LAN bridge until a TLS terminator exists
@@ -103,7 +130,7 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 | [realtime_runner_impl/turn_capture.py](./realtime_runner_impl/turn_capture.py) | Turn-controller streaming capture, transcript recovery, and early-snapshot coercion |
 | [realtime_runner_impl/turn_execution.py](./realtime_runner_impl/turn_execution.py) | Single-turn execution, streamed playback/interrupt handling, activation ack caching, and print-lane enqueue helpers |
 | [realtime_follow_up.py](./realtime_follow_up.py) | Focused follow-up reopening and closure-decision helper used by the realtime loop |
-| [voice_orchestrator.py](./voice_orchestrator.py) | Edge-side voice websocket bridge that streams bounded audio and runtime-state updates to the orchestrator server, including bounded transient XVF3800 capture recovery, first-frame and mid-stream capture-stall healing, and startup-time reconnect recovery when the gateway appears late |
+| [voice_orchestrator.py](./voice_orchestrator.py) | Edge-side voice websocket bridge that streams bounded audio and runtime-state updates to the orchestrator server, including explicit XVF3800 USB ASR-lane extraction from the native 6-channel capture path, bounded transient capture recovery, first-frame and mid-stream capture-stall healing, and startup-time reconnect recovery when the gateway appears late |
 | [voice_orchestrator_runtime.py](./voice_orchestrator_runtime.py) | Runtime-side voice-orchestrator state replay, same-stream transcript handoff, and remote follow-up helper |
 | [voice_turn_latency.py](./voice_turn_latency.py) | Shared wake/commit/supervisor/remote-memory/TTS stage tracker for per-turn Pi journal timing breakdowns |
 | [voice_identity_runtime.py](./voice_identity_runtime.py) | Runtime-side household voice profile sync plus conservative passive voice-profile updates for the live gateway path |
@@ -121,9 +148,9 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 | [streaming_turn_coordinator.py](./streaming_turn_coordinator.py) | Authoritative streaming turn state machine and completion coordinator |
 | [streaming_turn_orchestrator.py](./streaming_turn_orchestrator.py) | Low-level parallel bridge/final lane watchdog executor used by the coordinator |
 | [playback_coordinator.py](./playback_coordinator.py) | Single-owner speaker queue with priority-aware, request-bound preemption for beep, feedback, and TTS |
-| [respeaker_duplex_keepalive.py](./respeaker_duplex_keepalive.py) | ReSpeaker XVF3800 duplex-stability helper that keeps one Twinr-owned playback stream alive; on the productive softvol path it uses the direct `/dev/zero` ALSA guard instead of silence piped through `WaveAudioPlayer`, suspends that direct guard around real foreground playback, and waits through a short quiet gap before reclaiming the device so back-to-back processing and TTS playback do not race |
+| [respeaker_duplex_keepalive.py](./respeaker_duplex_keepalive.py) | ReSpeaker XVF3800 duplex-stability helper that keeps one Twinr-owned playback stream alive; on the productive softvol path it uses the direct `/dev/zero` ALSA guard instead of silence piped through `WaveAudioPlayer`, fails closed during startup unless that guard really claims playback ownership, preserves already active foreground playback such as `startup_boot_sound` across `open()`, suspends the guard around real foreground playback, and waits through a short quiet gap before reclaiming the device so back-to-back processing and TTS playback do not race |
 | [rendered_audio_clip.py](./rendered_audio_clip.py) | Bounded media-clip renderer/cache for reusable workflow WAV payloads |
-| [startup_boot_sound.py](./startup_boot_sound.py) | Bounded startup earcon helper that renders a faded `media/boot.mp3` clip and queues it through the shared playback coordinator |
+| [startup_boot_sound.py](./startup_boot_sound.py) | Bounded startup earcon helper that renders a faded `media/boot.mp3` clip and queues it through the shared playback coordinator only after the live voice orchestrator has opened the productive duplex guard |
 | [realtime_runtime/background.py](./realtime_runtime/background.py) | Active background delivery helpers used by the realtime loop, including idle-transition-safe reminder/automation/proactive delivery, routing display-first proactive prompts into the reserve lane, and triggering the explicit overnight orchestration hook |
 | [realtime_runtime/nightly.py](./realtime_runtime/nightly.py) | Explicit overnight orchestration for long-term flush/refresh, prepared morning digests, and durable nightly run-state artifacts |
 | [realtime_runtime/nightly_insights.py](./realtime_runtime/nightly_insights.py) | Focused extractor that turns reflection, world refresh, and accepted personality deltas into bounded nightly insight and continuity lines |
@@ -136,7 +163,7 @@ the edge-side audio bridge for the new server-backed voice orchestrator path.
 | [realtime_runtime/vision_support.py](./realtime_runtime/vision_support.py) | Safe reference-image loading, live camera image bundling, and bounded vision-prompt construction |
 | [realtime_runner_tools.py](./realtime_runner_tools.py) | Tool delegate mixin, including smart-home and RSS/world-intelligence wiring |
 | [button_dispatch.py](./button_dispatch.py) | Non-blocking button dispatch and busy-turn interruption |
-| [required_remote_watch.py](./required_remote_watch.py) | Background required-remote readiness watch for fail-closed runtimes |
+| [required_remote_watch.py](./required_remote_watch.py) | Background required-remote readiness watch for fail-closed runtimes, including capped exception/false-ready backoff that saturates before numeric overflow can crash the worker |
 | [required_remote_snapshot.py](./required_remote_snapshot.py) | Cheap external-watchdog snapshot evaluation for live runtime gating, including bounded heartbeat bridging keyed to healthy recent steady-state probe cadence, Pi-safe heartbeat quiet windows, and bounded recovery of a dead external watchdog owner |
 | [speech_output.py](./speech_output.py) | Interruptible streamed TTS |
 | [forensics.py](./forensics.py) | Queue-based forensic runpack tracing for live workflow bugs, including bounded thread snapshots for stuck workflow helpers |
@@ -154,6 +181,12 @@ The refactored realtime loop keeps the public class at
 under [`realtime_runner_impl/`](./realtime_runner_impl/) so bootstrap, session
 orchestration, capture, and per-turn execution stay reviewable as separate
 concerns.
+
+That split now also includes
+[`realtime_runner_impl/streaming_memory.py`](./realtime_runner_impl/streaming_memory.py),
+which owns the bounded run-loop memory-checkpoint descriptions consumed by the
+session orchestrator before they are written into the shared Pi memory
+attribution artifact.
 
 ## Forensic tracing
 
@@ -213,9 +246,12 @@ streaming_loop.run(duration_s=15)
 The remote/server voice path intentionally keeps a strict split:
 
 - `voice_orchestrator.py` owns edge microphone streaming and server-event dispatch
-- `voice_frame_speech.py` owns the bounded per-frame speech-probability side-channel sent with streamed edge audio and must keep room-audio classification stateless across frames so recurrent VAD state cannot drift on endless ambient streams
-- `voice_orchestrator_runtime.py` owns runtime-side state replay, intent-context refresh, and same-stream transcript handoff into the realtime loop
+- `voice_orchestrator.py` must keep the Pi sender thread transport-only; it streams PCM plus runtime-state snapshots and must not run a second wake/commit lane on the edge. A local per-frame `speech_probability` attestation is allowed only as fail-closed acoustic evidence attached to the transported frame, never as an edge wake/VAD decision or speech gate
+- `voice_orchestrator.py` must source the productive XVF3800 path through `src/twinr/hardware/respeaker/voice_capture.py`, keep the live ASR output enabled through `src/twinr/hardware/respeaker/voice_mux.py`, and extract the single host-control-attested ASR lane from the native 6-channel USB frame using the authoritative XMOS-pair-to-USB-lane contract instead of trusting ALSA downmix or a second hardcoded channel map
+- `voice_orchestrator_runtime.py` owns runtime-side state replay, intent-context refresh, and same-stream transcript handoff into the realtime loop; it must attest the authoritative `waiting` state to the remote voice gateway even before richer sensor context exists, replay the enriched context later when it becomes available, and fail closed when a live non-button turn would otherwise reopen Pi-local recorder/STT capture without the voice orchestrator lane
 - `remote_transcript_commit.py` owns the bounded wait/commit handoff for same-stream remote transcripts
 - `realtime_runner.py` and `streaming_capture.py` must not reopen a second Pi-local listen capture once the voice orchestrator path is active; they have to wait on the same remote stream instead
+- `realtime_runner.py`, `streaming_capture.py`, and `voice_orchestrator_runtime.py` must also fail closed when voice activation, gesture wake, proactive follow-up, or remote follow-up reaches a live audio turn without the transcript-first voice orchestrator lane; do not silently route those sources back into local recorder/STT rescue
 - `realtime_runner.py` must not start the local interrupt STT watcher once the voice orchestrator path is active; barge-in belongs to the same remote stream
+- the edge voice websocket contract now carries an explicit `wait_id` for every `listening`/`follow_up_open` state and an attested per-frame `speech_probability`, so the server can fail closed on one transcript-first voice lane instead of reviving host-side speech-evidence fallback logic
 - `src/twinr/orchestrator/voice_session.py` owns server-side wake, transcript-commit, follow-up, and barge-in decisions

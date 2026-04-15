@@ -859,6 +859,26 @@ class TwinrRuntimeMemoryMixin:
             ),
         )
 
+    def review_saved_memories(
+        self,
+        *,
+        kind: str | None = None,
+        limit: int | None = None,
+    ) -> tuple[PersistentMemoryEntry, ...]:
+        """Return explicit durable memories saved through the prompt-context store."""
+
+        kind = self._normalize_optional_identity_text("kind", kind, max_chars=128)
+        limit = self._normalize_limit(limit)
+
+        with self._memory_runtime_lock():
+            entries = self.long_term_memory.prompt_context_store.memory_store.load_entries()
+
+        if kind is not None:
+            entries = tuple(entry for entry in entries if entry.kind == kind)
+        if limit is not None:
+            entries = entries[:limit]
+        return entries
+
     def update_user_profile_context(
         self,
         *,

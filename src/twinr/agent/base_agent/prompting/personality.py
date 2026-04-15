@@ -73,12 +73,15 @@ _DYNAMIC_BUNDLE_CACHE_TTL_S = 15.0
 _SEMI_DYNAMIC_BUNDLE_CACHE_TTL_S = 30.0
 _STATIC_BUNDLE_CACHE_TTL_S = 120.0
 _OPTIONAL_PROMPT_CONTEXT_REMOTE_READ_TIMEOUT_S = 2.0
+_STATIC_SECTION_CACHE_TTL_S = float("inf")
 
 _PERSONALITY_CONTEXT_SERVICE = PersonalityContextService()
 _REMOTE_CONTEXT_WARNING_LOCK = Lock()
 _REMOTE_CONTEXT_WARNINGS: set[str] = set()
 _INSTRUCTION_BUNDLE_CACHE_LOCK = Lock()
 _INSTRUCTION_BUNDLE_RENDER_LOCKS: dict[str, Lock] = {}
+_SECTION_CACHE_LOCK = Lock()
+_SECTION_RENDER_LOCKS: dict[str, Lock] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +90,15 @@ class _InstructionBundleCacheEntry:
 
     signature: tuple[object, ...]
     instructions: str | None
+    expires_at_monotonic: float
+
+
+@dataclass(frozen=True, slots=True)
+class _SectionCacheEntry:
+    """Cache one rendered ordered section set together with its source signature."""
+
+    signature: tuple[object, ...]
+    sections: tuple[tuple[str, str], ...]
     expires_at_monotonic: float
 
 
@@ -161,6 +173,7 @@ class PersonalityContext:
 
 
 _INSTRUCTION_BUNDLE_CACHE: dict[str, _InstructionBundleCacheEntry] = {}
+_SECTION_CACHE: dict[str, _SectionCacheEntry] = {}
 
 
 def load_tool_loop_personality_context(config: TwinrConfig) -> PersonalityContext:
@@ -250,7 +263,7 @@ def load_personality_context(config: TwinrConfig) -> PersonalityContext:
 
 
 def _load_common_sections(config: TwinrConfig) -> list[tuple[str, str]]:
-    sections = _load_static_sections(config)
+    sections = list(_load_cached_static_sections(config))
     prompt_remote_state = _load_prompt_context_remote_state(config)
 
     memory_context = _safe_render_context(
@@ -278,6 +291,24 @@ def _load_common_sections(config: TwinrConfig) -> list[tuple[str, str]]:
             sections.append(("REMINDERS", reminder_context))
 
     return sections
+
+
+def _load_cached_static_sections(config: TwinrConfig) -> tuple[tuple[str, str], ...]:
+    """Return static personality sections cached independently from dynamic context.
+
+    Static managed USER/PERSONALITY sections are remote-authoritative and can
+    trigger bounded but still expensive remote reads. Cache them by their local
+    source signature so tool-loop TTL refreshes only rebuild dynamic memory and
+    reminder sections instead of rehydrating the same remote-managed static
+    payloads on the live voice path.
+    """
+
+    return _load_cached_sections(
+        bundle_key="common_static_sections",
+        signature=_instruction_bundle_signature(config),
+        ttl_s=_STATIC_SECTION_CACHE_TTL_S,
+        render=lambda: tuple(_load_static_sections(config)),
+    )
 
 
 def _load_static_sections(config: TwinrConfig) -> list[tuple[str, str]]:
@@ -669,6 +700,48 @@ def _load_cached_instruction_bundle(
                 expires_at_monotonic=monotonic() + max(ttl_s, 0.0),
             )
         return instructions
+
+
+def _load_cached_sections(
+    *,
+    bundle_key: str,
+    signature: tuple[object, ...],
+    ttl_s: float,
+    render: Callable[[], tuple[tuple[str, str], ...]],
+) -> tuple[tuple[str, str], ...]:
+    """Render one ordered section set only when its prompt sources changed."""
+
+    now = monotonic()
+    with _SECTION_CACHE_LOCK:
+        cached = _SECTION_CACHE.get(bundle_key)
+        if (
+            cached is not None
+            and cached.signature == signature
+            and now < cached.expires_at_monotonic
+        ):
+            return cached.sections
+        render_lock = _SECTION_RENDER_LOCKS.setdefault(bundle_key, Lock())
+
+    with render_lock:
+        now = monotonic()
+        with _SECTION_CACHE_LOCK:
+            cached = _SECTION_CACHE.get(bundle_key)
+            if (
+                cached is not None
+                and cached.signature == signature
+                and now < cached.expires_at_monotonic
+            ):
+                return cached.sections
+
+        sections = tuple(render())
+
+        with _SECTION_CACHE_LOCK:
+            _SECTION_CACHE[bundle_key] = _SectionCacheEntry(
+                signature=signature,
+                sections=sections,
+                expires_at_monotonic=monotonic() + max(ttl_s, 0.0),
+            )
+        return sections
 
 
 def _instruction_bundle_signature(

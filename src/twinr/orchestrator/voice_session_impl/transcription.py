@@ -44,30 +44,6 @@ class VoiceSessionTranscriptionMixin:
     _MAX_ERROR_CHARS = 240
     _DEBUG_PREVIEW_CHARS = 96
 
-    def _wake_phrase_spotter_supports_transcript_matching(
-        self,
-        *,
-        capture: AmbientAudioCaptureWindow,
-        origin_state: str | None,
-    ) -> bool:
-        try:
-            _, wake_phrase_spotter = self._resolve_wake_phrase_spotter(
-                capture,
-                origin_state=origin_state,
-            )
-        except Exception as exc:
-            self._trace_event(
-                "voice_activation_support_probe_error",
-                kind="warning",
-                level="WARN",
-                details=self._build_error_details(
-                    exc,
-                    details={"origin_state": self._normalize_origin_state(origin_state)},
-                ),
-            )
-            return False
-        return callable(getattr(wake_phrase_spotter, "match_transcript", None))
-
     def _assess_familiar_speaker_capture(
         self,
         capture: AmbientAudioCaptureWindow,
@@ -287,43 +263,70 @@ class VoiceSessionTranscriptionMixin:
             )
             self._trace_event(
                 "voice_activation_matcher_error",
-                kind="warning",
-                level="WARN",
+                kind="error",
+                level="ERROR",
                 details={"stage": stage, **resolved_details},
             )
-            return self._detect_wake_capture(capture=capture, stage=stage, details=details)
+            raise RuntimeError(
+                "Wake transcript matching could not resolve the active wake phrase matcher."
+            ) from exc
 
         match_transcript = getattr(wake_phrase_spotter, "match_transcript", None)
-        if callable(match_transcript):
-            try:
-                return match_transcript(normalized_transcript)
-            except Exception as exc:
-                resolved_details = self._build_error_details(
-                    exc,
-                    details=details,
-                    extra={
-                        **self._wake_bias_details(
-                            origin_state=origin_state,
-                            familiar_speaker_assessment=familiar_speaker_assessment,
-                        ),
-                        **self._transcript_debug_details(normalized_transcript),
-                    },
-                )
-                self._record_transcript_debug(
-                    stage=stage,
-                    outcome="matcher_error",
-                    capture=capture,
-                    details=resolved_details,
-                )
-                self._trace_event(
-                    "voice_activation_matcher_error",
-                    kind="warning",
-                    level="WARN",
-                    details={"stage": stage, **resolved_details},
-                )
-                return self._detect_wake_capture(capture=capture, stage=stage, details=details)
+        if not callable(match_transcript):
+            resolved_details = {
+                **self._sanitize_details(details),
+                **self._wake_bias_details(
+                    origin_state=origin_state,
+                    familiar_speaker_assessment=familiar_speaker_assessment,
+                ),
+                **self._transcript_debug_details(normalized_transcript),
+                "matcher_type": type(wake_phrase_spotter).__name__,
+            }
+            self._record_transcript_debug(
+                stage=stage,
+                outcome="matcher_error",
+                capture=capture,
+                details=resolved_details,
+            )
+            self._trace_event(
+                "voice_activation_matcher_missing_transcript_path",
+                kind="error",
+                level="ERROR",
+                details={"stage": stage, **resolved_details},
+            )
+            raise RuntimeError(
+                "Wake transcript matching requires a wake phrase matcher with match_transcript()."
+            )
 
-        return self._detect_wake_capture(capture=capture, stage=stage, details=details)
+        try:
+            return match_transcript(normalized_transcript)
+        except Exception as exc:
+            resolved_details = self._build_error_details(
+                exc,
+                details=details,
+                extra={
+                    **self._wake_bias_details(
+                        origin_state=origin_state,
+                        familiar_speaker_assessment=familiar_speaker_assessment,
+                    ),
+                    **self._transcript_debug_details(normalized_transcript),
+                },
+            )
+            self._record_transcript_debug(
+                stage=stage,
+                outcome="matcher_error",
+                capture=capture,
+                details=resolved_details,
+            )
+            self._trace_event(
+                "voice_activation_matcher_error",
+                kind="error",
+                level="ERROR",
+                details={"stage": stage, **resolved_details},
+            )
+            raise RuntimeError(
+                "Wake transcript matching failed while evaluating the committed utterance."
+            ) from exc
 
     def _backend_request_context(
         self,

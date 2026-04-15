@@ -254,7 +254,15 @@ def _load_projection_filtered_objects(
     loader = getattr(object_store, "load_objects_by_projection_filter", None)
     if not callable(loader):
         return ()
-    return tuple(loader(predicate=predicate))
+    try:
+        return tuple(
+            loader(
+                predicate=predicate,
+                allow_cold_remote_catalog_scan=False,
+            )
+        )
+    except TypeError:
+        return tuple(loader(predicate=predicate))
 
 
 def _load_event_objects(
@@ -267,7 +275,10 @@ def _load_event_objects(
     loader = getattr(object_store, "load_objects_by_event_ids", None)
     if not callable(loader):
         return ()
-    return tuple(loader(event_ids))
+    try:
+        return tuple(loader(event_ids, allow_cold_remote_catalog_scan=False))
+    except TypeError:
+        return tuple(loader(event_ids))
 
 
 def _add_selected_objects(

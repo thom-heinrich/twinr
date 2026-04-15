@@ -282,6 +282,22 @@ class GitGuardCliTests(unittest.TestCase):
             self.assertFalse(payload["ok"])
             self.assertIn("sensitive-assignment", rule_ids)
 
+    def test_scan_staged_allows_symbolic_reference_token_literals(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            self._init_repo(repo_root)
+            (repo_root / "module.py").write_text(
+                '_SELECTED_BASELINE_REPLAY_TOKEN = "@selected_baseline"\n',
+                encoding="utf-8",
+            )
+            _run_git(repo_root, "add", "module.py")
+
+            exit_code, payload, _ = self._run_cli(repo_root, "scan-staged")
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["issues"], [])
+
     def test_scan_staged_allows_blocked_term_policy_definitions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_root = Path(temp_dir)
@@ -409,6 +425,29 @@ class GitGuardCliTests(unittest.TestCase):
             self.assertFalse(payload["ok"])
             issues = cast(list[dict[str, Any]], payload["issues"])
             self.assertEqual(issues[0]["rule_id"], "phone-number")
+
+    def test_scan_staged_ignores_git_patch_index_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            self._init_repo(repo_root)
+            (repo_root / "changes.patch").write_text(
+                (
+                    "diff --git a/src/drivers/src/i2c_drv.c b/src/drivers/src/i2c_drv.c\n"
+                    "index 6eab7ec..9295343 100644\n"
+                    "diff --git a/src/drivers/src/i2cdev.c b/src/drivers/src/i2cdev.c\n"
+                    "index 3fa753b..120a663 100644\n"
+                    "diff --git a/src/modules/src/system.c b/src/modules/src/system.c\n"
+                    "index e1103eb..f96e1c3 100644\n"
+                ),
+                encoding="utf-8",
+            )
+            _run_git(repo_root, "add", "changes.patch")
+
+            exit_code, payload, _ = self._run_cli(repo_root, "scan-staged")
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["issues"], [])
 
     def test_scan_staged_ignores_binary_patch_content_without_crashing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

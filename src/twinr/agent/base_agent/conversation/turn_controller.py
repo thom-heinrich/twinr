@@ -47,6 +47,10 @@ from twinr.agent.base_agent.prompting.personality import load_turn_controller_in
 TurnDecisionName = Literal["continue_listening", "end_turn"]
 TurnDecisionLabel = Literal["complete", "incomplete", "backchannel", "wait"]
 
+
+class TurnControllerEvaluationError(RuntimeError):
+    """Raised when the single turn-controller lane cannot produce a decision."""
+
 _DEFAULT_CONTEXT_TURNS = 8
 _DEFAULT_MAX_TRANSCRIPT_CHARS = 4096
 _DEFAULT_MAX_REASON_CHARS = 256
@@ -636,19 +640,7 @@ class ToolCallingTurnDecisionEvaluator:
         )
 
         if self._is_circuit_open():
-            local_fallback = _local_semantic_turn_decision(
-                config=self.config,
-                candidate=candidate,
-                conversation=conversation,
-                best_effort=True,
-                reason_prefix="turn_controller_circuit_open",
-            )
-            if local_fallback is not None:
-                return local_fallback
-            return self._fallback_decision(
-                reason="turn_controller_circuit_open",
-                transcript=fallback_transcript,
-            )
+            raise TurnControllerEvaluationError("turn_controller_circuit_open")
 
         compact_conversation = _compact_conversation(
             conversation,
@@ -696,12 +688,9 @@ class ToolCallingTurnDecisionEvaluator:
             )
         except Exception as exc:
             self._note_failure()
-            return self._fallback_or_wait(
-                candidate=candidate,
-                conversation=compact_conversation,
-                fallback_transcript=fallback_transcript,
-                reason=f"turn_controller_error:{type(exc).__name__}",
-            )
+            raise TurnControllerEvaluationError(
+                f"turn_controller_error:{type(exc).__name__}"
+            ) from exc
 
         parsed_decision = self._extract_provider_decision(
             response=response,
@@ -709,12 +698,7 @@ class ToolCallingTurnDecisionEvaluator:
         )
         if parsed_decision is None:
             self._note_failure()
-            return self._fallback_or_wait(
-                candidate=candidate,
-                conversation=compact_conversation,
-                fallback_transcript=fallback_transcript,
-                reason="turn_controller_invalid_provider_output",
-            )
+            raise TurnControllerEvaluationError("turn_controller_invalid_provider_output")
 
         self._note_success()
         return parsed_decision
@@ -748,33 +732,7 @@ class ToolCallingTurnDecisionEvaluator:
                 payload = _extract_json_object(bounded_arguments) or {}
             return self._coerce_decision(payload, fallback_transcript=fallback_transcript)
 
-        response_text = _safe_getattr(response, "text", "")
-        return self._parse_text_fallback(
-            response_text,
-            fallback_transcript=fallback_transcript,
-        )
-
-    def _fallback_or_wait(
-        self,
-        *,
-        candidate: TurnEvaluationCandidate,
-        conversation: ConversationLike | None,
-        fallback_transcript: str,
-        reason: str,
-    ) -> TurnDecision:
-        local_fallback = _local_semantic_turn_decision(
-            config=self.config,
-            candidate=candidate,
-            conversation=conversation,
-            best_effort=True,
-            reason_prefix=reason,
-        )
-        if local_fallback is not None:
-            return local_fallback
-        return self._fallback_decision(
-            reason=reason,
-            transcript=fallback_transcript,
-        )
+        return None
 
     def _build_prompt(
         self,
@@ -888,57 +846,6 @@ class ToolCallingTurnDecisionEvaluator:
             transcript=transcript,
         )
 
-    def _parse_text_fallback(
-        self,
-        text: object,
-        *,
-        fallback_transcript: str,
-    ) -> TurnDecision | None:
-        bounded_text = _coerce_text(
-            text,
-            max_chars=_config_int(
-                self.config,
-                "turn_controller_model_text_fallback_max_chars",
-                _DEFAULT_MODEL_TEXT_FALLBACK_MAX_CHARS,
-                minimum=512,
-                maximum=65536,
-            ),
-        )
-        if not bounded_text:
-            return None
-        payload = _extract_json_object(bounded_text)
-        if payload is None:
-            return None
-        return self._coerce_decision(payload, fallback_transcript=fallback_transcript)
-
-    def _fallback_decision(self, *, reason: str, transcript: str) -> TurnDecision:
-        return TurnDecision(
-            decision="continue_listening",
-            label="wait",
-            confidence=0.0,
-            reason=_coerce_text(
-                reason,
-                default="turn_controller_fallback",
-                max_chars=_config_int(
-                    self.config,
-                    "turn_controller_max_reason_chars",
-                    _DEFAULT_MAX_REASON_CHARS,
-                    minimum=32,
-                    maximum=2048,
-                ),
-            ) or "turn_controller_fallback",
-            transcript=_coerce_text(
-                transcript,
-                max_chars=_config_int(
-                    self.config,
-                    "turn_controller_max_transcript_chars",
-                    _DEFAULT_MAX_TRANSCRIPT_CHARS,
-                    minimum=64,
-                    maximum=32768,
-                ),
-            ),
-        )
-
     def _is_circuit_open(self) -> bool:
         with self._state_lock:
             return self._circuit_open_until_monotonic > time.monotonic()
@@ -989,6 +896,7 @@ class StreamingTurnController:
         self._latest_partial_normalized = ""
         self._pending_candidate: TurnEvaluationCandidate | None = None
         self._last_decision: TurnDecision | None = None
+        self._fatal_error: TurnControllerEvaluationError | None = None
         self._evaluation_inflight = False
         self._stop_requested = False
         self._closed = False
@@ -1032,7 +940,6 @@ class StreamingTurnController:
                 maximum=32768,
             ),
         )
-        fallback_transcript = ""
         with self._lock:
             if self._closed or self._stop_requested:
                 return
@@ -1055,7 +962,6 @@ class StreamingTurnController:
             self._state_revision = next_revision
             self._latest_partial = transcript
             self._latest_partial_normalized = _normalize_turn_text(transcript)
-            fallback_transcript = transcript
 
             if self._should_defer_bare_speech_final_locked(
                 event,
@@ -1100,21 +1006,15 @@ class StreamingTurnController:
                     name="twinr-turn-controller",
                 ).start()
             except Exception as exc:
-                start_failure_decision = self._local_decision_or_wait(
-                    TurnEvaluationCandidate.from_endpoint_event(
-                        event,
-                        transcript=fallback_transcript,
-                        source_revision=0,
-                    ),
-                    reason=f"turn_controller_runner_start_error:{type(exc).__name__}",
+                error = TurnControllerEvaluationError(
+                    f"turn_controller_runner_start_error:{type(exc).__name__}"
                 )
                 with self._lock:
                     self._evaluation_inflight = False
                     self._pending_candidate = None
-                    self._last_decision = start_failure_decision
-                    if start_failure_decision.decision == "end_turn":
-                        self._stop_requested = True
-                emit_messages.extend(self._decision_emit_messages(start_failure_decision))
+                    self._fatal_error = error
+                    self._stop_requested = True
+                emit_messages.append(self._format_emit("turn_controller_error", str(error)))
 
         self._emit_many(emit_messages)
 
@@ -1137,7 +1037,7 @@ class StreamingTurnController:
 
     def should_stop_capture(self) -> bool:
         with self._lock:
-            return self._stop_requested
+            return self._stop_requested or self._fatal_error is not None
 
     def latest_transcript(self) -> str:
         with self._lock:
@@ -1152,6 +1052,10 @@ class StreamingTurnController:
     def last_decision(self) -> TurnDecision | None:
         with self._lock:
             return self._last_decision
+
+    def fatal_error(self) -> TurnControllerEvaluationError | None:
+        with self._lock:
+            return self._fatal_error
 
     def close(self) -> None:
         with self._lock:
@@ -1172,7 +1076,15 @@ class StreamingTurnController:
                     self._evaluation_inflight = False
                 return
 
-            decision = self._evaluate_candidate_with_watchdog(candidate)
+            try:
+                decision = self._evaluate_candidate_with_watchdog(candidate)
+            except TurnControllerEvaluationError as exc:
+                with self._lock:
+                    self._fatal_error = exc
+                    self._evaluation_inflight = False
+                    self._stop_requested = True
+                self._emit_many([self._format_emit("turn_controller_error", str(exc))])
+                return
             emit_messages: list[str] = []
             should_return = False
 
@@ -1214,10 +1126,7 @@ class StreamingTurnController:
 
         with self._lock:
             if self._evaluator_worker_active:
-                return self._local_decision_or_wait(
-                    candidate,
-                    reason="turn_controller_worker_busy",
-                )
+                raise TurnControllerEvaluationError("turn_controller_worker_busy")
             self._evaluator_worker_active = True
 
         done = Event()
@@ -1251,62 +1160,22 @@ class StreamingTurnController:
         except Exception as exc:
             with self._lock:
                 self._evaluator_worker_active = False
-            return self._local_decision_or_wait(
-                candidate,
-                reason=f"turn_controller_worker_start_error:{type(exc).__name__}",
-            )
+            raise TurnControllerEvaluationError(
+                f"turn_controller_worker_start_error:{type(exc).__name__}"
+            ) from exc
 
         if not done.wait(timeout_seconds):
-            return self._local_decision_or_wait(
-                candidate,
-                reason="turn_controller_timeout",
-            )
+            raise TurnControllerEvaluationError("turn_controller_timeout")
 
         if error_holder:
-            return self._local_decision_or_wait(
-                candidate,
-                reason=f"turn_controller_error:{type(error_holder[0]).__name__}",
-            )
+            raise TurnControllerEvaluationError(
+                f"turn_controller_error:{type(error_holder[0]).__name__}"
+            ) from error_holder[0]
 
         if not decision_holder:
-            return self._local_decision_or_wait(
-                candidate,
-                reason="turn_controller_no_result",
-            )
+            raise TurnControllerEvaluationError("turn_controller_no_result")
 
         return decision_holder[0]
-
-    def _local_decision_or_wait(
-        self,
-        candidate: TurnEvaluationCandidate,
-        *,
-        reason: str,
-    ) -> TurnDecision:
-        local_decision = _local_semantic_turn_decision(
-            config=self._config,
-            candidate=candidate,
-            conversation=self._conversation_factory(),
-            best_effort=True,
-            reason_prefix=reason,
-        )
-        if local_decision is not None:
-            return self._sanitize_decision(local_decision, fallback_transcript=candidate.transcript)
-        return TurnDecision(
-            decision="continue_listening",
-            label="wait",
-            confidence=0.0,
-            reason=reason,
-            transcript=_coerce_text(
-                candidate.transcript,
-                max_chars=_config_int(
-                    self._config,
-                    "turn_controller_max_transcript_chars",
-                    _DEFAULT_MAX_TRANSCRIPT_CHARS,
-                    minimum=64,
-                    maximum=32768,
-                ),
-            ),
-        )
 
     def _sanitize_decision(
         self,

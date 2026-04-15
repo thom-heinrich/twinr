@@ -3,9 +3,9 @@
 # CHANGELOG: 2026-03-27
 # BUG-1: Serialized controller/shared-state access across callback and capture threads to
 #        eliminate turn-decision races and inconsistent transcript hints.
-# BUG-2: Added bounded finalize deadlines plus explicit recovery paths so stalled streaming
-#        providers no longer hang the realtime loop indefinitely.
-# BUG-3: Promote transport send failures into buffered-audio recovery instead of silently
+# BUG-2: Added bounded finalize deadlines so stalled streaming providers no longer hang
+#        the realtime loop indefinitely.
+# BUG-3: Promote transport send/finalize failures into explicit turn failures instead of
 #        accepting truncated or empty transcripts.
 # SEC-1: Raw partial transcripts are no longer emitted by default; telemetry is sanitized
 #        and fingerprinted unless an explicit opt-in flag enables full transcript logging.
@@ -13,9 +13,7 @@
 #        failures on constrained deployments such as Raspberry Pi 4.
 # IMP-1: Opportunistically uses provider control hooks for mid-stream configuration, stream
 #        flush / CloseStream, and keepalive when the session implementation exposes them.
-# IMP-2: Added optional hybrid fallback hooks so cloud-stream degradation can recover from
-#        buffered PCM through provider or on-device STT backends.
-# IMP-3: Added safer transcript telemetry and transcript-stability helpers tuned for modern
+# IMP-2: Added safer transcript telemetry and transcript-stability helpers tuned for modern
 #        voice-agent streaming pipelines.
 
 
@@ -423,163 +421,6 @@ class TwinrRealtimeTurnCaptureMixin:
             )
         raise TimeoutError(f"streaming finalize exceeded {timeout_ms}ms")
 
-    def _coerce_fallback_transcript(self, value: Any) -> str:
-        if value is None:
-            return ""
-        if isinstance(value, str):
-            return value.strip()
-        for attr_name in ("transcript", "text"):
-            text = getattr(value, attr_name, None)
-            if isinstance(text, str) and text.strip():
-                return text.strip()
-        alternatives = getattr(value, "alternatives", None)
-        if alternatives:
-            for alternative in alternatives:
-                text = self._coerce_fallback_transcript(alternative)
-                if text:
-                    return text
-        if isinstance(value, dict):
-            for key in ("transcript", "text"):
-                text = value.get(key)
-                if isinstance(text, str) and text.strip():
-                    return text.strip()
-            results = value.get("results")
-            if isinstance(results, dict):
-                channels = results.get("channels")
-                if isinstance(channels, list):
-                    for channel in channels:
-                        if not isinstance(channel, dict):
-                            continue
-                        alternatives = channel.get("alternatives")
-                        if isinstance(alternatives, list):
-                            for alternative in alternatives:
-                                text = self._coerce_fallback_transcript(alternative)
-                                if text:
-                                    return text
-        if isinstance(value, list):
-            for item in value:
-                text = self._coerce_fallback_transcript(item)
-                if text:
-                    return text
-        return ""
-
-    def _call_fallback_method(self, method: Any, *, pcm_bytes: bytes) -> str:
-        call_specs = (
-            {
-                "pcm_bytes": pcm_bytes,
-                "sample_rate": self._recorder_sample_rate(),
-                "channels": self.config.audio_channels,
-                "language": self.config.deepgram_stt_language,
-            },
-            {
-                "audio_bytes": pcm_bytes,
-                "sample_rate": self._recorder_sample_rate(),
-                "channels": self.config.audio_channels,
-                "language": self.config.deepgram_stt_language,
-            },
-            {
-                "pcm": pcm_bytes,
-                "sample_rate": self._recorder_sample_rate(),
-                "channels": self.config.audio_channels,
-                "language": self.config.deepgram_stt_language,
-            },
-        )
-        for kwargs in call_specs:
-            try:
-                transcript = self._coerce_fallback_transcript(method(**kwargs))
-            except TypeError:
-                continue
-            if transcript:
-                return transcript
-        try:
-            return self._coerce_fallback_transcript(method(pcm_bytes))
-        except TypeError:
-            return ""
-        except Exception:
-            raise
-        return ""
-
-    def _attempt_pcm_transcript_fallback(
-        self,
-        *,
-        stt_provider: StreamingSpeechToTextProvider,
-        capture_result: SpeechCaptureResult | None,
-    ) -> str:
-        if capture_result is None or not getattr(capture_result, "pcm_bytes", b""):
-            return ""
-        fallback_targets: list[Any] = []
-        for attr_name in (
-            "local_streaming_stt_fallback_runtime",
-            "streaming_stt_fallback_runtime",
-            "on_device_stt_runtime",
-        ):
-            target = getattr(self, attr_name, None)
-            if target is not None and target not in fallback_targets:
-                fallback_targets.append(target)
-        if stt_provider not in fallback_targets:
-            fallback_targets.append(stt_provider)
-
-        for target in fallback_targets:
-            for method_name in ("transcribe_pcm", "transcribe_bytes", "transcribe_audio", "transcribe"):
-                method = getattr(target, method_name, None)
-                if not callable(method):
-                    continue
-                try:
-                    transcript = self._call_fallback_method(
-                        method,
-                        pcm_bytes=capture_result.pcm_bytes,
-                    )
-                except Exception as exc:
-                    self.emit(f"stt_pcm_fallback_failed={type(exc).__name__}")
-                    self._trace_event(
-                        "turn_controller_pcm_fallback_failed",
-                        kind="exception",
-                        level="WARN",
-                        details={
-                            "error_type": type(exc).__name__,
-                            "method": method_name,
-                            "target_type": type(target).__name__,
-                        },
-                    )
-                    continue
-                if transcript:
-                    self._trace_event(
-                        "turn_controller_pcm_fallback_succeeded",
-                        kind="branch",
-                        details={
-                            "method": method_name,
-                            "target_type": type(target).__name__,
-                            "transcript_len": len(transcript),
-                        },
-                    )
-                    return transcript
-        return ""
-
-    def _recover_after_streaming_failure(
-        self,
-        *,
-        stt_provider: StreamingSpeechToTextProvider,
-        capture_result: SpeechCaptureResult | None,
-        transcript_hint: str,
-        saw_interim: bool,
-        capture_ms: int,
-    ) -> str:
-        transcript = (transcript_hint or "").strip()
-        transcript = self._maybe_recover_low_evidence_streaming_transcript(
-            stt_provider=stt_provider,
-            capture_result=capture_result,
-            transcript=transcript,
-            saw_interim=saw_interim,
-            capture_ms=capture_ms,
-        )
-        if transcript:
-            return transcript
-        transcript = self._attempt_pcm_transcript_fallback(
-            stt_provider=stt_provider,
-            capture_result=capture_result,
-        )
-        return transcript.strip()
-
     def _capture_and_transcribe_with_turn_controller(
         self,
         *,
@@ -795,36 +636,17 @@ class TwinrRealtimeTurnCaptureMixin:
                 details={"pcm_bytes": len(capture_result.pcm_bytes)},
                 kpi={"duration_ms": capture_ms},
             )
+            with shared_lock:
+                controller_error = None if controller is None else controller.fatal_error()
+            if controller_error is not None:
+                raise controller_error
 
             with shared_lock:
                 send_error = streaming_send_error[0] if streaming_send_error else None
             if send_error is not None:
-                transcript = self._recover_after_streaming_failure(
-                    stt_provider=stt_provider,
-                    capture_result=capture_result,
-                    transcript_hint=best_effort_transcript_hint(),
-                    saw_interim=bool(current_partial_text()),
-                    capture_ms=capture_ms,
-                )
-                transcript = self._maybe_verify_streaming_transcript(
-                    capture_result=capture_result,
-                    transcript=transcript,
-                    capture_ms=capture_ms,
-                    saw_speech_final=False,
-                    saw_utterance_end=False,
-                    confidence=None,
-                )
-                self.emit("stt_streaming_recovered_from_transport=true")
-                self._trace_event(
-                    "turn_controller_transport_recovered",
-                    kind="branch",
-                    level="WARN",
-                    details={
-                        "error_type": type(send_error).__name__,
-                        "transcript_len": len(transcript),
-                    },
-                )
-                return capture_result, transcript, capture_ms, -1, current_turn_label()
+                raise RuntimeError(
+                    f"turn_controller_stream_send_failed:{type(send_error).__name__}"
+                ) from send_error
 
             early_result = None
             try:
@@ -834,7 +656,7 @@ class TwinrRealtimeTurnCaptureMixin:
                     controller_lock=shared_lock,
                 )
             except Exception as exc:
-                self.emit(f"stt_streaming_early_fallback={type(exc).__name__}")
+                self.emit(f"stt_streaming_early_probe_failed={type(exc).__name__}")
             if early_result is not None:
                 if early_result.request_id:
                     self.emit(f"stt_request_id={early_result.request_id}")
@@ -890,31 +712,9 @@ class TwinrRealtimeTurnCaptureMixin:
             try:
                 result = self._finalize_streaming_session(session=session)
             except Exception as exc:
-                transcript = self._recover_after_streaming_failure(
-                    stt_provider=stt_provider,
-                    capture_result=capture_result,
-                    transcript_hint=early_transcript_hint or best_effort_transcript_hint(),
-                    saw_interim=bool(current_partial_text()),
-                    capture_ms=capture_ms,
-                )
-                transcript = self._maybe_verify_streaming_transcript(
-                    capture_result=capture_result,
-                    transcript=transcript,
-                    capture_ms=capture_ms,
-                    saw_speech_final=False,
-                    saw_utterance_end=False,
-                    confidence=None,
-                )
-                if capture_result is not None:
-                    self.emit(f"turn_controller_finalize_recovered={type(exc).__name__}")
-                    self._trace_event(
-                        "turn_controller_finalize_recovered",
-                        kind="branch",
-                        level="WARN",
-                        details={"error_type": type(exc).__name__, "hint_len": len(transcript)},
-                    )
-                    return capture_result, transcript, capture_ms, -1, current_turn_label()
-                raise
+                raise RuntimeError(
+                    f"turn_controller_finalize_failed:{type(exc).__name__}"
+                ) from exc
             stt_ms = int((time.monotonic() - stt_started) * 1000)
             self._trace_event(
                 "turn_controller_finalize_completed",

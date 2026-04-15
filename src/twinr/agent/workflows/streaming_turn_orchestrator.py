@@ -308,6 +308,7 @@ class StreamingTurnOrchestrator:
     ) -> StreamingTurnLaneOutcome:
         """Run one streaming turn with a parallel bridge and final lane."""
 
+        del bridge_fallback_reply
         started_at_ns = time.monotonic_ns()
         cleanup_reason = "execute_exit"
         bridge_deadline_ns = started_at_ns + _ms_to_ns(self.timeout_policy.bridge_reply_timeout_ms)
@@ -483,36 +484,8 @@ class StreamingTurnOrchestrator:
                     bridge_timeout_triggered = True
                     bridge_watchdog_triggered = True
                     self._emit("first_word_timeout=true")
-                    bridge_reply, bridge_source = self._normalize_bridge_reply(
-                        bridge_fallback_reply,
-                        source="watchdog_fallback",
-                        deadline_expired=False,
-                    )
-                    if bridge_reply is not None:
-                        self._emit_lane_delta(
-                            bridge_reply.spoken_text,
-                            lane="direct" if bridge_reply.mode == "direct" else "filler",
-                            replace_current=False,
-                            atomic=True,
-                        )
-                        bridge_emitted = True
-                        first_audio_gate_required = bridge_reply.mode == "filler"
-                        bridge_resume_processing_required = first_audio_gate_required and not final_task.done
-                        if bridge_reply.mode == "direct":
-                            cleanup_reason = "bridge_watchdog_direct_reply"
-                            self._stop_final_lane_feedback()
-                            return StreamingTurnLaneOutcome(
-                                response=_direct_reply_result(bridge_reply),
-                                first_word_reply=bridge_reply,
-                                first_word_source=bridge_source,
-                                bridge_watchdog_triggered=True,
-                                bridge_lane_elapsed_ms=None if bridge_task is None else bridge_task.elapsed_ms,
-                                final_lane_elapsed_ms=final_task.elapsed_ms,
-                                metadata={"exit_reason": cleanup_reason},
-                            )
-                    else:
-                        self.ensure_processing_feedback()
-                        bridge_source = "none"
+                    self.ensure_processing_feedback()
+                    bridge_source = "none"
 
                 if not final_lane_watchdog_triggered and now_ns >= final_watchdog_deadline_ns:
                     final_lane_watchdog_triggered = True

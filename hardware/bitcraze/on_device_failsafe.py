@@ -1,36 +1,39 @@
 #!/usr/bin/env python3
 # CHANGELOG: 2026-03-27
 # BUG-1: start() is now transactional and removes the Appchannel callback again if the first heartbeat or worker startup fails.
-# BUG-2: optional trace_writer failures can no longer abort startup, heartbeat transmission, or shutdown; tracing is fail-open.
+# SEC-3: 2026-04-11 trace_writer misuse and trace emission failures now surface immediately instead of being swallowed fail-open.
 # BUG-3: invalid threshold combinations (for example timeout <= period or low_battery <= critical_battery) now fail fast instead of silently producing bad firmware config.
 # SEC-1: session ids are now generated with secrets.randbelow() instead of predictable time-based low bits.
 # SEC-2: # BREAKING: start() now refuses to arm the host heartbeat session when probe_on_device_failsafe() did not verify the firmware app.
+# BUG-5: Host takeoff and the on-device failsafe used to disagree about when lateral clearance should become active; the session can now arm lateral clearance explicitly after takeoff confirmation.
+# ARCH-1: 2026-04-14 the STM32 app is no longer only a passive failsafe. The host now sends one bounded hover intent over Appchannel and the Crazyflie owns the critical takeoff/hover/landing state machine locally.
 # IMP-1: the heartbeat worker now uses monotonic deadline scheduling, drift compensation, and deadline-miss accounting instead of simple periodic waits.
 # IMP-2: optional cflib link_statistics integration records latency/link quality/RSSI/rates/congestion on current stable cflib when available.
 # IMP-3: exact packet-size parsing, context-manager support, wait_for_status(), richer reports, and stricter Appchannel MTU guards improve deployment diagnostics.
 
-"""Drive Twinr's on-device Crazyflie failsafe over the Appchannel.
+"""Drive Twinr's on-device Crazyflie hover/failsafe app over the Appchannel.
 
 Purpose
 -------
-Keep the host-side part of the on-device failsafe intentionally small. This
-module only proves that the firmware app is present, sends bounded heartbeat
-packets with the current failsafe thresholds, and records status packets sent
-back by the app. The actual safety-critical land/avoid controller lives on the
-Crazyflie in C; Python only configures and observes it.
+Keep the host-side part of the on-device Crazyflie lane intentionally small.
+This module proves that the firmware app is present, sends bounded heartbeat
+packets with the current failsafe thresholds, submits one bounded hover intent,
+and records status packets sent back by the app. The safety-critical
+takeoff/hover/landing controller lives on the Crazyflie in C; Python only
+configures, requests, and observes it.
 
 Frontier notes
 --------------
 This host module intentionally stays on the stable cflib API surface. It adds
-fail-closed startup, validated configuration, deadline-based heartbeat
-scheduling, and optional link-performance observability, while leaving the
-actual safety controller on-device where communication dropouts cannot remove
-the safety path.
+fail-closed startup, validated configuration, bounded mission-intent transport,
+deadline-based heartbeat scheduling, and optional link-performance
+observability, while leaving the actual control/safety path on-device where
+communication dropouts cannot remove it.
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import secrets
 import struct
 import threading
@@ -38,11 +41,19 @@ import time
 from typing import Any, Callable, Mapping
 
 
+# BUG-4: 2026-04-12 the host now distinguishes between the legacy v1 heartbeat
+# transport it still emits and the newer firmware surface version advertised by
+# the STM32 app. Firmware protocol v2 remains backward-compatible with v1
+# heartbeats and uses the negotiated packet version for status packets.
 ON_DEVICE_FAILSAFE_PROTOCOL_VERSION = 1
+ON_DEVICE_FAILSAFE_COMMAND_PROTOCOL_VERSION = 4
+ON_DEVICE_FAILSAFE_SUPPORTED_FIRMWARE_PROTOCOL_VERSIONS = frozenset((1, 2, 3, 4))
 ON_DEVICE_FAILSAFE_PACKET_KIND_HEARTBEAT = 1
 ON_DEVICE_FAILSAFE_PACKET_KIND_STATUS = 2
+ON_DEVICE_FAILSAFE_PACKET_KIND_COMMAND = 3
 ON_DEVICE_FAILSAFE_FLAG_ENABLE = 1 << 0
 ON_DEVICE_FAILSAFE_FLAG_REQUIRE_CLEARANCE = 1 << 1
+ON_DEVICE_FAILSAFE_FLAG_ARM_LATERAL_CLEARANCE = 1 << 2
 ON_DEVICE_FAILSAFE_HEARTBEAT_PERIOD_S = 0.1
 ON_DEVICE_FAILSAFE_HEARTBEAT_TIMEOUT_S = 0.35
 ON_DEVICE_FAILSAFE_LOW_BATTERY_V = 3.55
@@ -53,10 +64,35 @@ ON_DEVICE_FAILSAFE_DESCENT_RATE_MPS = 0.12
 ON_DEVICE_FAILSAFE_MAX_REPEL_VELOCITY_MPS = 0.15
 ON_DEVICE_FAILSAFE_BRAKE_HOLD_S = 0.20
 ON_DEVICE_FAILSAFE_APPCHANNEL_MTU = 30
+ON_DEVICE_HOVER_COMMAND_KIND_START = 1
+ON_DEVICE_HOVER_COMMAND_KIND_LAND = 2
+ON_DEVICE_HOVER_COMMAND_KIND_ABORT = 3
+ON_DEVICE_HOVER_STATE_FLAG_AIRBORNE = 1 << 0
+ON_DEVICE_HOVER_STATE_FLAG_RANGE_LIVE = 1 << 1
+ON_DEVICE_HOVER_STATE_FLAG_FLOW_LIVE = 1 << 2
+ON_DEVICE_HOVER_STATE_FLAG_MISSION_ACTIVE = 1 << 3
+ON_DEVICE_HOVER_STATE_FLAG_TAKEOFF_PROVEN = 1 << 4
+ON_DEVICE_HOVER_STATE_FLAG_HOVER_QUALIFIED = 1 << 5
+ON_DEVICE_HOVER_STATE_FLAG_LANDING_ACTIVE = 1 << 6
+ON_DEVICE_HOVER_STATE_FLAG_COMPLETE = 1 << 7
+ON_DEVICE_FAILSAFE_DEBUG_FLAG_RANGE_READY = 1 << 0
+ON_DEVICE_FAILSAFE_DEBUG_FLAG_FLOW_READY = 1 << 1
+ON_DEVICE_FAILSAFE_DEBUG_FLAG_THRUST_AT_CEILING = 1 << 2
+ON_DEVICE_FAILSAFE_DEBUG_FLAG_HOVER_THRUST_VALID = 1 << 3
+ON_DEVICE_FAILSAFE_DEBUG_FLAG_DISTURBANCE_VALID = 1 << 4
+ON_DEVICE_FAILSAFE_DEBUG_FLAG_TOUCHDOWN_BY_RANGE = 1 << 5
+ON_DEVICE_FAILSAFE_DEBUG_FLAG_TOUCHDOWN_BY_SUPERVISOR = 1 << 6
+ON_DEVICE_FAILSAFE_DEBUG_FLAG_ATTITUDE_READY = 1 << 7
+ON_DEVICE_HOVER_MICRO_LIFTOFF_HEIGHT_M = 0.08
+ON_DEVICE_HOVER_TAKEOFF_RAMP_S = 1.0
+ON_DEVICE_HOVER_TARGET_TOLERANCE_M = 0.05
 
 _UINT16_MAX = 0xFFFF
 _HEARTBEAT_STRUCT = struct.Struct("<BBBBHHHHHHHHH")
+_COMMAND_STRUCT = struct.Struct("<BBBBHHHHHH")
 _STATUS_STRUCT = struct.Struct("<BBBBHHHHH")
+_STATUS_STRUCT_V3 = struct.Struct("<BBBBHHHHHBBHHH")
+_STATUS_STRUCT_V4 = struct.Struct("<BBBBHHHHHBBHHHHHBBH")
 _AVAILABLE_PARAM_NAMES = (
     "twinrFs.protocolVersion",
     "twinrFs.enable",
@@ -70,6 +106,10 @@ _STATE_NAMES = {
     3: "failsafe_descend",
     4: "touchdown_confirm",
     5: "landed",
+    6: "mission_takeoff",
+    7: "mission_hover",
+    8: "mission_landing",
+    9: "mission_complete",
 }
 _REASON_NAMES = {
     0: "none",
@@ -79,6 +119,15 @@ _REASON_NAMES = {
     4: "clearance",
     5: "up_clearance",
     6: "manual_disable",
+    7: "mission_abort",
+    8: "takeoff_range_liveness",
+    9: "takeoff_flow_liveness",
+    10: "takeoff_attitude_quiet",
+    11: "truth_stale",
+    12: "state_flapping",
+    13: "ceiling_without_progress",
+    14: "disturbance_nonrecoverable",
+    15: "takeoff_overshoot",
 }
 
 
@@ -88,6 +137,7 @@ class OnDeviceFailsafeConfig:
 
     enabled: bool = True
     require_clearance: bool = True
+    arm_lateral_clearance: bool = True
     heartbeat_period_s: float = ON_DEVICE_FAILSAFE_HEARTBEAT_PERIOD_S
     heartbeat_timeout_s: float = ON_DEVICE_FAILSAFE_HEARTBEAT_TIMEOUT_S
     low_battery_v: float = ON_DEVICE_FAILSAFE_LOW_BATTERY_V
@@ -126,6 +176,40 @@ class OnDeviceFailsafeStatus:
     vbat_mv: int
     min_clearance_mm: int
     down_range_mm: int
+    mission_flags: int | None = None
+    debug_flags: int | None = None
+    target_height_mm: int | None = None
+    commanded_height_mm: int | None = None
+    state_estimate_z_mm: int | None = None
+    up_range_mm: int | None = None
+    motion_squal: int | None = None
+    touchdown_confirm_count: int | None = None
+    hover_thrust_permille: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OnDeviceHoverIntent:
+    """Describe one bounded on-device hover mission requested by the host."""
+
+    target_height_m: float
+    hover_duration_s: float
+    takeoff_ramp_s: float = ON_DEVICE_HOVER_TAKEOFF_RAMP_S
+    micro_liftoff_height_m: float = ON_DEVICE_HOVER_MICRO_LIFTOFF_HEIGHT_M
+    target_tolerance_m: float = ON_DEVICE_HOVER_TARGET_TOLERANCE_M
+
+
+@dataclass(frozen=True, slots=True)
+class OnDeviceHoverResult:
+    """Summarize one bounded on-device hover mission execution."""
+
+    final_status: OnDeviceFailsafeStatus | None
+    observed_state_names: tuple[str, ...]
+    observed_reason_names: tuple[str, ...]
+    took_off: bool
+    landed: bool
+    qualified_hover_reached: bool
+    landing_reached: bool
+    failures: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +246,8 @@ class OnDeviceFailsafeSessionReport:
     last_heartbeat_sent_monotonic_s: float | None
     last_status_received_monotonic_s: float | None
     last_status: OnDeviceFailsafeStatus | None
+    observed_state_names: tuple[str, ...]
+    observed_reason_names: tuple[str, ...]
     link_metrics: OnDeviceFailsafeLinkMetrics | None
     failures: tuple[str, ...]
 
@@ -174,17 +260,14 @@ def _emit_trace(
     message: str | None = None,
     data: Mapping[str, object] | None = None,
 ) -> None:
-    """Emit one optional trace event without depending on a concrete writer type."""
+    """Emit one trace event or fail fast when the configured writer is invalid."""
 
     if trace_writer is None:
         return
     emit = getattr(trace_writer, "emit", None)
     if emit is None:
-        return
-    try:
-        emit(phase, status=status, message=message, data=dict(data) if data is not None else None)
-    except Exception:
-        return
+        raise AttributeError("trace_writer must expose an emit() method")
+    emit(phase, status=status, message=message, data=dict(data) if data is not None else None)
 
 
 def _normalize_uint16(value: float, *, minimum: int = 0) -> int:
@@ -296,6 +379,33 @@ def _reason_name(code: int | None) -> str | None:
     return _REASON_NAMES.get(int(code), f"unknown_{int(code)}")
 
 
+def validate_on_device_hover_intent(intent: OnDeviceHoverIntent) -> OnDeviceHoverIntent:
+    """Validate one bounded hover intent before it is sent to the aircraft."""
+
+    if not isinstance(intent, OnDeviceHoverIntent):
+        raise TypeError(f"intent must be OnDeviceHoverIntent, got {type(intent).__name__}")
+    _validate_positive_scaled_field("target_height_m", intent.target_height_m, scale=1000.0, minimum=1)
+    _validate_positive_scaled_field("hover_duration_s", intent.hover_duration_s, scale=1000.0, minimum=1)
+    _validate_positive_scaled_field("takeoff_ramp_s", intent.takeoff_ramp_s, scale=1000.0, minimum=1)
+    _validate_positive_scaled_field(
+        "micro_liftoff_height_m",
+        intent.micro_liftoff_height_m,
+        scale=1000.0,
+        minimum=1,
+    )
+    _validate_positive_scaled_field(
+        "target_tolerance_m",
+        intent.target_tolerance_m,
+        scale=1000.0,
+        minimum=1,
+    )
+    if float(intent.micro_liftoff_height_m) > float(intent.target_height_m):
+        raise ValueError(
+            "micro_liftoff_height_m must be <= target_height_m for one bounded hover mission"
+        )
+    return intent
+
+
 def build_on_device_failsafe_heartbeat_packet(
     config: OnDeviceFailsafeConfig,
     *,
@@ -311,6 +421,8 @@ def build_on_device_failsafe_heartbeat_packet(
         flags |= ON_DEVICE_FAILSAFE_FLAG_ENABLE
     if config.require_clearance:
         flags |= ON_DEVICE_FAILSAFE_FLAG_REQUIRE_CLEARANCE
+    if config.arm_lateral_clearance:
+        flags |= ON_DEVICE_FAILSAFE_FLAG_ARM_LATERAL_CLEARANCE
     payload = _HEARTBEAT_STRUCT.pack(
         ON_DEVICE_FAILSAFE_PROTOCOL_VERSION,
         ON_DEVICE_FAILSAFE_PACKET_KIND_HEARTBEAT,
@@ -333,27 +445,119 @@ def build_on_device_failsafe_heartbeat_packet(
     return payload
 
 
+def build_on_device_hover_command_packet(
+    intent: OnDeviceHoverIntent,
+    *,
+    session_id: int,
+    command_kind: int,
+) -> bytes:
+    """Encode one bounded hover mission command for the firmware app."""
+
+    validate_on_device_hover_intent(intent)
+    session_id_int = _validate_session_id(session_id)
+    command_kind_int = int(command_kind)
+    if command_kind_int not in {
+        ON_DEVICE_HOVER_COMMAND_KIND_START,
+        ON_DEVICE_HOVER_COMMAND_KIND_LAND,
+        ON_DEVICE_HOVER_COMMAND_KIND_ABORT,
+    }:
+        raise ValueError(f"unsupported on-device hover command kind: {command_kind_int}")
+    payload = _COMMAND_STRUCT.pack(
+        ON_DEVICE_FAILSAFE_COMMAND_PROTOCOL_VERSION,
+        ON_DEVICE_FAILSAFE_PACKET_KIND_COMMAND,
+        command_kind_int,
+        0,
+        session_id_int,
+        _normalize_uint16(intent.target_height_m * 1000.0, minimum=1),
+        _normalize_uint16(intent.hover_duration_s * 1000.0, minimum=1),
+        _normalize_uint16(intent.takeoff_ramp_s * 1000.0, minimum=1),
+        _normalize_uint16(intent.micro_liftoff_height_m * 1000.0, minimum=1),
+        _normalize_uint16(intent.target_tolerance_m * 1000.0, minimum=1),
+    )
+    if len(payload) > ON_DEVICE_FAILSAFE_APPCHANNEL_MTU:
+        raise ValueError(
+            f"command packet is {len(payload)} bytes, exceeds Appchannel MTU {ON_DEVICE_FAILSAFE_APPCHANNEL_MTU}"
+        )
+    return payload
+
+
 def parse_on_device_failsafe_status_packet(
     data: bytes | bytearray | memoryview,
 ) -> OnDeviceFailsafeStatus | None:
     """Decode one firmware status packet when it matches the Twinr protocol."""
 
     payload = memoryview(data)
-    if len(payload) != _STATUS_STRUCT.size:
+    if len(payload) == _STATUS_STRUCT.size:
+        unpacked = _STATUS_STRUCT.unpack(payload)
+        (
+            version,
+            packet_kind,
+            state_code,
+            reason_code,
+            session_id,
+            heartbeat_age_ms,
+            vbat_mv,
+            min_clearance_mm,
+            down_range_mm,
+        ) = unpacked
+        mission_flags = None
+        debug_flags = None
+        target_height_mm = None
+        commanded_height_mm = None
+        state_estimate_z_mm = None
+        up_range_mm = None
+        motion_squal = None
+        touchdown_confirm_count = None
+        hover_thrust_permille = None
+    elif len(payload) == _STATUS_STRUCT_V3.size:
+        unpacked = _STATUS_STRUCT_V3.unpack(payload)
+        (
+            version,
+            packet_kind,
+            state_code,
+            reason_code,
+            session_id,
+            heartbeat_age_ms,
+            vbat_mv,
+            min_clearance_mm,
+            down_range_mm,
+            mission_flags,
+            _debug_reserved,
+            target_height_mm,
+            commanded_height_mm,
+            state_estimate_z_mm,
+        ) = unpacked
+        debug_flags = None
+        up_range_mm = None
+        motion_squal = None
+        touchdown_confirm_count = None
+        hover_thrust_permille = None
+    elif len(payload) == _STATUS_STRUCT_V4.size:
+        unpacked = _STATUS_STRUCT_V4.unpack(payload)
+        (
+            version,
+            packet_kind,
+            state_code,
+            reason_code,
+            session_id,
+            heartbeat_age_ms,
+            vbat_mv,
+            min_clearance_mm,
+            down_range_mm,
+            mission_flags,
+            debug_flags,
+            target_height_mm,
+            commanded_height_mm,
+            state_estimate_z_mm,
+            up_range_mm,
+            motion_squal,
+            touchdown_confirm_count,
+            _reserved,
+            hover_thrust_permille,
+        ) = unpacked
+    else:
         return None
-    unpacked = _STATUS_STRUCT.unpack(payload)
-    (
-        version,
-        packet_kind,
-        state_code,
-        reason_code,
-        session_id,
-        heartbeat_age_ms,
-        vbat_mv,
-        min_clearance_mm,
-        down_range_mm,
-    ) = unpacked
-    if version != ON_DEVICE_FAILSAFE_PROTOCOL_VERSION:
+    if version not in ON_DEVICE_FAILSAFE_SUPPORTED_FIRMWARE_PROTOCOL_VERSIONS:
         return None
     if packet_kind != ON_DEVICE_FAILSAFE_PACKET_KIND_STATUS:
         return None
@@ -369,6 +573,19 @@ def parse_on_device_failsafe_status_packet(
         vbat_mv=int(vbat_mv),
         min_clearance_mm=int(min_clearance_mm),
         down_range_mm=int(down_range_mm),
+        mission_flags=None if mission_flags is None else int(mission_flags),
+        debug_flags=None if debug_flags is None else int(debug_flags),
+        target_height_mm=None if target_height_mm is None else int(target_height_mm),
+        commanded_height_mm=None if commanded_height_mm is None else int(commanded_height_mm),
+        state_estimate_z_mm=None if state_estimate_z_mm is None else int(state_estimate_z_mm),
+        up_range_mm=None if up_range_mm is None else int(up_range_mm),
+        motion_squal=None if motion_squal is None else int(motion_squal),
+        touchdown_confirm_count=(
+            None if touchdown_confirm_count is None else int(touchdown_confirm_count)
+        ),
+        hover_thrust_permille=(
+            None if hover_thrust_permille is None else int(hover_thrust_permille)
+        ),
     )
 
 
@@ -400,11 +617,12 @@ def probe_on_device_failsafe(sync_cf: Any) -> OnDeviceFailsafeAvailability:
     # param could still mark the app as loaded.
     surface_complete = all(name in observed and observed.get(name) is not None for name in _AVAILABLE_PARAM_NAMES)
     protocol_version = observed.get("twinrFs.protocolVersion")
-    loaded = surface_complete and protocol_version == ON_DEVICE_FAILSAFE_PROTOCOL_VERSION
+    loaded = surface_complete and protocol_version in ON_DEVICE_FAILSAFE_SUPPORTED_FIRMWARE_PROTOCOL_VERSIONS
 
-    if surface_complete and protocol_version != ON_DEVICE_FAILSAFE_PROTOCOL_VERSION:
+    if surface_complete and protocol_version not in ON_DEVICE_FAILSAFE_SUPPORTED_FIRMWARE_PROTOCOL_VERSIONS:
+        supported = ", ".join(str(value) for value in sorted(ON_DEVICE_FAILSAFE_SUPPORTED_FIRMWARE_PROTOCOL_VERSIONS))
         failures.append(
-            f"twinrFs.protocolVersion reported {protocol_version}, expected {ON_DEVICE_FAILSAFE_PROTOCOL_VERSION}"
+            f"twinrFs.protocolVersion reported {protocol_version}, expected one of {{{supported}}}"
         )
     if not surface_complete:
         missing = tuple(name for name in _AVAILABLE_PARAM_NAMES if observed.get(name) is None)
@@ -462,6 +680,8 @@ class OnDeviceFailsafeHeartbeatSession:
         self._heartbeat_deadline_misses = 0
         self._last_status: OnDeviceFailsafeStatus | None = None
         self._failures: list[str] = []
+        self._observed_state_names: list[str] = []
+        self._observed_reason_names: list[str] = []
         self._stats_lock = threading.Lock()
         self._lifecycle_lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -626,6 +846,8 @@ class OnDeviceFailsafeHeartbeatSession:
             last_heartbeat_sent_monotonic_s = self._last_heartbeat_sent_monotonic_s
             last_status_received_monotonic_s = self._last_status_received_monotonic_s
             failures = tuple(self._failures)
+            observed_state_names = tuple(self._observed_state_names)
+            observed_reason_names = tuple(self._observed_reason_names)
             link_metrics = self._snapshot_link_metrics_unlocked()
         return OnDeviceFailsafeSessionReport(
             mode=self.mode,
@@ -643,8 +865,175 @@ class OnDeviceFailsafeHeartbeatSession:
             last_heartbeat_sent_monotonic_s=last_heartbeat_sent_monotonic_s,
             last_status_received_monotonic_s=last_status_received_monotonic_s,
             last_status=last_status,
+            observed_state_names=observed_state_names,
+            observed_reason_names=observed_reason_names,
             link_metrics=link_metrics,
             failures=failures,
+        )
+
+    def set_lateral_clearance_armed(self, armed: bool) -> None:
+        """Update whether the firmware should enforce lateral clearance now.
+
+        The host uses this to keep lateral clearance disarmed during the
+        bounded takeoff regime and to arm it immediately after takeoff
+        confirmation, so host and firmware share one lift-off contract.
+        """
+
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("cannot update lateral clearance after the session has been closed")
+            self.config = validate_on_device_failsafe_config(
+                replace(self.config, arm_lateral_clearance=bool(armed))
+            )
+            if not self._started:
+                return
+            self._send_heartbeat(enable=True)
+            _emit_trace(
+                self.trace_writer,
+                "on_device_failsafe_lateral_clearance",
+                status="done",
+                data={"armed": bool(armed), "session_id": self._session_id},
+            )
+
+    def start_bounded_hover(self, intent: OnDeviceHoverIntent) -> None:
+        """Send one bounded on-device hover start command for the active session."""
+
+        with self._lifecycle_lock:
+            if not self._started or self._closed:
+                raise RuntimeError("cannot start bounded hover without an active heartbeat session")
+            if (
+                self.availability.protocol_version is None
+                or int(self.availability.protocol_version) < ON_DEVICE_FAILSAFE_COMMAND_PROTOCOL_VERSION
+            ):
+                raise RuntimeError(
+                    "on-device hover commands require twinrFs protocol version >= "
+                    f"{ON_DEVICE_FAILSAFE_COMMAND_PROTOCOL_VERSION}"
+                )
+            payload = build_on_device_hover_command_packet(
+                intent,
+                session_id=self._session_id,
+                command_kind=ON_DEVICE_HOVER_COMMAND_KIND_START,
+            )
+            self._cf.appchannel.send_packet(payload)
+            _emit_trace(
+                self.trace_writer,
+                "on_device_hover_command",
+                status="done",
+                data={
+                    "command": "start",
+                    "session_id": self._session_id,
+                    "target_height_m": intent.target_height_m,
+                    "hover_duration_s": intent.hover_duration_s,
+                    "micro_liftoff_height_m": intent.micro_liftoff_height_m,
+                    "takeoff_ramp_s": intent.takeoff_ramp_s,
+                    "target_tolerance_m": intent.target_tolerance_m,
+                },
+            )
+
+    def request_land(self, intent: OnDeviceHoverIntent) -> None:
+        """Ask the active on-device hover mission to land."""
+
+        with self._lifecycle_lock:
+            if not self._started or self._closed:
+                raise RuntimeError("cannot request landing without an active heartbeat session")
+            if (
+                self.availability.protocol_version is None
+                or int(self.availability.protocol_version) < ON_DEVICE_FAILSAFE_COMMAND_PROTOCOL_VERSION
+            ):
+                raise RuntimeError(
+                    "on-device hover commands require twinrFs protocol version >= "
+                    f"{ON_DEVICE_FAILSAFE_COMMAND_PROTOCOL_VERSION}"
+                )
+            payload = build_on_device_hover_command_packet(
+                intent,
+                session_id=self._session_id,
+                command_kind=ON_DEVICE_HOVER_COMMAND_KIND_LAND,
+            )
+            self._cf.appchannel.send_packet(payload)
+            _emit_trace(
+                self.trace_writer,
+                "on_device_hover_command",
+                status="done",
+                data={"command": "land", "session_id": self._session_id},
+            )
+
+    def request_abort(self, intent: OnDeviceHoverIntent) -> None:
+        """Ask the active on-device hover mission to abort and fail closed."""
+
+        with self._lifecycle_lock:
+            if not self._started or self._closed:
+                raise RuntimeError("cannot request abort without an active heartbeat session")
+            if (
+                self.availability.protocol_version is None
+                or int(self.availability.protocol_version) < ON_DEVICE_FAILSAFE_COMMAND_PROTOCOL_VERSION
+            ):
+                raise RuntimeError(
+                    "on-device hover commands require twinrFs protocol version >= "
+                    f"{ON_DEVICE_FAILSAFE_COMMAND_PROTOCOL_VERSION}"
+                )
+            payload = build_on_device_hover_command_packet(
+                intent,
+                session_id=self._session_id,
+                command_kind=ON_DEVICE_HOVER_COMMAND_KIND_ABORT,
+            )
+            self._cf.appchannel.send_packet(payload)
+            _emit_trace(
+                self.trace_writer,
+                "on_device_hover_command",
+                status="done",
+                data={"command": "abort", "session_id": self._session_id},
+            )
+
+    def wait_for_bounded_hover_result(
+        self,
+        *,
+        timeout_s: float,
+    ) -> OnDeviceHoverResult:
+        """Wait until the on-device hover mission reaches one terminal state."""
+
+        deadline_s = self._monotonic() + max(0.0, float(timeout_s))
+        terminal_states = {"mission_complete", "landed", "failsafe_brake", "failsafe_descend", "touchdown_confirm"}
+        while self._monotonic() < deadline_s:
+            remaining_s = max(0.0, deadline_s - self._monotonic())
+            status = self.wait_for_status(timeout_s=min(0.1, remaining_s))
+            if status is None:
+                continue
+            if status.state_name in terminal_states:
+                break
+        report = self.report()
+        observed_state_names = report.observed_state_names
+        observed_reason_names = report.observed_reason_names
+        final_status = report.last_status
+        failures = list(report.failures)
+        if final_status is None:
+            failures.append("on-device hover mission produced no status packets")
+        elif final_status.state_name not in terminal_states:
+            failures.append(
+                f"on-device hover mission timed out in state {final_status.state_name}"
+            )
+        took_off = any(
+            state_name in {"mission_hover", "mission_landing", "mission_complete", "landed"}
+            for state_name in observed_state_names
+        )
+        landing_reached = any(
+            state_name in {"mission_landing", "mission_complete", "landed"}
+            for state_name in observed_state_names
+        )
+        landed = final_status is not None and final_status.state_name in {"mission_complete", "landed"}
+        qualified_hover_reached = "mission_hover" in observed_state_names
+        if final_status is not None and final_status.state_name.startswith("failsafe_"):
+            failures.append(
+                f"on-device hover mission fell into {final_status.state_name}:{final_status.reason_name}"
+            )
+        return OnDeviceHoverResult(
+            final_status=final_status,
+            observed_state_names=observed_state_names,
+            observed_reason_names=observed_reason_names,
+            took_off=took_off,
+            landed=landed,
+            qualified_hover_reached=qualified_hover_reached,
+            landing_reached=landing_reached,
+            failures=tuple(failures),
         )
 
     def _heartbeat_loop(self) -> None:
@@ -725,6 +1114,10 @@ class OnDeviceFailsafeHeartbeatSession:
                 self._last_status = status
                 self._status_packets_received += 1
                 self._last_status_received_monotonic_s = received_at_s
+                if status.state_name not in self._observed_state_names:
+                    self._observed_state_names.append(status.state_name)
+                if status.reason_name not in self._observed_reason_names:
+                    self._observed_reason_names.append(status.reason_name)
             self._status_event.set()
             _emit_trace(
                 self.trace_writer,

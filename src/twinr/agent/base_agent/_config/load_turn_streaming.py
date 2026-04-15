@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .constants import DEFAULT_OPENAI_SEARCH_MODEL
 from .context import ConfigLoadContext
 from .parsing import (
     _parse_bool,
@@ -9,6 +10,7 @@ from .parsing import (
     _parse_csv_strings,
     _parse_float,
     _parse_local_semantic_router_mode,
+    _parse_optional_int,
     _parse_optional_text,
 )
 
@@ -190,8 +192,8 @@ def load_turn_streaming_config(context: ConfigLoadContext) -> dict[str, object]:
         "streaming_search_final_lane_hard_timeout_ms": max(
             50,
             int(
-                get_value("TWINR_STREAMING_SEARCH_FINAL_LANE_HARD_TIMEOUT_MS", "30000")
-                or "30000"
+                get_value("TWINR_STREAMING_SEARCH_FINAL_LANE_HARD_TIMEOUT_MS", "90000")
+                or "90000"
             ),
         ),
         "realtime_sensitive_tools_require_identity": _parse_bool(
@@ -228,6 +230,9 @@ def load_turn_streaming_config(context: ConfigLoadContext) -> dict[str, object]:
         ),
         "streaming_supervisor_prefetch_wait_ms": int(
             get_value("TWINR_STREAMING_SUPERVISOR_PREFETCH_WAIT_MS", "80") or "80"
+        ),
+        "streaming_supervisor_prefetch_hard_timeout_ms": _parse_optional_int(
+            get_value("TWINR_STREAMING_SUPERVISOR_PREFETCH_HARD_TIMEOUT_MS", "2000")
         ),
         "streaming_specialist_model": get_value("TWINR_STREAMING_SPECIALIST_MODEL", "")
         or "",
@@ -377,7 +382,10 @@ def load_turn_streaming_config(context: ConfigLoadContext) -> dict[str, object]:
         "openai_enable_web_search": _parse_bool(
             get_value("TWINR_OPENAI_ENABLE_WEB_SEARCH"), False
         ),
-        "openai_search_model": get_value("OPENAI_SEARCH_MODEL", "") or "",
+        "openai_search_model": (
+            get_value("OPENAI_SEARCH_MODEL", DEFAULT_OPENAI_SEARCH_MODEL)
+            or DEFAULT_OPENAI_SEARCH_MODEL
+        ),
         "openai_web_search_context_size": get_value(
             "TWINR_OPENAI_WEB_SEARCH_CONTEXT_SIZE", "medium"
         )

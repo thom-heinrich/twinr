@@ -52,6 +52,7 @@ _DEFAULT_DEBUG_SIGNAL_MAX_SIGNALS = 8
 _DEFAULT_SIGNAL_TEXT_MAX_LEN = 48
 _DEFAULT_SOURCE_TEXT_MAX_LEN = 64
 _SCHEMA_VERSION = 2
+_DISPLAY_DEBUG_SIGNAL_FILE_MODE = 0o644
 
 _ALLOWED_ACCENTS = frozenset({"neutral", "info", "success", "warning", "alert"})
 _ACCENT_SEVERITY = {
@@ -523,6 +524,7 @@ class DisplayDebugSignalStore:
             with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
                 handle.write(payload_text)
                 handle.flush()
+                os.fchmod(handle.fileno(), _DISPLAY_DEBUG_SIGNAL_FILE_MODE)
                 os.fsync(handle.fileno())
             os.replace(tmp_path, self.path)
             self._fsync_directory()

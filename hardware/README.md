@@ -26,7 +26,7 @@ Pi-side setup, probe, and smoke-test scripts for Twinr peripherals.
 |---|---|
 | [buttons/](./buttons) | Button setup and GPIO probe |
 | [display/](./display) | Display backend setup and smoke tests |
-| [bitcraze/](./bitcraze) | Crazyradio USB access, pinned firmware staging, isolated `/twinr/bitcraze` workspace provisioning, and the Crazyflie STM32 on-device failsafe build/flash helpers |
+| [bitcraze/](./bitcraze) | Crazyradio USB access, pinned firmware staging, isolated `/twinr/bitcraze` workspace provisioning, and the fail-closed Crazyflie firmware build/promotion/flash helpers |
 | [mic/](./mic) | Audio default-device setup, playback loudness normalization/softvol, and XVF3800 USB-access rule |
 | [servo/](./servo) | Pololu Maestro USB access, `USB_DUAL_PORT` setup, and operator hold/arm state control for Twinr's continuous attention-servo runtime |
 | [ops/](./ops) | Pi-side productive systemd units, the development-host bounded drone daemon, and Pi/bootstrap deploy helpers |
@@ -46,8 +46,8 @@ Retired standalone break-glass units now live only under the ignored top-level `
 python3 hardware/display/display_test.py --env-file .env
 sudo ./hardware/bitcraze/setup_bitcraze.sh --workspace /twinr/bitcraze --runtime-user thh
 python3 hardware/bitcraze/probe_crazyradio.py --workspace /twinr/bitcraze
-bash hardware/bitcraze/build_on_device_failsafe.sh
-/twinr/bitcraze/.venv/bin/python hardware/bitcraze/flash_on_device_failsafe.py
+bash hardware/bitcraze/build_on_device_failsafe.sh --firmware-root /tmp/crazyflie-firmware --expected-firmware-revision 2025.12.1
+/twinr/bitcraze/.venv/bin/python hardware/bitcraze/flash_on_device_failsafe.py --lane dev --device-role dev --attestation hardware/bitcraze/twinr_on_device_failsafe/build/twinr_on_device_failsafe.build-attestation.json
 sudo ./hardware/mic/setup_audio.sh --env-file .env --proactive-device-match reSpeaker --test
 sudo ./hardware/mic/setup_respeaker_access.sh
 sudo ./hardware/servo/setup_pololu_maestro.sh

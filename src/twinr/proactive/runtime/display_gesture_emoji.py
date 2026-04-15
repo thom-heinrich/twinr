@@ -2,6 +2,9 @@
 # BUG-1: Replaced wall-clock suppression timing with monotonic timing so RTC/NTP jumps cannot stretch or suppress gesture acknowledgements incorrectly.
 # BUG-2: Serialized the publish path and added duplicate-bounce suppression so concurrent or bursty gesture updates no longer race or thrash the HDMI cue store.
 # BUG-3: Hardened naive-datetime handling and isolated controller/store failures so auxiliary emoji feedback cannot crash the proactive camera loop.
+# BUG-4: Transcript-first voice mode now fail-closes the dedicated HDMI
+#        gesture-refresh cadence centrally again so the heavy gesture lane
+#        cannot contend with the live voice streaming PID.
 # SEC-1: Clamped externally supplied hold times and sanitized source/accent/reason fields to prevent in-process cue-lane lockout and oversized payload abuse.
 # IMP-1: Added policy-driven, alias-aware gesture mapping with optional TwinrConfig overrides for fine/coarse gestures, accents, hold times, and classifier-label aliases.
 # IMP-2: Activated configurable motion-dominance/custom-only suppression and per-gesture dedupe windows, which better matches 2026 edge-HRI feedback expectations.
@@ -30,7 +33,7 @@ import re
 import threading
 import time
 from types import MappingProxyType
-from typing import Any, Final
+from typing import Any, Final, cast
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.display.emoji_cues import DisplayEmojiController, DisplayEmojiCueStore, DisplayEmojiSymbol
@@ -190,7 +193,7 @@ def _bounded_float(
     """Parse one bounded finite float with a fallback default."""
 
     try:
-        value = float(raw)
+        value = float(cast(Any, raw))
     except (TypeError, ValueError):
         value = default
     if not math.isfinite(value):
@@ -415,13 +418,13 @@ def resolve_display_gesture_policy(config: TwinrConfig | None = None) -> Display
         maximum=3.0,
     )
     fine_rules = _build_rule_index(
-        default_map=_FINE_HAND_GESTURE_MAP,
+        default_map=cast(Mapping[object, tuple[DisplayEmojiSymbol, str]], _FINE_HAND_GESTURE_MAP),
         default_aliases=_DEFAULT_FINE_GESTURE_ALIASES,
         default_hold_seconds=global_hold_seconds,
         overrides=_coerce_mapping(getattr(config, "display_gesture_fine_map", None)),
     )
     coarse_rules = _build_rule_index(
-        default_map=_COARSE_GESTURE_MAP,
+        default_map=cast(Mapping[object, tuple[DisplayEmojiSymbol, str]], _COARSE_GESTURE_MAP),
         default_aliases=_DEFAULT_COARSE_GESTURE_ALIASES,
         default_hold_seconds=global_hold_seconds,
         overrides=_coerce_mapping(getattr(config, "display_gesture_coarse_map", None)),
@@ -476,7 +479,14 @@ def _resolved_policy(policy: DisplayGestureEmojiPolicy | None) -> DisplayGesture
 
 
 def resolve_display_gesture_refresh_interval(config: TwinrConfig) -> float | None:
-    """Return the bounded local refresh cadence for HDMI gesture acknowledgement."""
+    """Return the bounded HDMI gesture-refresh cadence.
+
+    Transcript-first voice mode must fail closed here so every downstream
+    support/scheduler gate sees the dedicated gesture lane as unavailable.
+    """
+
+    if bool(getattr(config, "voice_orchestrator_enabled", False)):
+        return None
 
     raw_interval = getattr(config, "display_gesture_refresh_interval_s", 0.2)
     try:
@@ -640,7 +650,7 @@ class DisplayGestureEmojiPublisher:
 
         return cls(
             controller=DisplayEmojiController.from_config(
-                config,
+                cast(Any, config),
                 default_source=_SOURCE,
             ),
             source=_SOURCE,

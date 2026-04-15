@@ -22,7 +22,7 @@ import random
 import time
 from dataclasses import dataclass, field
 from threading import Condition, Lock, Thread, Timer
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable, Coroutine, cast
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -435,7 +435,9 @@ class RequiredRemoteDependencyWatch:
             result = self.refresh(force)
 
         if inspect.isawaitable(result):
-            return bool(asyncio.run(result))
+            if inspect.iscoroutine(result):
+                return bool(asyncio.run(cast(Coroutine[Any, Any, bool], result)))
+            return bool(asyncio.run(self._await_refresh_result(cast(Awaitable[bool], result))))
         return bool(result)
 
     def _compute_next_wait_ns(self, *, ready: bool, failed_by_exception: bool) -> int:
@@ -444,8 +446,7 @@ class RequiredRemoteDependencyWatch:
 
         delay_ns = self._interval_ns
         if failed_by_exception or (self.backoff_on_false_ready and not ready):
-            scaled_delay = self._interval_ns * (self.exception_backoff_multiplier ** max(0, failures - 1))
-            delay_ns = min(int(scaled_delay), self._max_exception_backoff_ns)
+            delay_ns = self._compute_capped_exception_backoff_ns(failures=failures)
 
             jitter_ratio = self.exception_backoff_jitter_ratio
             if jitter_ratio > 0.0 and delay_ns > 0:
@@ -454,6 +455,40 @@ class RequiredRemoteDependencyWatch:
                     delay_ns = max(self._interval_ns, delay_ns + self._rng.randint(-jitter_span, jitter_span))
 
         return max(0, delay_ns)
+
+    def _compute_capped_exception_backoff_ns(self, *, failures: int) -> int:
+        exponent = max(0, failures - 1)
+        if exponent <= 0:
+            return min(self._interval_ns, self._max_exception_backoff_ns)
+
+        if self._interval_ns >= self._max_exception_backoff_ns:
+            return self._max_exception_backoff_ns
+
+        multiplier = self.exception_backoff_multiplier
+        if multiplier <= 1.0:
+            return self._interval_ns
+
+        max_scale = self._max_exception_backoff_ns / self._interval_ns
+        if max_scale <= 1.0:
+            return self._max_exception_backoff_ns
+
+        try:
+            max_safe_exponent = math.ceil(math.log(max_scale) / math.log(multiplier))
+        except (OverflowError, ValueError, ZeroDivisionError):
+            return self._max_exception_backoff_ns
+
+        if exponent >= max_safe_exponent:
+            return self._max_exception_backoff_ns
+
+        try:
+            scaled_delay = self._interval_ns * (multiplier**exponent)
+        except OverflowError:
+            return self._max_exception_backoff_ns
+
+        if not math.isfinite(scaled_delay):
+            return self._max_exception_backoff_ns
+
+        return min(int(scaled_delay), self._max_exception_backoff_ns)
 
     def _arm_soft_timeout_timer(self, *, started_ns: int, force: bool) -> Timer | None:
         if self._refresh_timeout_ns is None:
@@ -569,6 +604,10 @@ class RequiredRemoteDependencyWatch:
                 return True
 
         return positional_capacity >= 2
+
+    @staticmethod
+    async def _await_refresh_result(result: Awaitable[bool]) -> bool:
+        return bool(await result)
 
     def _trace(self, msg: str, **details: object) -> None:
         if not callable(self.trace_event):

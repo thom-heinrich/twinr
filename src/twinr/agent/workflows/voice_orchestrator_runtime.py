@@ -20,6 +20,7 @@ import math
 import threading
 import time
 from typing import Any
+from uuid import uuid4
 
 from twinr.agent.base_agent.conversation.follow_up_context import (
     clear_pending_conversation_follow_up_hint,
@@ -45,7 +46,11 @@ _MAX_REMOTE_TRANSCRIPT_CHARS = 8192
 _MAX_DETAIL_CHARS = 160
 _MAX_EMIT_TEXT_CHARS = 96
 _MAX_SOURCE_CHARS = 64
+_MAX_WAIT_ID_CHARS = 128
+_MAX_ITEM_ID_CHARS = 128
 _REMOTE_TRANSCRIPT_WAIT_POLL_S = 0.05
+_MANUAL_LOCAL_AUDIO_TURN_SOURCES = frozenset({"button"})
+_REMOTE_WAIT_STATES = frozenset({"listening", "follow_up_open"})
 _INTENT_CONTEXT_FIELDS: tuple[str, ...] = (
     "attention_state",
     "interaction_intent_state",
@@ -109,6 +114,18 @@ def _normalize_remote_transcript(transcript: Any) -> str:
     return text
 
 
+def _normalize_wait_id(wait_id: Any) -> str | None:
+    """Normalize one remote wait identifier."""
+
+    return _sanitize_untrusted_text(wait_id, max_chars=_MAX_WAIT_ID_CHARS)
+
+
+def _normalize_item_id(item_id: Any) -> str | None:
+    """Normalize one remote item identifier."""
+
+    return _sanitize_untrusted_text(item_id, max_chars=_MAX_ITEM_ID_CHARS)
+
+
 def _transcript_trace_details(transcript: str) -> dict[str, object]:
     """Return privacy-safe trace fields for one committed transcript."""
 
@@ -148,18 +165,25 @@ def _notify_voice_state(
     *,
     detail: str | None = None,
     follow_up_allowed: bool = False,
+    wait_id: str | None = None,
 ) -> None:
     """Use the loop-bound notifier when present, otherwise call the module helper."""
 
     notifier = getattr(loop, "_notify_voice_orchestrator_state", None)
     if callable(notifier):
-        notifier(state, detail=detail, follow_up_allowed=follow_up_allowed)
+        notifier(
+            state,
+            detail=detail,
+            follow_up_allowed=follow_up_allowed,
+            wait_id=wait_id,
+        )
         return
     notify_voice_orchestrator_state(
         loop,
         state,
         detail=detail,
         follow_up_allowed=follow_up_allowed,
+        wait_id=wait_id,
     )
 
 
@@ -201,7 +225,39 @@ def _cached_follow_up_window_open(loop: Any) -> bool:
     return state == "follow_up_open" and _effective_follow_up_allowed(
         loop,
         follow_up_allowed=bool(follow_up_allowed),
-    )
+    ) and _cached_runtime_wait_id(loop) is not None
+
+
+def _cached_runtime_wait_id(loop: Any) -> str | None:
+    """Return the cached remote wait token for the current runtime state."""
+
+    return _normalize_wait_id(getattr(loop, "_last_voice_orchestrator_runtime_wait_id", None))
+
+
+def _resolve_runtime_wait_id(loop: Any, *, state: str, wait_id: str | None) -> str | None:
+    """Resolve the explicit wait token for one runtime-state snapshot."""
+
+    normalized_state = str(state or "").strip()
+    normalized_wait_id = _normalize_wait_id(wait_id)
+    if normalized_state == "listening":
+        if normalized_wait_id is not None:
+            return normalized_wait_id
+        cached_state = getattr(loop, "_last_voice_orchestrator_runtime_state", None)
+        if isinstance(cached_state, tuple) and len(cached_state) >= 1 and cached_state[0] == "listening":
+            cached_wait_id = _cached_runtime_wait_id(loop)
+            if cached_wait_id is not None:
+                return cached_wait_id
+        return uuid4().hex
+    if normalized_state == "follow_up_open":
+        if normalized_wait_id is not None:
+            return normalized_wait_id
+        cached_state = getattr(loop, "_last_voice_orchestrator_runtime_state", None)
+        if isinstance(cached_state, tuple) and len(cached_state) >= 1 and cached_state[0] == "follow_up_open":
+            cached_wait_id = _cached_runtime_wait_id(loop)
+            if cached_wait_id is not None:
+                return cached_wait_id
+        return uuid4().hex
+    return None
 
 
 def _intent_context_from_loop(
@@ -277,6 +333,7 @@ def _cache_voice_orchestrator_runtime_state(
     state: str,
     detail: str | None,
     follow_up_allowed: bool,
+    wait_id: str | None,
     intent_context: VoiceRuntimeIntentContext | None,
     quiet_until_utc: str | None,
     dirty: bool,
@@ -290,6 +347,7 @@ def _cache_voice_orchestrator_runtime_state(
             detail,
             follow_up_allowed,
         )
+        loop._last_voice_orchestrator_runtime_wait_id = _normalize_wait_id(wait_id)
         loop._last_voice_orchestrator_intent_context = intent_context
         loop._last_voice_orchestrator_quiet_until_utc = quiet_until_utc
         loop._last_voice_orchestrator_runtime_state_dirty = bool(dirty)
@@ -305,6 +363,7 @@ def _send_voice_orchestrator_runtime_state(
     state: str,
     detail: str | None,
     follow_up_allowed: bool,
+    wait_id: str | None,
     intent_context: VoiceRuntimeIntentContext | None,
     quiet_until_utc: str | None,
     failure_emit_key: str,
@@ -317,6 +376,7 @@ def _send_voice_orchestrator_runtime_state(
         return False
 
     normalized_detail = _sanitize_untrusted_text(detail, max_chars=_MAX_DETAIL_CHARS)
+    resolved_wait_id = _resolve_runtime_wait_id(loop, state=state, wait_id=wait_id)
     effective_follow_up = _effective_follow_up_allowed(
         loop,
         follow_up_allowed=follow_up_allowed,
@@ -328,6 +388,7 @@ def _send_voice_orchestrator_runtime_state(
         state,
         normalized_detail,
         follow_up_allowed,
+        resolved_wait_id,
         intent_context,
         quiet_until_utc,
     )
@@ -339,6 +400,7 @@ def _send_voice_orchestrator_runtime_state(
         ) + 1
         loop._voice_orchestrator_runtime_state_generation = generation
         loop._last_voice_orchestrator_runtime_state = state_tuple
+        loop._last_voice_orchestrator_runtime_wait_id = resolved_wait_id
         loop._last_voice_orchestrator_intent_context = intent_context
         loop._last_voice_orchestrator_quiet_until_utc = quiet_until_utc
         loop._last_voice_orchestrator_runtime_state_dirty = True
@@ -353,6 +415,7 @@ def _send_voice_orchestrator_runtime_state(
                 state=state,
                 detail=normalized_detail,
                 follow_up_allowed=effective_follow_up,
+                wait_id=resolved_wait_id,
                 voice_quiet_until_utc=quiet_until_utc,
                 **event_fields,
             )
@@ -361,6 +424,7 @@ def _send_voice_orchestrator_runtime_state(
                 state=state,
                 detail=normalized_detail,
                 follow_up_allowed=effective_follow_up,
+                wait_id=resolved_wait_id,
                 voice_quiet_until_utc=quiet_until_utc,
                 **event_fields,
             )
@@ -389,6 +453,7 @@ def _send_voice_orchestrator_runtime_state(
             send_succeeded
             and getattr(loop, "_voice_orchestrator_runtime_state_generation", 0) == generation
             and getattr(loop, "_last_voice_orchestrator_runtime_state", None) == state_tuple
+            and _cached_runtime_wait_id(loop) == resolved_wait_id
             and getattr(loop, "_last_voice_orchestrator_intent_context", None) == intent_context
             and getattr(loop, "_last_voice_orchestrator_quiet_until_utc", None)
             == quiet_until_utc
@@ -438,6 +503,7 @@ def notify_voice_orchestrator_state(
     *,
     detail: str | None = None,
     follow_up_allowed: bool = False,
+    wait_id: str | None = None,
 ) -> None:
     """Push one runtime-state snapshot plus compact intent context to the bridge."""
 
@@ -451,6 +517,7 @@ def notify_voice_orchestrator_state(
         state=state,
         detail=detail,
         follow_up_allowed=follow_up_allowed,
+        wait_id=wait_id,
         intent_context=intent_context,
         quiet_until_utc=quiet_until_utc,
         failure_emit_key="voice_orchestrator_notify_failed",
@@ -468,28 +535,18 @@ def prime_voice_orchestrator_waiting_state(loop: Any) -> None:
     quiet_until_utc = _voice_quiet_until_utc(loop)
     intent_context = _intent_context_from_loop(loop, prefer_cached=False)
     if intent_context is None:
-        _cache_voice_orchestrator_runtime_state(
-            loop,
-            state="waiting",
-            detail=None,
-            follow_up_allowed=False,
-            intent_context=None,
-            quiet_until_utc=quiet_until_utc,
-            dirty=True,
-            requires_context=True,
-        )
         loop._trace_event(
-            "voice_orchestrator_waiting_state_seed_deferred",
+            "voice_orchestrator_waiting_state_seed_without_context",
             kind="branch",
             details={"reason": "missing_sensor_context"},
         )
-        return
 
     _send_voice_orchestrator_runtime_state(
         loop,
         state="waiting",
         detail=None,
         follow_up_allowed=False,
+        wait_id=None,
         intent_context=intent_context,
         quiet_until_utc=quiet_until_utc,
         failure_emit_key="voice_orchestrator_waiting_state_seed_failed",
@@ -521,6 +578,7 @@ def refresh_voice_orchestrator_sensor_context(loop: Any) -> None:
             return
 
         state, detail, follow_up_allowed = last_state
+        wait_id = _cached_runtime_wait_id(loop)
         dirty = bool(getattr(loop, "_last_voice_orchestrator_runtime_state_dirty", False))
         last_intent_context = loop._last_voice_orchestrator_intent_context
         last_quiet_until_utc = getattr(
@@ -537,6 +595,7 @@ def refresh_voice_orchestrator_sensor_context(loop: Any) -> None:
             state,
             detail,
             follow_up_allowed,
+            wait_id,
             intent_context,
             quiet_until_utc,
         )
@@ -554,22 +613,89 @@ def refresh_voice_orchestrator_sensor_context(loop: Any) -> None:
         state=state,
         detail=detail,
         follow_up_allowed=follow_up_allowed,
+        wait_id=wait_id,
         intent_context=intent_context,
         quiet_until_utc=quiet_until_utc,
         failure_emit_key="voice_orchestrator_context_refresh_failed",
     )
 
 
-def handle_remote_transcript_committed(loop: Any, transcript: str, source: str) -> bool:
+def _bind_remote_wait_item_id(loop: Any, *, wait_id: str | None, item_id: str | None) -> bool:
+    """Attach one server item id to an active remote wait when both ids are present."""
+
+    if wait_id is None or item_id is None:
+        return True
+    try:
+        return bool(loop._remote_transcript_commits.bind_item_id(wait_id=wait_id, item_id=item_id))
+    except Exception as exc:
+        loop.emit(f"voice_orchestrator_item_bind_failed={type(exc).__name__}")
+        loop._trace_event(
+            "voice_orchestrator_item_bind_failed",
+            kind="error",
+            level="ERROR",
+            details={
+                "wait_id": wait_id,
+                "item_id": item_id,
+                "error": type(exc).__name__,
+            },
+        )
+        return False
+
+
+def _remote_transcript_wait_is_active(loop: Any, *, wait_id: str | None) -> bool:
+    """Return whether the commit coordinator still tracks the given wait token."""
+
+    normalized_wait_id = _normalize_wait_id(wait_id)
+    if normalized_wait_id is None:
+        return False
+    try:
+        return bool(loop._remote_transcript_commits.has_wait(wait_id=normalized_wait_id))
+    except Exception as exc:
+        loop.emit(f"voice_orchestrator_wait_lookup_failed={type(exc).__name__}")
+        loop._trace_event(
+            "voice_orchestrator_wait_lookup_failed",
+            kind="error",
+            level="ERROR",
+            details={
+                "wait_id": normalized_wait_id,
+                "error": type(exc).__name__,
+            },
+        )
+        return True
+
+
+def _follow_up_wait_matches(loop: Any, *, wait_id: str | None) -> bool:
+    """Return whether the cached follow-up window still matches the remote wait token."""
+
+    if not _cached_follow_up_window_open(loop):
+        return False
+    return wait_id is not None and _cached_runtime_wait_id(loop) == wait_id
+
+
+def handle_remote_transcript_committed(
+    loop: Any,
+    transcript: str,
+    source: str,
+    wait_id: str | None,
+    item_id: str | None,
+) -> bool:
     """Consume one transcript committed by the live remote voice stream."""
 
     try:
         raw_transcript = str(transcript or "")
         committed_source = _normalize_remote_source(source)
         committed_transcript = _normalize_remote_transcript(raw_transcript)
+        committed_wait_id = _normalize_wait_id(wait_id)
+        committed_item_id = _normalize_item_id(item_id)
 
         if not committed_transcript:
             loop.emit("voice_orchestrator_transcript_ignored=empty")
+            return False
+        if committed_wait_id is None:
+            loop.emit("voice_orchestrator_transcript_ignored=missing_wait_id")
+            return False
+        if committed_item_id is None:
+            loop.emit("voice_orchestrator_transcript_ignored=missing_item_id")
             return False
 
         if len(raw_transcript.strip()) > _MAX_REMOTE_TRANSCRIPT_CHARS:
@@ -579,6 +705,8 @@ def handle_remote_transcript_committed(loop: Any, transcript: str, source: str) 
             kind="workflow",
             details={
                 "source": committed_source,
+                "wait_id": committed_wait_id,
+                "item_id": committed_item_id,
                 "raw_chars": len(raw_transcript.strip()),
                 "normalized": _transcript_trace_details(committed_transcript),
                 "follow_up_hint": pending_conversation_follow_up_hint_trace_details(
@@ -591,17 +719,26 @@ def handle_remote_transcript_committed(loop: Any, transcript: str, source: str) 
                 clear_pending_conversation_follow_up_hint(getattr(loop, "runtime", None))
                 loop.emit("voice_orchestrator_follow_up_skipped=disabled")
                 return False
-            if not _cached_follow_up_window_open(loop):
+            if not _follow_up_wait_matches(loop, wait_id=committed_wait_id):
                 clear_pending_conversation_follow_up_hint(getattr(loop, "runtime", None))
-                loop.emit("voice_orchestrator_follow_up_skipped=closed")
+                loop.emit("voice_orchestrator_follow_up_skipped=stale_wait")
                 return False
             if bool(getattr(loop, "_conversation_session_active", False)):
                 loop.emit("voice_orchestrator_follow_up_skipped=session_active")
                 return False
 
+        active_wait = _remote_transcript_wait_is_active(loop, wait_id=committed_wait_id)
+        if active_wait and not _bind_remote_wait_item_id(
+            loop,
+            wait_id=committed_wait_id,
+            item_id=committed_item_id,
+        ):
+            loop.emit("voice_orchestrator_transcript_ignored=item_mismatch")
+            return False
         if loop._remote_transcript_commits.commit(
             source=committed_source,
             transcript=committed_transcript,
+            wait_id=committed_wait_id,
         ):
             loop.emit(
                 f"voice_orchestrator_transcript_delivered="
@@ -646,7 +783,12 @@ def handle_remote_transcript_committed(loop: Any, transcript: str, source: str) 
         return False
 
 
-def handle_remote_follow_up_closed(loop: Any, reason: str) -> None:
+def handle_remote_follow_up_closed(
+    loop: Any,
+    reason: str,
+    wait_id: str | None,
+    item_id: str | None,
+) -> None:
     """Return the local runtime to waiting when a remote follow-up window closes.
 
     The server owns the transcript-first follow-up timeout window, but the Pi
@@ -660,11 +802,26 @@ def handle_remote_follow_up_closed(loop: Any, reason: str) -> None:
 
     try:
         normalized_reason = _sanitize_untrusted_text(reason, max_chars=_MAX_DETAIL_CHARS) or "closed"
+        normalized_wait_id = _normalize_wait_id(wait_id)
+        normalized_item_id = _normalize_item_id(item_id)
         cached_state = getattr(loop, "_last_voice_orchestrator_runtime_state", None)
         cached_mode = cached_state[0] if isinstance(cached_state, tuple) and cached_state else None
         if cached_mode != "follow_up_open":
             loop.emit("voice_orchestrator_follow_up_closed_ignored=stale_state")
             return
+        if not _follow_up_wait_matches(loop, wait_id=normalized_wait_id):
+            loop.emit("voice_orchestrator_follow_up_closed_ignored=stale_wait")
+            return
+        _bind_remote_wait_item_id(
+            loop,
+            wait_id=normalized_wait_id,
+            item_id=normalized_item_id,
+        )
+        loop._remote_transcript_commits.close(
+            reason=normalized_reason,
+            wait_id=normalized_wait_id,
+            item_id=normalized_item_id,
+        )
         if bool(getattr(loop, "_conversation_session_active", False)):
             loop.emit("voice_orchestrator_follow_up_closed_ignored=session_active")
             return
@@ -697,6 +854,47 @@ def voice_orchestrator_owns_live_listening(loop: Any) -> bool:
     """Return whether the current voice path is server-owned after wake."""
 
     return loop.voice_orchestrator is not None
+
+
+def live_audio_turn_requires_voice_orchestrator(loop: Any, *, initial_source: str) -> bool:
+    """Return whether one audio turn source must stay on the remote transcript-first lane."""
+
+    del loop
+    return _normalize_remote_source(initial_source) not in _MANUAL_LOCAL_AUDIO_TURN_SOURCES
+
+
+def ensure_live_audio_turn_supported(
+    loop: Any,
+    *,
+    initial_source: str,
+    listen_source: str,
+) -> None:
+    """Fail closed when a live transcript-first audio source would reopen local capture."""
+
+    if not live_audio_turn_requires_voice_orchestrator(loop, initial_source=initial_source):
+        return
+    if voice_orchestrator_owns_live_listening(loop):
+        return
+
+    normalized_initial_source = _normalize_remote_source(initial_source)
+    normalized_listen_source = _normalize_remote_source(listen_source)
+    loop.emit(
+        "voice_orchestrator_live_audio_required="
+        f"{_sanitize_emit_text(normalized_listen_source, default='unknown')}"
+    )
+    loop._trace_event(
+        "voice_orchestrator_live_audio_required",
+        kind="invariant",
+        level="ERROR",
+        details={
+            "initial_source": normalized_initial_source,
+            "listen_source": normalized_listen_source,
+        },
+    )
+    raise RuntimeError(
+        "Live audio turns must stay on the transcript-first voice orchestrator lane: "
+        f"initial_source={normalized_initial_source!r} listen_source={normalized_listen_source!r}"
+    )
 
 
 def pause_voice_orchestrator_capture(loop: Any, *, reason: str) -> None:

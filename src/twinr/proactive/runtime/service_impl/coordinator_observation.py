@@ -39,7 +39,6 @@ from .coordinator_observation_display import ProactiveCoordinatorObservationDisp
 from .coordinator_observation_facts import ProactiveCoordinatorObservationFactsMixin
 from twinr.hardware.respeaker import resolve_respeaker_indicator_state
 from twinr.proactive.runtime.service_impl.compat import (
-    _VISION_REVIEW_FAIL_OPEN_TRIGGERS,
     _format_firmware_version,
     _record_respeaker_dead_capture_blocker,
     _round_optional_ratio,
@@ -58,6 +57,9 @@ _EVENT_EMIT_TOKEN_MAX_LEN = 96
 _EVENT_LIST_MAX_ITEMS = 16
 _EVENT_DICT_MAX_ITEMS = 32
 _EVENT_MAX_DEPTH = 4
+_AUDIO_POLICY_UNBLOCKED_TRIGGERS = frozenset(
+    {"possible_fall", "floor_stillness", "distress_possible"}
+)
 
 
 def _neutralize_log_text(value: str | None, *, max_len: int = _EVENT_TEXT_MAX_LEN) -> str | None:
@@ -890,7 +892,7 @@ class ProactiveCoordinatorObservationMixin(
         """Return a conservative ReSpeaker-driven suppression reason for one trigger."""
 
         del presence_snapshot
-        if decision.trigger_id in _VISION_REVIEW_FAIL_OPEN_TRIGGERS:
+        if decision.trigger_id in _AUDIO_POLICY_UNBLOCKED_TRIGGERS:
             return None
         if audio_policy_snapshot is None:
             return None

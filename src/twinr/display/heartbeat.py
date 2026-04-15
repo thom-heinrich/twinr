@@ -3,7 +3,7 @@
 # BUG-2: Fixed naive-datetime timezone corruption by normalizing naive datetimes as UTC consistently for persisted and comparison timestamps.
 # BUG-3: Fixed same-process concurrent save races caused by predictable per-PID temp filenames.
 # BUG-4: Fixed stale-lock false positives by validating owner liveness and process identity (pidfd inode or /proc starttime) instead of trusting PID equality alone.
-# SEC-1: Hardened heartbeat reads/writes against oversized payloads, symlink tricks, and weak file permissions; writes now use secure temp files, fsync(), and 0600 files.
+# SEC-1: Hardened heartbeat reads/writes against oversized payloads, symlink tricks, and weak file permissions; writes now use secure temp files, fsync(), and shared 0644 ops artifacts.
 # IMP-1: Added schema-versioned heartbeat metadata (boot_id, monotonic_ns, process identity) for 2026-grade gray-failure detection.
 # IMP-2: BREAKING: when systemd RuntimeDirectory= is present, the canonical heartbeat path moves to volatile runtime storage and the legacy project-root path is treated as a read fallback during rollout.
 # IMP-3: Added config-driven timeout overrides and richer health diagnostics while keeping the module API drop-in compatible.
@@ -51,6 +51,7 @@ _MAX_HEARTBEAT_BYTES = 64 * 1024
 _MAX_FUTURE_CLOCK_SKEW_S = 2.0
 _RUNTIME_HEARTBEAT_FILENAME = "display_heartbeat.json"
 _HEARTBEAT_SCHEMA_VERSION = 2
+_DISPLAY_HEARTBEAT_FILE_MODE = 0o644
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -142,6 +143,14 @@ def _optional_text(value: object | None, *, max_length: int | None = None) -> st
 def _optional_int(value: object | None) -> int | None:
     if value is None or value == "":
         return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if not isinstance(value, str):
+        return None
     try:
         return int(value)
     except (TypeError, ValueError, OverflowError):
@@ -151,9 +160,16 @@ def _optional_int(value: object | None) -> int | None:
 def _coerce_positive_float(value: object | None) -> float | None:
     if value is None or value == "":
         return None
-    try:
+    if isinstance(value, bool):
+        parsed = float(int(value))
+    elif isinstance(value, (int, float)):
         parsed = float(value)
-    except (TypeError, ValueError):
+    elif isinstance(value, str):
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+    else:
         return None
     if parsed <= 0.0:
         return None
@@ -347,15 +363,15 @@ class DisplayHeartbeat:
         """Build one heartbeat from JSON payload data."""
 
         return cls(
-            pid=int(payload.get("pid", 0) or 0),
+            pid=_optional_int(payload.get("pid")) or 0,
             updated_at=str(payload.get("updated_at", "") or ""),
             runtime_status=str(payload.get("runtime_status", "") or ""),
             phase=str(payload.get("phase", "") or ""),
-            seq=int(payload.get("seq", 0) or 0),
+            seq=_optional_int(payload.get("seq")) or 0,
             last_render_started_at=_optional_text(payload.get("last_render_started_at")),
             last_render_completed_at=_optional_text(payload.get("last_render_completed_at")),
             detail=_optional_text(payload.get("detail")),
-            schema_version=max(1, int(payload.get("schema_version", 1) or 1)),
+            schema_version=max(1, _optional_int(payload.get("schema_version")) or 1),
             boot_id=_optional_text(payload.get("boot_id")),
             updated_monotonic_ns=_optional_int(payload.get("updated_monotonic_ns")),
             process_start_ticks=_optional_int(payload.get("process_start_ticks")),
@@ -528,19 +544,25 @@ class DisplayHeartbeatStore:
         return freshest_heartbeat
 
     def save(self, heartbeat: DisplayHeartbeat) -> None:
-        """Persist one heartbeat atomically and durably."""
+        """Persist one heartbeat atomically, durably, and operator-readable."""
 
-        self.path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
         serialized = json.dumps(
             heartbeat.to_dict(),
             ensure_ascii=True,
             sort_keys=True,
             separators=(",", ":"),
         )
+        for target_path in self._candidate_paths():
+            self._save_serialized(target_path=target_path, serialized=serialized)
+
+    def _save_serialized(self, *, target_path: Path, serialized: str) -> None:
+        """Persist one already-serialized heartbeat to one target path."""
+
+        target_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(
-            prefix=f".{self.path.name}.",
+            prefix=f".{target_path.name}.",
             suffix=".tmp",
-            dir=os.fspath(self.path.parent),
+            dir=os.fspath(target_path.parent),
             text=True,
         )
         tmp_path = Path(tmp_name)
@@ -549,12 +571,9 @@ class DisplayHeartbeatStore:
                 handle.write(serialized)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(tmp_path, self.path)
-            try:
-                os.chmod(self.path, 0o600)
-            except OSError:
-                pass
-            _fsync_parent_directory(self.path)
+                os.fchmod(handle.fileno(), _DISPLAY_HEARTBEAT_FILE_MODE)
+            os.replace(tmp_path, target_path)
+            _fsync_parent_directory(target_path)
         finally:
             try:
                 if tmp_path.exists():

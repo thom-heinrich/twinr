@@ -3,13 +3,16 @@
 # streaming-loop session. Starting a separate session let /dev/zero keepalive
 # helpers survive loop restarts as PPID=1 orphans, leaving twinr_playback_softvol
 # busy for the next foreground thinking/TTS playback.
+# BUG-5: Tie direct-guard aplay helpers to the parent process lifetime via
+# PR_SET_PDEATHSIG and fail closed when the playback device is already busy.
+# Treating a foreign/stale owner as "externally satisfied" let orphaned guards
+# mask the real fault until foreground Thinking/TTS playback crashed.
 # CHANGELOG: 2026-03-28
 # BUG-1: Detect ReSpeaker ALSA devices referenced as numeric/symbolic hw/plughw/sysdefault cards via /proc/asound/cards; official Seeed examples use plughw:<card>,0 and were previously missed.
 # BUG-2: Prevent helper hangs and false positives by using non-blocking open, startup settling, shared ref-counted guards, and multi-rate fallback/caching.
 # BUG-3: Drain stderr asynchronously so long-lived guards cannot stall on a full stderr pipe; stop logic is now process-group based and non-blocking.
 # SEC-1: Resolve the absolute aplay path before exec and sanitize/bound log output to reduce PATH hijack and log-injection/flood risk in local Pi deployments.
 # IMP-1: Tune ALSA guard startup for bounded helpers (non-blocking open, reduced buffer time, immediate start delay, fatal error semantics).
-# IMP-2: Expose effective sample rate and diagnostics; gracefully accept an already-busy playback device as an externally satisfied duplex condition.
 
 """Manage short-lived XVF3800 playback guards for bounded capture helpers.
 
@@ -28,17 +31,19 @@ survive a loop restart and strand the productive playback device as an orphan.
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import re
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from twinr.hardware.audio_env import build_audio_subprocess_env_for_mode
 
@@ -108,6 +113,8 @@ _DEVICE_BUSY_MARKERS = (
     "resource busy",
     "temporarily unavailable",
 )
+_PR_SET_PDEATHSIG = 1
+_PARENT_DEATH_SIGNAL = signal.SIGTERM
 
 _SHARED_GUARD_LOCK = threading.Lock()
 _SHARED_GUARDS: dict[str, "_SharedPlaybackState"] = {}
@@ -116,6 +123,43 @@ _SUCCESSFUL_SAMPLE_RATE_BY_DEVICE: dict[str, int] = {}
 
 def _normalize_device_string(value: object | None) -> str:
     return str(value or "").strip().lower()
+
+
+def _load_prctl_libc() -> ctypes.CDLL | None:
+    if sys.platform != "linux":
+        return None
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+    except OSError:
+        return None
+    prctl = getattr(libc, "prctl", None)
+    if prctl is None:
+        return None
+    prctl.restype = ctypes.c_int
+    return libc
+
+
+_PRCTL_LIBC = _load_prctl_libc()
+
+
+def _build_parent_death_signal_preexec(expected_parent_pid: int) -> Callable[[], None] | None:
+    """Return one Linux-only pre-exec hook that terminates the child when the parent dies."""
+
+    if sys.platform != "linux" or _PRCTL_LIBC is None:
+        return None
+
+    def _preexec() -> None:
+        libc = _PRCTL_LIBC
+        if libc is None:  # pragma: no cover - child inherits the ready global.
+            return
+        ctypes.set_errno(0)
+        if libc.prctl(_PR_SET_PDEATHSIG, _PARENT_DEATH_SIGNAL, 0, 0, 0) != 0:
+            errno_value = ctypes.get_errno() or 0
+            raise OSError(errno_value, "prctl(PR_SET_PDEATHSIG) failed")
+        if os.getppid() != expected_parent_pid:
+            os.kill(os.getpid(), _PARENT_DEATH_SIGNAL)
+
+    return _preexec
 
 
 def _sanitize_log_text(value: object | None, *, max_chars: int = _MAX_LOG_TEXT_CHARS) -> str:
@@ -127,9 +171,10 @@ def _sanitize_log_text(value: object | None, *, max_chars: int = _MAX_LOG_TEXT_C
 
 
 def _coerce_sample_rate_hz(value: object | None) -> int:
+    text = str(value or "").strip()
     try:
-        sample_rate_hz = int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+        sample_rate_hz = int(text) if text else _DEFAULT_DUPLEX_PLAYBACK_SAMPLE_RATE_HZ
+    except ValueError:
         sample_rate_hz = _DEFAULT_DUPLEX_PLAYBACK_SAMPLE_RATE_HZ
     return max(_MIN_PLAYBACK_SAMPLE_RATE_HZ, sample_rate_hz)
 
@@ -241,9 +286,10 @@ def resolve_respeaker_duplex_playback_sample_rate_hz(config: TwinrConfig) -> int
         "tts_output_sample_rate",
     ):
         raw_value = getattr(config, attr_name, None)
+        text = str(raw_value or "").strip()
         try:
-            sample_rate = int(raw_value)
-        except (TypeError, ValueError):
+            sample_rate = int(text) if text else 0
+        except ValueError:
             continue
         if sample_rate >= _MIN_PLAYBACK_SAMPLE_RATE_HZ:
             return sample_rate
@@ -280,16 +326,11 @@ class _SharedPlaybackState:
     sample_rate_hz: int
     process_handle: _ProcessHandle | None
     ref_count: int = 1
-    external_busy: bool = False
 
     @property
     def alive(self) -> bool:
         handle = self.process_handle
         return handle is not None and handle.process.poll() is None
-
-    @property
-    def usable(self) -> bool:
-        return self.external_busy or self.alive
 
     def diagnostics(self) -> str:
         handle = self.process_handle
@@ -381,6 +422,7 @@ def _spawn_aplay_handle(
         playback_device=playback_device,
         sample_rate_hz=sample_rate_hz,
     )
+    preexec_fn = _build_parent_death_signal_preexec(os.getpid())
     try:
         process = subprocess.Popen(
             command,
@@ -388,9 +430,9 @@ def _spawn_aplay_handle(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             close_fds=True,
-            # Keep the guard inside the streaming-loop child session so the
-            # runtime supervisor can reap it together with the old loop during
-            # internal restarts instead of leaving an orphaned aplay behind.
+            # Keep the guard inside the current session/process group so the
+            # runtime supervisor can reap it together with the owning loop.
+            preexec_fn=preexec_fn,
         )
     except OSError as exc:
         raise RuntimeError(
@@ -489,7 +531,7 @@ def _acquire_shared_guard(
 
     with _SHARED_GUARD_LOCK:
         existing = _SHARED_GUARDS.get(playback_key)
-        if existing is not None and existing.usable:
+        if existing is not None and existing.alive:
             existing.ref_count += 1
             return existing, "reused"
         if existing is not None:
@@ -510,7 +552,6 @@ def _acquire_shared_guard(
                     sample_rate_hz=sample_rate_hz,
                     process_handle=handle,
                     ref_count=1,
-                    external_busy=False,
                 )
                 _SHARED_GUARDS[playback_key] = state
                 return state, "started"
@@ -518,17 +559,11 @@ def _acquire_shared_guard(
             stderr_text = handle.diagnostics()
             _stop_process_handle(handle)
             if _playback_device_busy(stderr_text):
-                state = _SharedPlaybackState(
-                    playback_key=playback_key,
-                    playback_device=playback_device,
-                    sample_rate_hz=sample_rate_hz,
-                    process_handle=None,
-                    ref_count=1,
-                    external_busy=True,
+                detail = stderr_text or "device or resource busy"
+                raise RuntimeError(
+                    "Required ReSpeaker duplex playback guard could not acquire "
+                    f"{playback_device}: {detail}"
                 )
-                _SHARED_GUARDS[playback_key] = state
-                return state, "external_busy"
-
             last_error_text = stderr_text or last_error_text
 
         raise RuntimeError(
@@ -600,13 +635,6 @@ class ReSpeakerDuplexPlaybackGuard:
                 return diagnostics
         return self._last_diagnostics
 
-    @property
-    def externally_satisfied(self) -> bool:
-        """Return whether another playback owner already satisfied the duplex need."""
-
-        state = self._state
-        return bool(state is not None and state.external_busy)
-
     def __enter__(self) -> "ReSpeakerDuplexPlaybackGuard":
         if self._state is not None:
             return self
@@ -636,13 +664,6 @@ class ReSpeakerDuplexPlaybackGuard:
                 _sanitize_log_text(self._playback_device),
                 state.sample_rate_hz,
             )
-        elif action == "external_busy":
-            logger.info(
-                "Skipped local ReSpeaker duplex playback guard because playback is already active elsewhere | capture_device=%s | playback_device=%s | requested_sample_rate_hz=%d",
-                _sanitize_log_text(self._capture_device),
-                _sanitize_log_text(self._playback_device),
-                self._requested_sample_rate_hz,
-            )
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> bool:
@@ -666,14 +687,6 @@ class ReSpeakerDuplexPlaybackGuard:
                 _sanitize_log_text(self._capture_device),
                 _sanitize_log_text(self._playback_device),
                 state.sample_rate_hz,
-            )
-            return
-
-        if action == "released_external":
-            logger.info(
-                "Released externally satisfied ReSpeaker duplex playback guard | capture_device=%s | playback_device=%s",
-                _sanitize_log_text(self._capture_device),
-                _sanitize_log_text(self._playback_device),
             )
             return
 

@@ -89,6 +89,8 @@ class AttentionServoController(ControllerExitOnlyMixin):
         self._settled_since: float | None = None
         self._released_pulse_width_us: int | None = None
         self._visible_target_pulse_width_us: int | None = None
+        self._visible_retarget_cooldown_anchor_pulse_width_us: int | None = None
+        self._visible_retarget_cooldown_until_at: float | None = None
         self._last_exit_hold_center_x: float | None = None
         self._recent_visible_targets: deque[tuple[float, float]] = deque()
         self._recent_visible_target_boxes: deque[tuple[float, float, float]] = deque()
@@ -271,6 +273,7 @@ class AttentionServoController(ControllerExitOnlyMixin):
             active_tracking=effective_active,
         )
         target_pulse_width_us = self._stabilize_visible_target_pulse_width(
+            observed_at=checked_at,
             target_pulse_width_us=target_pulse_width_us,
             reason=reason,
         )
@@ -344,6 +347,7 @@ class AttentionServoController(ControllerExitOnlyMixin):
             )
 
         try:
+            previous_commanded_pulse_width_us = self._last_commanded_pulse_width_us
             if (
                 self._last_commanded_pulse_width_us is None
                 or commanded_pulse_width_us != self._last_commanded_pulse_width_us
@@ -361,6 +365,12 @@ class AttentionServoController(ControllerExitOnlyMixin):
                 self._last_commanded_pulse_width_us = commanded_pulse_width_us
                 if not self._writer_reports_live_position():
                     self._last_physical_pulse_width_us = commanded_pulse_width_us
+                self._note_visible_tracking_command(
+                    observed_at=checked_at,
+                    reason=reason,
+                    previous_commanded_pulse_width_us=previous_commanded_pulse_width_us,
+                    commanded_pulse_width_us=commanded_pulse_width_us,
+                )
                 self._persist_runtime_state(observed_at=checked_at)
             self._last_update_at = checked_at
         except Exception as exc:
@@ -411,6 +421,8 @@ class AttentionServoController(ControllerExitOnlyMixin):
             self._settled_since = None
             self._released_pulse_width_us = None
             self._visible_target_pulse_width_us = None
+            self._visible_retarget_cooldown_anchor_pulse_width_us = None
+            self._visible_retarget_cooldown_until_at = None
             self._last_physical_pulse_width_us = None
             self._last_exit_hold_center_x = None
             self._pulse_writer.close()
@@ -440,6 +452,12 @@ class AttentionServoController(ControllerExitOnlyMixin):
         visible_recenter_settled_age_s = None
         if checked_at is not None and self._visible_recenter_settled_at is not None:
             visible_recenter_settled_age_s = round(max(0.0, checked_at - self._visible_recenter_settled_at), 3)
+        visible_retarget_cooldown_remaining_s = None
+        if checked_at is not None and self._visible_retarget_cooldown_until_at is not None:
+            visible_retarget_cooldown_remaining_s = round(
+                max(0.0, self._visible_retarget_cooldown_until_at - checked_at),
+                3,
+            )
         exit_cooldown_remaining_s = None
         if checked_at is not None and self._exit_cooldown_until_at is not None:
             exit_cooldown_remaining_s = round(max(0.0, self._exit_cooldown_until_at - checked_at), 3)
@@ -465,6 +483,8 @@ class AttentionServoController(ControllerExitOnlyMixin):
             ),
             "visible_recenter_target_pulse_width_us": self._visible_recenter_target_pulse_width_us,
             "visible_recenter_settled_age_s": visible_recenter_settled_age_s,
+            "visible_retarget_cooldown_remaining_s": visible_retarget_cooldown_remaining_s,
+            "visible_retarget_cooldown_anchor_pulse_width_us": self._visible_retarget_cooldown_anchor_pulse_width_us,
             "exit_pursuit_center_x": None if self._exit_pursuit_center_x is None else round(self._exit_pursuit_center_x, 4),
             "exit_pursuit_target_pulse_width_us": self._exit_pursuit_target_pulse_width_us,
             "exit_pursuit_settled_at": self._exit_pursuit_settled_at,
@@ -516,6 +536,8 @@ class AttentionServoController(ControllerExitOnlyMixin):
                 "min_confidence": round(self.config.min_confidence, 4),
                 "hold_min_confidence": round(self.config.hold_min_confidence, 4),
                 "deadband": round(self.config.deadband, 4),
+                "visible_retarget_tolerance_us": self.config.visible_retarget_tolerance_us,
+                "visible_retarget_cooldown_s": round(self.config.visible_retarget_cooldown_s, 3),
                 "state_path": self.config.state_path,
                 "estimated_zero_max_uncertainty_degrees": round(
                     self.config.estimated_zero_max_uncertainty_degrees,

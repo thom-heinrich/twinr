@@ -50,6 +50,8 @@ class ControllerAttrsMixin:
     _visible_recenter_settled_at: Any
     _visible_recenter_since_at: Any
     _visible_recenter_target_pulse_width_us: Any
+    _visible_retarget_cooldown_anchor_pulse_width_us: Any
+    _visible_retarget_cooldown_until_at: Any
     _visible_target_pulse_width_us: Any
     _zero_reference_confirmed: Any
     _zero_return_direction_sign: Any

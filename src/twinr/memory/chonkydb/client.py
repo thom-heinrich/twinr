@@ -226,7 +226,11 @@ class ChonkyDBClient:
             timeout_s=timeout_s,
             max_response_bytes=self.config.max_response_bytes,
         )
-        return ChonkyDBClient(connection, opener=self._opener)
+        clone = ChonkyDBClient(connection, opener=self._opener)
+        timeout_cap_s = getattr(self, "_twinr_timeout_cap_s", None)
+        if isinstance(timeout_cap_s, (int, float)) and math.isfinite(float(timeout_cap_s)):
+            setattr(clone, "_twinr_timeout_cap_s", max(_MIN_TIMEOUT_S, float(timeout_cap_s)))
+        return clone
 
     def list_records(
         self,

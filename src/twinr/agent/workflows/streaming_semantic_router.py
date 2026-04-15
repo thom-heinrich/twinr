@@ -14,6 +14,10 @@
 # IMP-2: Add policy-gated abstention, optional model-dir root validation, and richer traces.
 # BUG-6: Defer heavyweight user-intent ORT probing during idle streaming-runtime startup so the Pi
 #        does not retain the router's validation session before the first real transcript.
+# BUG-7: Defer full semantic-router bundle construction until transcript activity while keeping the
+#        last known-good router alive across lazy reload failures.
+# BUG-8: Keep an already-live router when a deferred rebuild is later disabled by a missing model
+#        bundle path; otherwise authoritative memory/web/tool routes can disappear mid-turn.
 
 """Bridge local semantic router decisions into the streaming workflow path."""
 
@@ -98,33 +102,136 @@ class StreamingSemanticRouterRuntime:
     def __init__(self, loop) -> None:
         self._loop = loop
         self._state_lock = threading.RLock()
+        self._build_lock = threading.RLock()
         self._warmup_lock = threading.RLock()
         self._router: LocalSemanticRouter | TwoStageLocalSemanticRouter | None = None
+        self._router_build_pending = False
         self._router_epoch = 0
         self._warmed_router_epoch = -1
         self._instance_scope_token = _short_hash(f"runtime:{time.time_ns()}:{id(loop)}")
         self._resolution_cache: OrderedDict[tuple[object, ...], _ResolutionCacheEntry] = OrderedDict()
-        build_result = self._build_router_candidate(self._runtime_policy())
+        policy = self._runtime_policy()
         with self._state_lock:
-            self._apply_build_result_locked(build_result, initial=True)
+            if policy.mode == "off":
+                self._apply_build_result_locked(_RouterBuildResult(status="disabled"), initial=True)
+            else:
+                self._defer_router_build_locked(initial=True, preserve_router=False)
+        if policy.mode != "off":
+            self._trace_event(
+                "streaming_local_semantic_router_build_deferred",
+                kind="cache",
+                details={"mode": policy.mode, "reason": "idle_startup"},
+            )
 
     def reload(self) -> None:
-        """Rebuild the local semantic router after live config reloads."""
+        """Mark the router stale and rebuild lazily on the next live transcript."""
 
-        build_result = self._build_router_candidate(self._runtime_policy())
+        policy = self._runtime_policy()
         with self._state_lock:
-            previous_router = self._router
-            applied = self._apply_build_result_locked(build_result, initial=False)
-        if not applied and previous_router is not None:
-            self._trace_event(
-                "streaming_local_semantic_router_reload_kept_previous",
-                kind="cache",
-                level="WARN",
-                details={
-                    "reason": build_result.reason or "build_failed",
-                    "mode": self._router_mode(),
-                },
+            if policy.mode == "off":
+                self._apply_build_result_locked(_RouterBuildResult(status="disabled"), initial=False)
+                return
+            self._defer_router_build_locked(
+                initial=False,
+                preserve_router=self._router is not None,
             )
+        self._trace_event(
+            "streaming_local_semantic_router_build_deferred",
+            kind="cache",
+            details={"mode": policy.mode, "reason": "reload"},
+        )
+
+    def _build_router_if_needed(
+        self,
+        *,
+        policy: _RuntimePolicy,
+        trigger: str,
+    ) -> tuple[LocalSemanticRouter | TwoStageLocalSemanticRouter | None, int]:
+        """Build the router lazily only when live transcript activity needs it."""
+
+        if policy.mode == "off":
+            with self._state_lock:
+                self._apply_build_result_locked(_RouterBuildResult(status="disabled"), initial=False)
+                return (None, self._router_epoch)
+
+        with self._state_lock:
+            router = self._router
+            router_epoch = self._router_epoch
+            build_pending = self._router_build_pending
+        if router is not None and not build_pending:
+            return (router, router_epoch)
+
+        with self._build_lock:
+            with self._state_lock:
+                router = self._router
+                router_epoch = self._router_epoch
+                build_pending = self._router_build_pending
+            if router is not None and not build_pending:
+                return (router, router_epoch)
+
+            build_result = self._build_router_candidate(policy)
+            with self._state_lock:
+                previous_router = self._router
+                previous_router_epoch = self._router_epoch
+                applied = self._apply_build_result_locked(build_result, initial=False)
+                keep_previous_router = build_result.status != "ready" and previous_router is not None
+                if keep_previous_router:
+                    self._router = previous_router
+                    self._router_epoch = previous_router_epoch
+                    self._router_build_pending = False
+                router = self._router
+                router_epoch = self._router_epoch
+            if build_result.status == "ready" and applied:
+                record_streaming_memory_phase_best_effort(
+                    self._loop.config,
+                    label="streaming_loop.semantic_router.bundle_ready",
+                    owner_label="streaming_loop.semantic_router.bundle_ready",
+                    owner_detail=(
+                        "Streaming semantic router loaded its runtime bundle after live transcript activity. "
+                        f"trigger={trigger} two_stage={build_result.two_stage}"
+                    ),
+                    replace=True,
+                )
+                self._trace_event(
+                    "streaming_local_semantic_router_deferred_ready",
+                    kind="cache",
+                    details={
+                        "mode": policy.mode,
+                        "trigger": trigger,
+                        "two_stage": build_result.two_stage,
+                        "model_dir": build_result.model_dir,
+                        "user_intent_model_dir": build_result.user_intent_model_dir,
+                        "model_id": build_result.model_id,
+                    },
+                )
+                return (router, router_epoch)
+            if keep_previous_router:
+                self._trace_event(
+                    "streaming_local_semantic_router_reload_kept_previous",
+                    kind="cache",
+                    level="WARN",
+                    details={
+                        "reason": build_result.reason or "build_failed",
+                        "mode": self._router_mode(),
+                    },
+                )
+            return (router, router_epoch)
+
+    def _build_and_warm_router_if_needed(self, *, transcript: str) -> None:
+        """Build the local router lazily and then warm it on the same transcript."""
+
+        policy = self._runtime_policy()
+        router, router_epoch = self._build_router_if_needed(
+            policy=policy,
+            trigger="transcript_activity",
+        )
+        if router is None:
+            return
+        self._warmup_router_if_needed(
+            router,
+            router_epoch,
+            transcript=transcript,
+        )
 
     def resolve_transcript(self, transcript: str) -> LocalSemanticRouteResolution | None:
         """Classify one transcript locally and synthesize workflow state when safe."""
@@ -135,15 +242,23 @@ class StreamingSemanticRouterRuntime:
         if policy.mode == "off" or not cleaned:
             return None
 
-        with self._state_lock:
-            router = self._router
-            router_epoch = self._router_epoch
-        if router is None:
-            return None
         if self._warmup_enabled(policy):
+            self.maybe_start_warmup(cleaned)
             wait_for_warmup = getattr(self._loop, "_wait_for_speculative_warmup", None)
             if callable(wait_for_warmup):
                 wait_for_warmup("local_semantic_router")
+            with self._state_lock:
+                router = self._router
+                router_epoch = self._router_epoch
+            if router is None:
+                return None
+        else:
+            router, router_epoch = self._build_router_if_needed(
+                policy=policy,
+                trigger="resolve_transcript",
+            )
+            if router is None:
+                return None
 
         if policy.trace_enabled and normalization["truncated"]:
             self._trace_event(
@@ -285,24 +400,17 @@ class StreamingSemanticRouterRuntime:
         with self._state_lock:
             router = self._router
             router_epoch = self._router_epoch
-        if router is None:
+            build_pending = self._router_build_pending
+            router_warmed = router is not None and self._warmed_router_epoch == router_epoch
+        if router_warmed and not build_pending:
             return
-        with self._warmup_lock:
-            if self._warmed_router_epoch == router_epoch:
-                return
         schedule_warmup = getattr(self._loop, "_schedule_speculative_warmup", None)
         if not callable(schedule_warmup):
-            self._warmup_router_if_needed(
-                router,
-                router_epoch,
-                transcript=cleaned,
-            )
+            self._build_and_warm_router_if_needed(transcript=cleaned)
             return
         schedule_warmup(
             "local_semantic_router",
-            lambda: self._warmup_router_if_needed(
-                router,
-                router_epoch,
+            lambda: self._build_and_warm_router_if_needed(
                 transcript=cleaned,
             ),
         )
@@ -414,12 +522,14 @@ class StreamingSemanticRouterRuntime:
 
         if build_result.status == "ready":
             self._router = build_result.router
+            self._router_build_pending = False
             self._router_epoch += 1
             self._warmed_router_epoch = -1
             self._resolution_cache.clear()
             return True
         if build_result.status == "disabled":
             self._router = None
+            self._router_build_pending = False
             self._router_epoch += 1
             self._warmed_router_epoch = -1
             self._resolution_cache.clear()
@@ -428,6 +538,17 @@ class StreamingSemanticRouterRuntime:
             self._router = None
             self._warmed_router_epoch = -1
         return False
+
+    def _defer_router_build_locked(self, *, initial: bool, preserve_router: bool) -> None:
+        """Mark the router stale so the next transcript can rebuild it lazily."""
+
+        if not preserve_router:
+            self._router = None
+        if not initial and not preserve_router:
+            self._router_epoch += 1
+        self._router_build_pending = True
+        self._warmed_router_epoch = -1
+        self._resolution_cache.clear()
 
     def _build_bridge_reply(
         self,

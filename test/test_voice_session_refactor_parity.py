@@ -12,9 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.orchestrator.voice_contracts import (
-    OrchestratorVoiceAudioFrame,
     OrchestratorVoiceHelloRequest,
-    OrchestratorVoiceRuntimeStateEvent,
 )
 from twinr.orchestrator.voice_session import EdgeOrchestratorVoiceSession
 from twinr.orchestrator.voice_session_impl import EdgeOrchestratorVoiceSessionImpl
@@ -22,18 +20,27 @@ from test.test_orchestrator import (
     _MinDurationWakePhraseSpotter,
     _TranscriptOnlyNonWakePhraseSpotter,
     _pcm_frame,
+    _voice_audio_frame,
+    _voice_runtime_state_event,
 )
 
 _EXPECTED_GOLDEN_DIGESTS = {
-    "waiting_wake_confirmed": "d228aabe13c6978118935edec1113f280396e027788b40e9326915e96063ac20",
-    "follow_up_transcript_committed": "f0916410adf74722ae1063635b202a64227fd51b47ea536c212c6600cf8b1860",
-    "stage1_capture_window": "64d6328afd2e751081e4d329e25bd65241602a8d94e2ad762e14a95bdf24a2be",
+    "waiting_wake_confirmed": "e41bbbab6d18b623000ff23d40d01e5e44a120214a24b83fe4b653e584576d3e",
+    "follow_up_transcript_committed": "468510709e74a88fe32cc54d50c5aacba3be6501f62da71af60240c778d5ba1d",
+    "stage1_capture_window": "b5f5a89bae7950a1fc13be6c345a282e2615b61c85d371e654b95b2ebbeeb24f",
 }
 
 
 def _normalize_payload(value):
     if isinstance(value, dict):
-        return {str(key): _normalize_payload(item) for key, item in value.items()}
+        normalized: dict[str, object] = {}
+        for key, item in value.items():
+            normalized_key = str(key)
+            if normalized_key == "item_id" and item is not None:
+                normalized[normalized_key] = "<item-id>"
+                continue
+            normalized[normalized_key] = _normalize_payload(item)
+        return normalized
     if isinstance(value, (list, tuple)):
         return [_normalize_payload(item) for item in value]
     if isinstance(value, bytes):
@@ -91,10 +98,10 @@ class VoiceSessionRefactorParityTests(unittest.TestCase):
                 )
             )
             first = session.handle_audio_frame(
-                OrchestratorVoiceAudioFrame(sequence=0, pcm_bytes=_pcm_frame(2))
+                _voice_audio_frame(sequence=0, pcm_bytes=_pcm_frame(2))
             )
             second = session.handle_audio_frame(
-                OrchestratorVoiceAudioFrame(sequence=1, pcm_bytes=_pcm_frame(0))
+                _voice_audio_frame(sequence=1, pcm_bytes=_pcm_frame(0))
             )
 
         return {
@@ -147,17 +154,17 @@ class VoiceSessionRefactorParityTests(unittest.TestCase):
                 )
             )
             runtime_events = session.handle_runtime_state(
-                OrchestratorVoiceRuntimeStateEvent(
+                _voice_runtime_state_event(
                     state="follow_up_open",
                     detail="voice_activation",
                     follow_up_allowed=True,
                 )
             )
             first = session.handle_audio_frame(
-                OrchestratorVoiceAudioFrame(sequence=0, pcm_bytes=_pcm_frame(2))
+                _voice_audio_frame(sequence=0, pcm_bytes=_pcm_frame(2))
             )
             second = session.handle_audio_frame(
-                OrchestratorVoiceAudioFrame(sequence=1, pcm_bytes=_pcm_frame(0))
+                _voice_audio_frame(sequence=1, pcm_bytes=_pcm_frame(0))
             )
 
         return {

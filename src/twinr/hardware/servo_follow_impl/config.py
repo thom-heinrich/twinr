@@ -55,6 +55,7 @@ from .constants import (
     _DEFAULT_TARGET_SMOOTHING_S,
     _DEFAULT_VISIBLE_RECENTER_CENTER_TOLERANCE,
     _DEFAULT_VISIBLE_RECENTER_INTERVAL_S,
+    _DEFAULT_VISIBLE_RETARGET_COOLDOWN_S,
     _DEFAULT_VISIBLE_RETARGET_TOLERANCE_US,
 )
 
@@ -101,6 +102,7 @@ class AttentionServoConfig:
     rest_max_jerk_us_per_s3: float = _DEFAULT_REST_MAX_JERK_US_PER_S3
     min_command_delta_us: int = _DEFAULT_MIN_COMMAND_DELTA_US
     visible_retarget_tolerance_us: int = _DEFAULT_VISIBLE_RETARGET_TOLERANCE_US
+    visible_retarget_cooldown_s: float = _DEFAULT_VISIBLE_RETARGET_COOLDOWN_S
     reference_interval_s: float = _DEFAULT_REFERENCE_INTERVAL_S
     soft_limit_margin_us: int = _DEFAULT_SOFT_LIMIT_MARGIN_US
     idle_release_s: float = _DEFAULT_IDLE_RELEASE_S
@@ -436,6 +438,16 @@ class AttentionServoConfig:
                 default=_DEFAULT_VISIBLE_RETARGET_TOLERANCE_US,
                 minimum=0,
                 maximum=max(1, max_pulse - min_pulse),
+            ),
+            visible_retarget_cooldown_s=_bounded_float(
+                getattr(
+                    config,
+                    "attention_servo_visible_retarget_cooldown_s",
+                    _DEFAULT_VISIBLE_RETARGET_COOLDOWN_S,
+                ),
+                default=_DEFAULT_VISIBLE_RETARGET_COOLDOWN_S,
+                minimum=0.0,
+                maximum=5.0,
             ),
             reference_interval_s=_bounded_float(
                 getattr(config, "display_attention_refresh_interval_s", _DEFAULT_REFERENCE_INTERVAL_S),

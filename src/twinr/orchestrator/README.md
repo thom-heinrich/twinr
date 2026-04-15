@@ -14,11 +14,15 @@ contracts used by the Alexa-like hybrid voice path.
 - bridge remote tool calls and results into Twinr's local dual-lane tool loop
 - keep fast ack phrases mapped to stable transport IDs
 - define the streaming voice websocket contracts for audio frames, runtime-state
-  updates, wake confirmations, same-stream transcript commits, follow-up windows,
-  and barge-in interrupts
-- accept optional per-frame speech-probability side-channel metadata on voice
-  audio frames so the host scanner can trust Pi speech evidence instead of only
-  raw RMS fallback
+  updates, speculative wake hints, wake confirmations, same-stream transcript
+  commits, follow-up windows, and barge-in interrupts
+- bound edge-side voice websocket sends so remote stalls surface as explicit
+  reconnectable transport failures instead of leaving the Pi in silent
+  backpressure churn
+- require attested per-frame `speech_probability` on non-empty voice audio
+  frames and fail closed instead of rebuilding speech evidence host-side
+- keep same-stream transcript and follow-up close correlation on explicit
+  `wait_id` and `item_id` tokens instead of reviving source-only matching
 - host the server-side voice session that turns bounded edge audio into wake,
   continuation, and interruption decisions
 - call the thh1986-backed remote ASR service for transcript-first wake
@@ -45,12 +49,12 @@ contracts used by the Alexa-like hybrid voice path.
 | [remote_asr_service.py](./remote_asr_service.py) | Embedded `/v1/transcribe` HTTP surface when the remote-ASR URL points back to the local orchestrator server |
 | [voice_gateway_guardrails.py](./voice_gateway_guardrails.py) | Fail-closed startup checks for the remote-only live voice gateway contract |
 | [voice_activation.py](./voice_activation.py) | Transcript-first wake phrase matching and continuation extraction |
-| [voice_forensics.py](./voice_forensics.py) | Bounded voice-frame telemetry shared by the edge and host-side voice path |
+| [voice_forensics.py](./voice_forensics.py) | Bounded transcript-first gateway telemetry for attested edge audio, utterance scans, and same-stream commit debugging |
 | [voice_audio_debug_store.py](./voice_audio_debug_store.py) | Opt-in rolling WAV artifact store for forensic-only voice debugging |
 | [voice_transcript_debug_stream.py](./voice_transcript_debug_stream.py) | Bounded JSONL store for raw transcript-first gateway decisions |
 | [voice_contracts.py](./voice_contracts.py) | Streaming voice websocket contracts |
 | [voice_runtime_intent.py](./voice_runtime_intent.py) | Compact person-state projection for voice-gateway bias |
-| [voice_client.py](./voice_client.py) | Blocking client for the voice websocket |
+| [voice_client.py](./voice_client.py) | Blocking client for the voice websocket, including bounded send failure handling for remote stalls |
 | [voice_session.py](./voice_session.py) | Stable compatibility wrapper for the server-side voice-session import surface |
 | [voice_session_impl/](./voice_session_impl/) | Internal package split across runtime-state handling, observability, backend requests, and utterance scanning |
 | [local_bridge_target.py](./local_bridge_target.py) | Host-side probe target resolver that rewrites stale self-LAN websocket URLs to the local `:8797` loopback bridge when available |
@@ -87,6 +91,30 @@ conversation context and the local realtime tool surface, but it deliberately
 skips GPIO/audio/proactive/live-voice startup that belongs to the full hardware
 loop instead of a text websocket probe. That keeps the probe bounded and makes
 its stage timings actionable when Pi acceptance stalls.
+The probe still uses its own isolated runtime-snapshot scope so it cannot
+overwrite the primary live runtime state, but that isolated scope now restores
+across probe invocations. Runtime-local set/status acceptance checks such as
+temporary voice quiet mode therefore observe one truthful probe-state timeline.
+Because this is an explicit operator validation path rather than ambient voice,
+the probe runtime also authorizes the full realtime sensitive-tool surface
+before opening the websocket turn, so probe-based acceptance can exercise the
+same memory/contact/print tool lanes that a real runtime loop would expose
+after explicit authorization.
+The probe seeds the runtime with the current prompt before it assembles provider
+context, so long-term memory retrieval and other prompt-conditioned context
+builders see the real operator question instead of an empty transcript.
+The websocket session now also rebuilds the specialist tool-turn instruction
+bundle per turn instead of freezing it for the whole session, so prompt-memory
+writes such as `remember_memory` are immediately visible to the next real probe
+turn on the same orchestrator session.
+After a successful turn, that probe runtime now explicitly flushes long-term
+memory with a dedicated bounded `10.0s` acceptance budget before it closes the
+lightweight loop with its shorter `2.0s` shutdown budget. Successful multimodal
+turns such as `inspect_camera` therefore finish their accepted persistence work
+before probe cleanup instead of manufacturing timeout or abort noise on exit.
+The operator probe also disables durable multimodal evidence capture for
+acceptance-only camera and print artifacts, so text validation runs do not
+pollute long-term memory or create shutdown pressure from non-user probe data.
 
 On the leading repo host, that probe path also resolves stale self-targeted
 LAN websocket URLs back to the authoritative local `ws://127.0.0.1:8797`
@@ -101,6 +129,52 @@ The probe client and the server-side remote-tool bridge also share one timeout
 policy from [`remote_tool_timeout.py`](./remote_tool_timeout.py). That keeps
 host acceptance from failing a real live-web tool call locally while the server
 is still legitimately waiting for the same tool result.
+The probe timing output now splits client-side request assembly from the real
+socket upgrade: `request_prepare` covers local request/context serialization,
+while `ws_connect` covers only the websocket handshake itself. That keeps slow
+probe metrics from falsely blaming LAN websocket connect time when the real
+cost sits in local request preparation.
+That request-prepare slice now also emits explicit subspans for
+`request_prepare_tool_context`, `request_prepare_supervisor_context`,
+`request_prepare_supervisor_decision`, `request_prepare_request_object`,
+`request_prepare_tool_handlers`,
+`request_prepare_headers`, `request_prepare_connector_kwargs`,
+`request_prepare_deadline`, and `request_prepare_payload`. Pi acceptance can
+therefore prove whether a slow non-voice turn is burning time in runtime
+context construction or only in the lightweight websocket-client payload path
+before the socket is even opened.
+The probe now also resolves the structured supervisor decision locally before
+it builds the tool conversation, serializes that decision on
+`OrchestratorTurnRequest.prefetched_supervisor_decision`, and uses the
+decision's `context_scope` plus runtime-local-tool contract to choose between
+the full tool context and `tool_provider_tiny_recent_conversation_context()`.
+Direct, `end_conversation`, and executable runtime-local probe turns therefore
+stay off the heavy remote long-term-context lane when the already-resolved
+supervisor decision says a tiny recent context is sufficient, while the server
+still reuses the exact same decision instead of paying a second supervisor
+resolution step.
+When the lightweight probe loop has workflow forensics enabled, the probe now
+binds that trace context into the runtime-owned provider-context builders too.
+The emitted runpack can therefore correlate `request_prepare_tool_context` with
+runtime-side stage metrics and long-term-memory retrieval subspans instead of
+leaving provider-context time as an uncorrelated local wall-clock number.
+
+The session bridge now fails closed on turn execution errors. It does not
+manufacture a synthetic `turn_complete` anymore when a local bridge/handler
+raises. Ordinary `end_conversation` turns still go through the same remote-tool
+bridge contract as every other tool call, while unexpected session failures
+surface as explicit websocket `turn_error` frames from the server path.
+Complete structured runtime-local handoffs such as `manage_voice_quiet_mode`
+now also stay on that same remote-tool bridge contract instead of reopening a
+second specialist-model pass. A probe quiet/status/set/clear turn therefore
+executes the already-resolved tool directly once the supervisor decision
+includes one executable `runtime_tool_name` plus arguments.
+The orchestrator server now also keeps one shared OpenAI backend/provider
+bundle alive across websocket sessions instead of cold-booting a new backend
+for every non-voice connection. Each websocket still gets its own
+`EdgeOrchestratorSession` turn lock and fresh per-turn specialist prompt
+bundle, but the underlying OpenAI transport and keep-alive pool stay warm for
+repeated probe and operator turns such as `quiet` and `end_conversation`.
 
 For a deterministic text-only acceptance proof across the real direct/tool/
 memory paths, operators can now run:
@@ -125,9 +199,23 @@ silently routes the turn back into a second Pi wake/listen phase. Once that
 transcript-first gateway is running, there is no alternate local detector or
 fallback voice path behind the same live session.
 
+For already-open `listening` and `follow_up_open` turns, the server also keeps
+exactly one matcher contract: transcribe the utterance once and evaluate it via
+`match_transcript()`. If the configured wake matcher cannot be resolved or does
+not implement transcript matching, the session raises an explicit error instead
+of falling back to `detect(capture)` on the same utterance and silently
+reintroducing a second wake/commit decision lane. The same websocket contract
+now also requires explicit `wait_id` tokens on `listening`/`follow_up_open`
+runtime-state updates plus `wait_id`/`item_id` on committed transcripts, so the
+edge and server stay aligned on one same-stream utterance window without any
+legacy source-only correlation.
+
 Twinr also keeps follow-up and barge-in decisions on that same remote
 `remote_asr` path; the live gateway must not require an `OpenAIBackend` or
 `OPENAI_API_KEY` just to build the websocket session and emit `voice_ready`.
+Non-empty voice frames must now carry attested edge `speech_probability`; the
+server rejects missing speech evidence instead of recreating a host-side
+classifier lane.
 
 In that transcript-first mode the ASR service owns the primary speech/VAD gate.
 Twinr keeps the extra candidate active-ratio gate open by default so quiet
@@ -141,6 +229,11 @@ mal ...` on one server-side stream instead of fragmenting the turn into a wake
 micro-scan plus a second local listen phase.
 
 The practical rules for that utterance scanner are:
+- when the stage-one wake matcher already sees a credible wake candidate while
+  the stream is still open, emit a display-only `wake_speculative` event
+  immediately so the Pi can tint HDMI dark blue before final endpoint silence;
+  keep the runtime state authoritative and do not treat that cue as a real
+  `listening` turn yet
 - start buffering from the latest speech burst and preserve a bounded quiet
   lead-in so `Twinner` does not collapse into `Winner`
 - keep buffering on the same stream until bounded endpoint silence or the
@@ -183,8 +276,8 @@ not immediately drop an utterance candidate.
 The websocket server now also protects that control plane under temporary
 decode stalls by preferring to shed stale queued `voice_audio_frame` messages
 before it rejects newer runtime-state or identity updates; the default voice
-ingress queue budget is sized for real host-side transcription spikes instead
-of only a few seconds of audio at the productive 100 ms frame cadence.
+ingress queue budget is sized for real transcript-first live-stream bursts
+instead of only a few seconds of audio at the productive 100 ms frame cadence.
 
 When `TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL` points back to the same
 orchestrator host/port, Twinr now mounts the bounded `/v1/transcribe` route in

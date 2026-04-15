@@ -35,10 +35,12 @@ surface sanitized transport failures back to the caller.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from ipaddress import ip_address
 import inspect
 import json
 import logging
+import socket as socket_module
 import ssl as ssl_module
 from threading import Event, Lock, Thread, current_thread
 from typing import Any
@@ -52,16 +54,6 @@ from websockets.exceptions import (
 )
 from websockets.sync.client import connect as websocket_connect
 
-try:
-    from websockets.extensions import permessage_deflate
-except Exception:  # pragma: no cover - optional import / older websockets build
-    permessage_deflate = None
-
-try:
-    import msgspec
-except Exception:  # pragma: no cover - optional dependency
-    msgspec = None
-
 from .voice_contracts import (
     OrchestratorVoiceAudioFrame,
     OrchestratorVoiceHelloRequest,
@@ -70,6 +62,18 @@ from .voice_contracts import (
     VoiceServerEvent,
     decode_voice_server_event,
 )
+
+permessage_deflate: Any
+try:
+    from websockets.extensions import permessage_deflate as permessage_deflate
+except Exception:  # pragma: no cover - optional import / older websockets build
+    permessage_deflate = None
+
+msgspec: Any
+try:
+    import msgspec as msgspec
+except Exception:  # pragma: no cover - optional dependency
+    msgspec = None
 
 
 _DEFAULT_LOGGER = logging.getLogger("twinr.voice.orchestrator.ws")
@@ -183,6 +187,7 @@ class OrchestratorVoiceWebSocketClient:
     _DEFAULT_CLOSE_TIMEOUT_SECONDS = 5.0
     _DEFAULT_PING_INTERVAL_SECONDS = 20.0
     _DEFAULT_PING_TIMEOUT_SECONDS = 20.0
+    _DEFAULT_SEND_TIMEOUT_SECONDS = 2.0
     _DEFAULT_MAX_MESSAGE_BYTES = 1_048_576
     _DEFAULT_MAX_QUEUE = 16
 
@@ -209,6 +214,7 @@ class OrchestratorVoiceWebSocketClient:
         close_timeout_seconds: float | None = _DEFAULT_CLOSE_TIMEOUT_SECONDS,
         ping_interval_seconds: float | None = _DEFAULT_PING_INTERVAL_SECONDS,
         ping_timeout_seconds: float | None = _DEFAULT_PING_TIMEOUT_SECONDS,
+        send_timeout_seconds: float | None = _DEFAULT_SEND_TIMEOUT_SECONDS,
         max_message_bytes: int | tuple[int | None, int | None] | None = _DEFAULT_MAX_MESSAGE_BYTES,
         max_queue: int | tuple[int | None, int | None] | None = _DEFAULT_MAX_QUEUE,
         require_tls: bool = True,
@@ -237,6 +243,7 @@ class OrchestratorVoiceWebSocketClient:
         self.close_timeout_seconds = _validate_timeout("close_timeout_seconds", close_timeout_seconds)
         self.ping_interval_seconds = _validate_timeout("ping_interval_seconds", ping_interval_seconds)
         self.ping_timeout_seconds = _validate_timeout("ping_timeout_seconds", ping_timeout_seconds)
+        self.send_timeout_seconds = _validate_timeout("send_timeout_seconds", send_timeout_seconds)
         self.max_message_bytes = _validate_int_or_pair("max_message_bytes", max_message_bytes)
         self.max_queue = _validate_int_or_pair("max_queue", max_queue)
 
@@ -248,6 +255,8 @@ class OrchestratorVoiceWebSocketClient:
         self._receiver_started = Event()
         self._receiver_thread: Thread | None = None
         self._opened = False
+        self._send_executor_lock = Lock()
+        self._send_executor: ThreadPoolExecutor | None = None
 
     @property
     def is_open(self) -> bool:
@@ -352,6 +361,10 @@ class OrchestratorVoiceWebSocketClient:
         if thread is not None and thread is not current_thread():
             thread.join(timeout=self.close_timeout_seconds)
 
+        executor = self._take_send_executor()
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+
     def send_hello(self, request: OrchestratorVoiceHelloRequest) -> None:
         """Send the opening session metadata to the server."""
 
@@ -382,10 +395,27 @@ class OrchestratorVoiceWebSocketClient:
 
         try:
             with self._send_lock:
-                self._socket_send(socket, message)
+                if self.send_timeout_seconds is None:
+                    self._socket_send(socket, message)
+                else:
+                    future = self._send_executor_for_timeout().submit(
+                        self._socket_send,
+                        socket,
+                        message,
+                    )
+                    try:
+                        future.result(timeout=self.send_timeout_seconds)
+                    except FutureTimeoutError as exc:
+                        self._abort_socket_transport(socket)
+                        raise ConnectionError(
+                            f"Voice orchestrator websocket send timed out while sending {context}"
+                        ) from exc
         except ConnectionClosed as exc:
             self._mark_socket_closed(socket)
             raise ConnectionError(f"Voice orchestrator websocket closed while sending {context}") from exc
+        except (OSError, TimeoutError) as exc:
+            self._abort_socket_transport(socket)
+            raise ConnectionError(f"Voice orchestrator websocket send failed while sending {context}") from exc
 
     def _encode_payload(self, payload: dict[str, Any]) -> bytes:
         if msgspec is not None:
@@ -418,6 +448,52 @@ class OrchestratorVoiceWebSocketClient:
             if self._receiver_thread is current_thread():
                 self._receiver_thread = None
                 self._receiver_started.clear()
+
+    def _send_executor_for_timeout(self) -> ThreadPoolExecutor:
+        with self._send_executor_lock:
+            if self._send_executor is None:
+                self._send_executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="twinr-voice-ws-send",
+                )
+            return self._send_executor
+
+    def _take_send_executor(self) -> ThreadPoolExecutor | None:
+        with self._send_executor_lock:
+            executor = self._send_executor
+            self._send_executor = None
+            return executor
+
+    def _abort_socket_transport(self, socket: Any) -> None:
+        """Force one stuck websocket transport closed without waiting on a handshake."""
+
+        self._receiver_stop.set()
+        close_socket = getattr(socket, "close_socket", None)
+        if callable(close_socket):
+            try:
+                close_socket()
+            except Exception:
+                pass
+            self._mark_socket_closed(socket)
+            return
+
+        raw_socket = getattr(socket, "socket", None)
+        if raw_socket is None and hasattr(socket, "shutdown"):
+            raw_socket = socket
+
+        shutdown = getattr(raw_socket, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown(socket_module.SHUT_RDWR)
+            except Exception:
+                pass
+        raw_close = getattr(raw_socket, "close", None)
+        if callable(raw_close):
+            try:
+                raw_close()
+            except Exception:
+                pass
+        self._mark_socket_closed(socket)
 
     def _socket_send(self, socket: Any, message: bytes) -> None:
         """Send one encoded JSON payload across websocket implementations/test doubles."""

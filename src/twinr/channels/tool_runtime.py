@@ -66,6 +66,7 @@ _TEXT_CHANNEL_TOOL_NAMES: tuple[str, ...] = (
     "control_smart_home_entities",
     "read_smart_home_sensor_stream",
     "remember_memory",
+    "review_saved_memories",
     "remember_contact",
     "lookup_contact",
     "send_whatsapp_message",

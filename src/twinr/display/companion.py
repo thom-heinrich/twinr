@@ -28,6 +28,9 @@ from time import monotonic
 from typing import Protocol
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.display.companion_signals import (
+    register_display_companion_wakeup_listener,
+)
 
 
 class DisplayLoopLike(Protocol):
@@ -273,6 +276,7 @@ def _interruptible_sleep(
     *,
     original_sleep: Callable[[float], object],
     stop_event: Event,
+    wake_event: Event,
     duration_s: float,
     quantum_s: float,
 ) -> None:
@@ -295,7 +299,9 @@ def _interruptible_sleep(
         remaining = deadline - monotonic()
         if remaining <= 0:
             return
-        original_sleep(min(quantum_s, remaining))
+        if wake_event.wait(timeout=min(quantum_s, remaining)):
+            wake_event.clear()
+            return
 
 
 def _thread_kwargs_for_context_isolation() -> dict[str, object]:
@@ -344,6 +350,7 @@ def optional_display_companion(
         return
 
     stop_event = Event()
+    wake_event = Event()
     started_event = Event()
     finished_event = Event()
     state: dict[str, str] = {"status": "starting"}
@@ -356,6 +363,7 @@ def optional_display_companion(
             loop.sleep = lambda duration_s: _interruptible_sleep(
                 original_sleep=original_sleep,
                 stop_event=stop_event,
+                wake_event=wake_event,
                 duration_s=duration_s,
                 quantum_s=_sleep_quantum_seconds(config),
             )
@@ -390,7 +398,8 @@ def optional_display_companion(
                     if stop_event.is_set():
                         state["status"] = "stopped-before-start"
                         return
-                    _run_locked_loop()
+                    with register_display_companion_wakeup_listener(wake_event):
+                        _run_locked_loop()
                 finally:
                     release_lock()
                 return
@@ -399,7 +408,8 @@ def optional_display_companion(
                 if stop_event.is_set():
                     state["status"] = "stopped-before-start"
                     return
-                _run_locked_loop()
+                with register_display_companion_wakeup_listener(wake_event):
+                    _run_locked_loop()
         except Exception as exc:
             summary = _exception_summary(exc)
             if state.get("status") == "starting":

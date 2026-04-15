@@ -7,15 +7,23 @@
 # BUG-3: Fixed over-eager hard failure on ReSpeaker audio blockers; the monitor
 #        now degrades to ambient audio or other non-audio sensor paths whenever a
 #        viable runtime path still exists.
+# BUG-4: Disabled the hdmi_wayland attention-refresh bootstrap path because Pi
+#        evidence showed the hidden camera/servo lane still drives memory pressure
+#        even when visible face publishing is already fail-closed there.
+# BUG-6: Restored the hdmi_wayland attention-refresh fail-close after a later
+#        regression drifted the hidden camera/servo lane back into the
+#        transcript-first voice runtime and reintroduced transport backpressure.
 # SEC-1: Hardened config-derived timing and buffer parameters to reduce practical
 #        Pi 4 denial-of-service risk from invalid or hostile config values
 #        (busy-loop polling, excessive frame buffers, or unbounded reviewer input).
 # SEC-2: Sanitized and redacted exception details before emitting them to ops/log
 #        sinks to reduce secret leakage and log/terminal injection risk.
-# IMP-1: Implemented actual "local_first" proactive-vision fallback chaining and
-#        added 2026 Pi camera aliases (picamera2/libcamera/imx500/ai_camera).
-# IMP-2: Added reviewer-parameter normalization and explicit degradation paths
-#        aligned with 2026 local-first edge-AI deployment patterns on Raspberry Pi.
+# BUG-5: Removed proactive vision-provider fallback chaining so the configured
+#        camera lane is now single-path and startup fails closed on init errors.
+# IMP-1: Added 2026 Pi camera aliases (picamera2/libcamera/imx500/ai_camera)
+#        while normalizing them onto the same strict local provider lane.
+# IMP-2: Added reviewer-parameter normalization aligned with 2026 local-first
+#        edge-AI deployment patterns on Raspberry Pi.
 
 """Default proactive monitor builder for the refactored service package.
 
@@ -64,12 +72,13 @@ from .compat import (
     _exception_text,
     _preserve_local_attention_on_audio_block,
     _proactive_pcm_capture_conflicts_with_voice_orchestrator,
+    _proactive_respeaker_host_control_conflicts_with_voice_orchestrator,
     _record_component_warning,
     _record_respeaker_dead_capture_blocker,
     _respeaker_capture_probe_duration_ms,
     _safe_emit,
 )
-from ..display_attention import resolve_display_attention_refresh_interval
+from ..display_attention import display_attention_refresh_backend_supported
 from ..display_gesture_emoji import resolve_display_gesture_refresh_interval
 from ..presence import PresenceSessionController
 from ..respeaker_capture_gate import require_stable_respeaker_capture
@@ -242,8 +251,9 @@ def _normalize_float_config(
 
 
 def _normalize_vision_provider_name(raw_value: Any) -> str:
-    provider_name = str(raw_value or "local_first").strip().lower()
+    provider_name = str(raw_value or "local").strip().lower()
     alias_map = {
+        "local_first": "local",
         "local_camera": "local",
         "local_only": "local",
         "local_strict": "local",
@@ -258,20 +268,6 @@ def _normalize_vision_provider_name(raw_value: Any) -> str:
         "openai_remote": "openai",
     }
     return alias_map.get(provider_name, provider_name)
-
-
-def _vision_provider_plan(provider_name: str) -> tuple[str, ...]:
-    if provider_name == "local_first":
-        return ("local", "openai")
-    if provider_name == "local":
-        return ("local",)
-    if provider_name == "openai":
-        return ("openai", "local")
-    if provider_name == "aideck_openai":
-        return ("aideck_openai", "local", "openai")
-    if provider_name in {"remote_proxy", "remote_frame"}:
-        return ("unsupported_remote",)
-    return ("local",)
 
 
 def _make_ambient_audio_observer_factory(
@@ -313,15 +309,29 @@ def build_default_proactive_monitor(
     """Build the default proactive monitor stack from Twinr runtime services."""
 
     deps = dependencies or BuildDefaultProactiveMonitorDependencies()
-    display_attention_enabled = (
-        resolve_display_attention_refresh_interval(config) is not None
-        and str(getattr(config, "display_driver", "") or "").strip().lower().startswith("hdmi")
-    )
+    voice_path_enabled = bool(getattr(config, "voice_orchestrator_enabled", False))
+    display_driver_is_hdmi = str(getattr(config, "display_driver", "") or "").strip().lower().startswith("hdmi")
+    # Keep the attention-refresh lane only on HDMI backends that are presently
+    # safe end-to-end. hdmi_wayland stays fail-closed here because the hidden
+    # camera/servo lane has repeatedly reintroduced Pi memory pressure and
+    # voice transport starvation in the transcript-first streaming PID.
+    display_attention_enabled = display_attention_refresh_backend_supported(config=config)
     display_gesture_enabled = (
+        not voice_path_enabled
+        and
         resolve_display_gesture_refresh_interval(config) is not None
-        and str(getattr(config, "display_driver", "") or "").strip().lower().startswith("hdmi")
+        and display_driver_is_hdmi
     )
-    vision_requested = bool(config.proactive_enabled or display_attention_enabled or display_gesture_enabled)
+    # Keep the transcript-first voice process single-purpose for proactive
+    # prompts and the heavier HDMI gesture lane. Only the explicitly safe
+    # attention-refresh backends stay available alongside live voice.
+    vision_requested = bool(
+        display_attention_enabled
+        or (
+            not voice_path_enabled
+            and (config.proactive_enabled or display_gesture_enabled)
+        )
+    )
     if (
         not config.proactive_enabled
         and not display_attention_enabled
@@ -415,6 +425,9 @@ def build_default_proactive_monitor(
     ambient_audio_observer_factory: Callable[[], Any] | None = None
     distress_enabled = bool(config.proactive_enabled and config.proactive_audio_distress_enabled)
     shared_voice_capture_conflict = _proactive_pcm_capture_conflicts_with_voice_orchestrator(config)
+    shared_respeaker_host_control_conflict = (
+        _proactive_respeaker_host_control_conflicts_with_voice_orchestrator(config)
+    )
     respeaker_targeted = config_targets_respeaker(
         getattr(config, "audio_input_device", None),
         getattr(config, "proactive_audio_input_device", None),
@@ -471,227 +484,225 @@ def build_default_proactive_monitor(
                 audio_observer = deps.null_audio_observer_cls()
 
     if respeaker_targeted and config.proactive_audio_enabled:
-        try:
-            base_signal_provider = deps.base_signal_provider_cls(
-                sensor_window_ms=proactive_audio_sample_ms,
-                assistant_output_active_predicate=lambda: _assistant_output_active(runtime),
+        if shared_respeaker_host_control_conflict:
+            _record_component_warning(
+                runtime=runtime,
+                emit=emit,
+                reason="respeaker_signal_provider_disabled_for_voice_runtime",
+                detail=(
+                    "Proactive XVF3800 host-control monitoring was disabled because the "
+                    "voice orchestrator owns the same ReSpeaker device inside the streaming "
+                    "runtime. The proactive monitor stays camera/PIR-only so USB control "
+                    "snapshots cannot starve live voice transport."
+                ),
             )
-            signal_provider = deps.scheduled_signal_provider_cls.from_config(
-                config,
-                provider=base_signal_provider,
-            )
-            initial_signal = signal_provider.observe()
-            startup_contract = assess_respeaker_monitor_startup_contract(initial_signal)
-            if startup_contract.blocking:
-                blocker_code = _sanitize_detail_text(startup_contract.blocker_code or "blocked", max_len=64)
-                detail = _sanitize_detail_text(
-                    startup_contract.detail
-                    or "ReSpeaker startup contract blocked monitor initialization."
+        else:
+            try:
+                base_signal_provider = deps.base_signal_provider_cls(
+                    sensor_window_ms=proactive_audio_sample_ms,
+                    assistant_output_active_predicate=lambda: _assistant_output_active(runtime),
                 )
-                _safe_emit(emit, f"respeaker_runtime_blocker={blocker_code}")
-                _append_ops_event(
-                    runtime,
-                    event="proactive_component_blocked",
-                    level="error",
-                    message="Proactive monitor startup was blocked by the ReSpeaker runtime contract.",
-                    data={
-                        "reason": _sanitize_detail_text(
-                            startup_contract.ops_reason or "respeaker_startup_blocked",
-                            max_len=96,
-                        ),
-                        "detail": detail,
-                        "blocker_code": blocker_code,
-                        "device_runtime_mode": _sanitize_detail_text(
-                            initial_signal.device_runtime_mode,
-                            max_len=96,
-                        ),
-                        "host_control_ready": bool(initial_signal.host_control_ready),
-                        "transport_reason": _sanitize_detail_text(
-                            initial_signal.transport_reason,
-                            max_len=96,
-                        ),
-                    },
-                    emit=emit,
+                signal_provider = deps.scheduled_signal_provider_cls.from_config(
+                    config,
+                    provider=base_signal_provider,
                 )
-                raise ReSpeakerRuntimeContractError(detail)
-            if not initial_signal.host_control_ready:
-                reason = _sanitize_detail_text(
-                    initial_signal.transport_reason or "unknown_transport_state",
-                    max_len=96,
-                )
-                detail = (
-                    "ReSpeaker XVF3800 is configured for proactive/runtime audio, "
-                    f"but host-control signals are degraded at startup: {reason}."
-                )
-                if initial_signal.requires_elevated_permissions:
-                    detail += " USB permissions are likely missing for the runtime user."
-                _record_component_warning(
-                    runtime=runtime,
-                    emit=emit,
-                    reason="respeaker_signal_provider_degraded",
-                    detail=detail,
-                )
-            if ambient_audio_observer_factory is not None:
-                try:
-                    require_stable_respeaker_capture(
-                        sampler=deps.ambient_audio_sampler_cls.from_config(config),
-                        duration_ms=capture_probe_duration_ms,
-                    )
-                except AudioCaptureReadinessError as exc:
+                initial_signal = signal_provider.observe()
+                startup_contract = assess_respeaker_monitor_startup_contract(initial_signal)
+                if startup_contract.blocking:
+                    blocker_code = _sanitize_detail_text(startup_contract.blocker_code or "blocked", max_len=64)
                     detail = _sanitize_detail_text(
-                        _record_respeaker_dead_capture_blocker(
-                            runtime=runtime,
-                            emit=emit,
-                            probe=exc.probe,
-                            stage="startup",
-                            signal=initial_signal,
-                        )
+                        startup_contract.detail
+                        or "ReSpeaker startup contract blocked monitor initialization."
                     )
-                    raise ReSpeakerRuntimeContractError(detail) from exc
-
-            base_audio_observer = deps.null_audio_observer_cls()
-            if ambient_audio_observer_factory is not None:
-                observer, observer_factory = _try_build_ambient_audio_observer(
-                    warning_reason="respeaker_pcm_fallback_init_failed",
-                    warning_prefix="Ambient PCM fallback could not be initialized",
-                )
-                if observer is not None:
-                    base_audio_observer = observer
-                    audio_observer_fallback_factory = observer_factory
-
-            audio_observer = deps.respeaker_audio_observer_cls(
-                signal_provider=signal_provider,
-                fallback_observer=base_audio_observer,
-            )
-
-            if audio_observer_fallback_factory is not None:
-                previous_factory = audio_observer_fallback_factory
-
-                def _fallback_respeaker_audio_observer_factory() -> Any:
-                    fallback_observer = previous_factory()
-                    return deps.respeaker_audio_observer_cls(
-                        signal_provider=signal_provider,
-                        fallback_observer=fallback_observer,
+                    _safe_emit(emit, f"respeaker_runtime_blocker={blocker_code}")
+                    _append_ops_event(
+                        runtime,
+                        event="proactive_component_blocked",
+                        level="error",
+                        message="Proactive monitor startup was blocked by the ReSpeaker runtime contract.",
+                        data={
+                            "reason": _sanitize_detail_text(
+                                startup_contract.ops_reason or "respeaker_startup_blocked",
+                                max_len=96,
+                            ),
+                            "detail": detail,
+                            "blocker_code": blocker_code,
+                            "device_runtime_mode": _sanitize_detail_text(
+                                initial_signal.device_runtime_mode,
+                                max_len=96,
+                            ),
+                            "host_control_ready": bool(initial_signal.host_control_ready),
+                            "transport_reason": _sanitize_detail_text(
+                                initial_signal.transport_reason,
+                                max_len=96,
+                            ),
+                        },
+                        emit=emit,
                     )
-
-                audio_observer_fallback_factory = _fallback_respeaker_audio_observer_factory
-
-        except Exception as exc:
-            if isinstance(exc, ReSpeakerRuntimeContractError):
-                detail = _safe_exception_detail(exc)
-                observer, observer_factory = _try_build_ambient_audio_observer(
-                    warning_reason="respeaker_pcm_fallback_init_failed",
-                    warning_prefix="Ambient PCM fallback could not be initialized after ReSpeaker startup failure",
-                )
-                if observer is not None and observer_factory is not None:
+                    raise ReSpeakerRuntimeContractError(detail)
+                if not initial_signal.host_control_ready:
+                    reason = _sanitize_detail_text(
+                        initial_signal.transport_reason or "unknown_transport_state",
+                        max_len=96,
+                    )
+                    detail = (
+                        "ReSpeaker XVF3800 is configured for proactive/runtime audio, "
+                        f"but host-control signals are degraded at startup: {reason}."
+                    )
+                    if initial_signal.requires_elevated_permissions:
+                        detail += " USB permissions are likely missing for the runtime user."
                     _record_component_warning(
                         runtime=runtime,
                         emit=emit,
-                        reason="respeaker_runtime_degraded_to_pcm",
-                        detail=(
-                            "ReSpeaker host-control startup failed; degrading to direct PCM ambient "
-                            f"audio monitoring: {detail}"
-                        ),
-                    )
-                    audio_observer = observer
-                    audio_observer_fallback_factory = observer_factory
-                elif display_attention_enabled:
-                    _preserve_local_attention_on_audio_block(
-                        runtime=runtime,
-                        emit=emit,
+                        reason="respeaker_signal_provider_degraded",
                         detail=detail,
                     )
-                    audio_observer = deps.null_audio_observer_cls()
-                    audio_observer_fallback_factory = None
-                elif pir_monitor is not None or vision_requested or display_gesture_enabled:
+                if ambient_audio_observer_factory is not None:
+                    try:
+                        require_stable_respeaker_capture(
+                            sampler=deps.ambient_audio_sampler_cls.from_config(config),
+                            duration_ms=capture_probe_duration_ms,
+                        )
+                    except AudioCaptureReadinessError as exc:
+                        detail = _sanitize_detail_text(
+                            _record_respeaker_dead_capture_blocker(
+                                runtime=runtime,
+                                emit=emit,
+                                probe=exc.probe,
+                                stage="startup",
+                                signal=initial_signal,
+                            )
+                        )
+                        raise ReSpeakerRuntimeContractError(detail) from exc
+
+                base_audio_observer = deps.null_audio_observer_cls()
+                if ambient_audio_observer_factory is not None:
+                    observer, observer_factory = _try_build_ambient_audio_observer(
+                        warning_reason="respeaker_pcm_fallback_init_failed",
+                        warning_prefix="Ambient PCM fallback could not be initialized",
+                    )
+                    if observer is not None:
+                        base_audio_observer = observer
+                        audio_observer_fallback_factory = observer_factory
+
+                audio_observer = deps.respeaker_audio_observer_cls(
+                    signal_provider=signal_provider,
+                    fallback_observer=base_audio_observer,
+                )
+
+                if audio_observer_fallback_factory is not None:
+                    previous_factory = audio_observer_fallback_factory
+
+                    def _fallback_respeaker_audio_observer_factory() -> Any:
+                        fallback_observer = previous_factory()
+                        return deps.respeaker_audio_observer_cls(
+                            signal_provider=signal_provider,
+                            fallback_observer=fallback_observer,
+                        )
+
+                    audio_observer_fallback_factory = _fallback_respeaker_audio_observer_factory
+
+            except Exception as exc:
+                if isinstance(exc, ReSpeakerRuntimeContractError):
+                    detail = _safe_exception_detail(exc)
+                    observer, observer_factory = _try_build_ambient_audio_observer(
+                        warning_reason="respeaker_pcm_fallback_init_failed",
+                        warning_prefix="Ambient PCM fallback could not be initialized after ReSpeaker startup failure",
+                    )
+                    if observer is not None and observer_factory is not None:
+                        _record_component_warning(
+                            runtime=runtime,
+                            emit=emit,
+                            reason="respeaker_runtime_degraded_to_pcm",
+                            detail=(
+                                "ReSpeaker host-control startup failed; degrading to direct PCM ambient "
+                                f"audio monitoring: {detail}"
+                            ),
+                        )
+                        audio_observer = observer
+                        audio_observer_fallback_factory = observer_factory
+                    elif display_attention_enabled:
+                        _preserve_local_attention_on_audio_block(
+                            runtime=runtime,
+                            emit=emit,
+                            detail=detail,
+                        )
+                        audio_observer = deps.null_audio_observer_cls()
+                        audio_observer_fallback_factory = None
+                    elif pir_monitor is not None or vision_requested or display_gesture_enabled:
+                        _record_component_warning(
+                            runtime=runtime,
+                            emit=emit,
+                            reason="proactive_audio_runtime_blocked",
+                            detail=(
+                                "Audio startup was blocked, but another non-audio proactive path remains "
+                                f"available. Audio was disabled: {detail}"
+                            ),
+                        )
+                        audio_observer = deps.null_audio_observer_cls()
+                        audio_observer_fallback_factory = None
+                    else:
+                        raise
+                else:
                     _record_component_warning(
                         runtime=runtime,
                         emit=emit,
-                        reason="proactive_audio_runtime_blocked",
-                        detail=(
-                            "Audio startup was blocked, but another non-audio proactive path remains "
-                            f"available. Audio was disabled: {detail}"
-                        ),
+                        reason="respeaker_signal_provider_init_failed",
+                        detail=f"ReSpeaker signal-provider initialization failed: {_safe_exception_detail(exc)}",
                     )
-                    audio_observer = deps.null_audio_observer_cls()
-                    audio_observer_fallback_factory = None
-                else:
-                    raise
-            else:
-                _record_component_warning(
-                    runtime=runtime,
-                    emit=emit,
-                    reason="respeaker_signal_provider_init_failed",
-                    detail=f"ReSpeaker signal-provider initialization failed: {_safe_exception_detail(exc)}",
-                )
-                observer, observer_factory = _try_build_ambient_audio_observer(
-                    warning_reason="audio_sampler_init_failed",
-                    warning_prefix="Ambient audio fallback could not be initialized after ReSpeaker provider failure",
-                )
-                if observer is not None and observer_factory is not None:
-                    audio_observer = observer
-                    audio_observer_fallback_factory = observer_factory
+                    observer, observer_factory = _try_build_ambient_audio_observer(
+                        warning_reason="audio_sampler_init_failed",
+                        warning_prefix="Ambient audio fallback could not be initialized after ReSpeaker provider failure",
+                    )
+                    if observer is not None and observer_factory is not None:
+                        audio_observer = observer
+                        audio_observer_fallback_factory = observer_factory
 
     vision_observer: Any | None = None
     if vision_requested:
         provider_name = _normalize_vision_provider_name(
-            getattr(config, "proactive_vision_provider", "local_first")
+            getattr(config, "proactive_vision_provider", "local")
         )
-        provider_plan = _vision_provider_plan(provider_name)
-        vision_failures: list[str] = []
-
-        # BREAKING: `local_first` now behaves as a real fallback chain (local -> OpenAI).
-        # Use `local`/`picamera2`/`libcamera`/`imx500`/`ai_camera` to enforce strictly local-only vision.
-        for provider_kind in provider_plan:
-            try:
-                if provider_kind == "local":
-                    vision_observer = deps.local_vision_provider_cls.from_config(config)
-                elif provider_kind == "openai":
-                    vision_observer = deps.openai_vision_provider_cls(
-                        backend=backend,
-                        camera=camera,
-                        camera_lock=camera_lock,
-                    )
-                elif provider_kind == "aideck_openai":
-                    vision_observer = deps.aideck_vision_provider_cls.from_config(
-                        config,
-                        backend=backend,
-                        camera=camera,
-                        camera_lock=camera_lock,
-                    )
-                elif provider_kind == "unsupported_remote":
-                    raise ValueError(
-                        "Legacy helper-Pi proactive vision providers are no longer supported. "
-                        "Twinr now requires local proactive vision on the main Pi."
-                    )
-                else:
-                    raise ValueError(f"Unknown proactive vision provider kind: {provider_kind}")
-                if vision_failures:
-                    _record_component_warning(
-                        runtime=runtime,
-                        emit=emit,
-                        reason="vision_provider_fallback_used",
-                        detail=(
-                            f"Vision provider fallback succeeded with {provider_kind!r} after earlier "
-                            f"provider failures: {'; '.join(vision_failures)}"
-                        ),
-                    )
-                break
-            except Exception as exc:
-                failure = f"{provider_kind}: {_safe_exception_detail(exc)}"
-                vision_failures.append(failure)
-                vision_observer = None
-
-        if vision_observer is None and vision_failures:
-            _record_component_warning(
-                runtime=runtime,
+        try:
+            if provider_name == "local":
+                vision_observer = deps.local_vision_provider_cls.from_config(config)
+            elif provider_name == "openai":
+                vision_observer = deps.openai_vision_provider_cls(
+                    backend=backend,
+                    camera=camera,
+                    camera_lock=camera_lock,
+                )
+            elif provider_name == "aideck_openai":
+                vision_observer = deps.aideck_vision_provider_cls.from_config(
+                    config,
+                    backend=backend,
+                    camera=camera,
+                    camera_lock=camera_lock,
+                )
+            elif provider_name in {"remote_proxy", "remote_frame"}:
+                raise ValueError(
+                    "Legacy helper-Pi proactive vision providers are no longer supported. "
+                    "Twinr now requires local proactive vision on the main Pi."
+                )
+            else:
+                raise ValueError(f"Unknown proactive vision provider kind: {provider_name}")
+        except Exception as exc:
+            detail = _safe_exception_detail(exc)
+            _append_ops_event(
+                runtime,
+                event="proactive_component_blocked",
+                level="error",
+                message="Proactive monitor startup was blocked because the configured vision provider failed.",
+                data={
+                    "reason": "vision_observer_init_failed",
+                    "provider": provider_name,
+                    "detail": detail,
+                },
                 emit=emit,
-                reason="vision_observer_init_failed",
-                detail=(
-                    "Vision observation provider initialization failed for all configured "
-                    f"fallbacks: {'; '.join(vision_failures)}"
-                ),
             )
+            raise RuntimeError(
+                f"Vision observation provider {provider_name!r} failed to initialize: {detail}"
+            ) from exc
 
     vision_reviewer = None
     if config.proactive_enabled and config.proactive_vision_review_enabled and vision_observer is not None:

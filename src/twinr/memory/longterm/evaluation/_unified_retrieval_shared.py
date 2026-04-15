@@ -21,6 +21,7 @@ from twinr.memory.longterm.core.models import (
     LongTermMidtermPacketV1,
     LongTermSourceRefV1,
 )
+from twinr.memory.longterm.evaluation._graph_seed_contracts import require_successful_contact_seed_write
 from twinr.memory.longterm.runtime.service import LongTermMemoryService
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.memory.query_normalization import LongTermQueryProfile
@@ -706,17 +707,35 @@ def seed_unified_retrieval_fixture(service: LongTermMemoryService) -> UnifiedRet
         archived_objects=(),
     )
     service.midterm_store.save_packets(packets=(midterm_corinna, midterm_janina))
-    service.graph_store.remember_contact(
+    corinna_result = service.graph_store.remember_contact(
         given_name="Corinna",
         family_name="Maier",
         phone=_CORINNA_GRAPH_PHONE,
         role="Physiotherapist",
     )
-    service.graph_store.remember_contact(
+    require_successful_contact_seed_write(
+        result=corinna_result,
+        given_name="Corinna",
+        family_name="Maier",
+        role="Physiotherapist",
+        phone=_CORINNA_GRAPH_PHONE,
+        email=None,
+        seed_context="unified_retrieval_fixture.graph",
+    )
+    anna_result = service.graph_store.remember_contact(
         given_name="Anna",
         family_name="Becker",
         email=_ANNA_EMAIL,
         role="Daughter",
+    )
+    require_successful_contact_seed_write(
+        result=anna_result,
+        given_name="Anna",
+        family_name="Becker",
+        role="Daughter",
+        phone=None,
+        email=_ANNA_EMAIL,
+        seed_context="unified_retrieval_fixture.graph",
     )
     graph_document = service.graph_store.load_document()
     return UnifiedRetrievalFixtureSeedStats(
@@ -740,7 +759,7 @@ def ensure_unified_retrieval_remote_ready(service: LongTermMemoryService) -> obj
     """
 
     status = service.remote_status()
-    if getattr(status, "ready", False):
+    if getattr(status, "ready", False) or getattr(status, "operational_probe_allowed", False):
         return status
     if service.remote_required():
         raise LongTermRemoteUnavailableError(

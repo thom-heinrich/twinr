@@ -7,11 +7,12 @@ Use this operator script when the current leading-repo state in
 ``/home/thh/twinr`` must be pushed to the Pi acceptance checkout under
 ``/twinr``. The command mirrors the repo, optionally overwrites the Pi
 runtime ``.env`` from the local repo, refreshes the editable install, installs
-optional mirrored browser-automation runtime manifests when present, installs
-the productive base systemd units plus any repo-backed Pi runtime units that
-are already enabled on the host, supports explicit first-rollout activation for
-optional Pi units, restarts them, and verifies that the services and env
-contract came back healthy.
+browser-automation runtime support only when those allowlisted manifests are
+part of the same authoritative release snapshot, installs the productive base
+systemd units plus any repo-backed Pi runtime units that are already enabled on
+the host, supports explicit first-rollout activation for optional Pi units,
+restarts them, and verifies that the services and env contract came back
+healthy.
 
 Usage
 -----

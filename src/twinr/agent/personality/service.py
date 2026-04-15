@@ -1,6 +1,8 @@
 # CHANGELOG: 2026-03-27
 # BUG-1: Zero/negative max_items no longer leaks through to downstream builders that forced at least one item.
-# BUG-2: Schema drift, partial corruption, and unexpected remote-state shapes now fail open instead of crashing prompt assembly.
+# BUG-2: Schema drift, partial corruption, and unexpected remote-state shapes now
+#        surface as hard failures instead of silently substituting stale/default
+#        prompt state.
 # BUG-3: Repeated same-turn loads now reuse short-lived cached state instead of re-hitting remote storage on every helper call.
 # SEC-1: Remote-derived sections and engagement signals are now bounded and sanitized to reduce prompt-stuffing and Pi-side resource exhaustion.
 # SEC-2: Added stale-if-error caching, failure cooldowns, and request coalescing to avoid outage amplification against remote-primary state.
@@ -199,18 +201,12 @@ class PersonalityContextService:
         """Merge legacy sections with any available structured personality state."""
 
         runtime_state = self._load_runtime_state(config=config, remote_state=remote_state)
-        try:
-            plan = self.builder.build_prompt_plan(
-                legacy_sections=legacy_sections,
-                snapshot=runtime_state.snapshot,
-                engagement_signals=runtime_state.engagement_signals,
-            )
-            return self._sanitize_sections(plan.as_sections())
-        except Exception:
-            _LOGGER.exception(
-                "Falling back to legacy personality sections after prompt-plan build failure.",
-            )
-            return self._sanitize_sections(legacy_sections)
+        plan = self.builder.build_prompt_plan(
+            legacy_sections=legacy_sections,
+            snapshot=runtime_state.snapshot,
+            engagement_signals=runtime_state.engagement_signals,
+        )
+        return self._sanitize_sections(plan.as_sections())
 
     def build_supervisor_sections(
         self,
@@ -228,17 +224,11 @@ class PersonalityContextService:
         """
 
         snapshot = self.load_snapshot(config=config, remote_state=remote_state)
-        try:
-            plan = self.builder.build_supervisor_prompt_plan(
-                legacy_sections=legacy_sections,
-                snapshot=snapshot,
-            )
-            return self._sanitize_sections(plan.as_sections())
-        except Exception:
-            _LOGGER.exception(
-                "Falling back to legacy supervisor sections after prompt-plan build failure.",
-            )
-            return self._sanitize_sections(legacy_sections)
+        plan = self.builder.build_supervisor_prompt_plan(
+            legacy_sections=legacy_sections,
+            snapshot=snapshot,
+        )
+        return self._sanitize_sections(plan.as_sections())
 
     def load_turn_steering_cues(
         self,
@@ -265,15 +255,11 @@ class PersonalityContextService:
             return ()
 
         runtime_state = self._load_runtime_state(config=config, remote_state=remote_state)
-        try:
-            return build_turn_steering_cues(
-                runtime_state.snapshot,
-                engagement_signals=runtime_state.engagement_signals,
-                max_items=limited_max_items,
-            )
-        except Exception:
-            _LOGGER.exception("Ignoring malformed turn-steering state for this turn.")
-            return ()
+        return build_turn_steering_cues(
+            runtime_state.snapshot,
+            engagement_signals=runtime_state.engagement_signals,
+            max_items=limited_max_items,
+        )
 
     def load_engagement_signals(
         self,
@@ -302,15 +288,11 @@ class PersonalityContextService:
             return ()
 
         runtime_state = self._load_runtime_state(config=config, remote_state=remote_state)
-        try:
-            return build_positive_engagement_policies(
-                runtime_state.snapshot,
-                engagement_signals=runtime_state.engagement_signals,
-                max_items=limited_max_items,
-            )
-        except Exception:
-            _LOGGER.exception("Ignoring malformed positive-engagement state for this turn.")
-            return ()
+        return build_positive_engagement_policies(
+            runtime_state.snapshot,
+            engagement_signals=runtime_state.engagement_signals,
+            max_items=limited_max_items,
+        )
 
     def load_display_impulse_candidates(
         self,
@@ -327,16 +309,12 @@ class PersonalityContextService:
             return ()
 
         runtime_state = self._load_runtime_state(config=config, remote_state=remote_state)
-        try:
-            return build_ambient_display_impulse_candidates(
-                runtime_state.snapshot,
-                engagement_signals=runtime_state.engagement_signals,
-                local_now=local_now,
-                max_items=limited_max_items,
-            )
-        except Exception:
-            _LOGGER.exception("Ignoring malformed display-impulse state for this turn.")
-            return ()
+        return build_ambient_display_impulse_candidates(
+            runtime_state.snapshot,
+            engagement_signals=runtime_state.engagement_signals,
+            local_now=local_now,
+            max_items=limited_max_items,
+        )
 
     def _load_runtime_state(
         self,
@@ -395,6 +373,7 @@ class PersonalityContextService:
         malformed_log_message: str,
         stale_debug_label: str,
     ) -> _T:
+        del default, stale_debug_label
         now = time.monotonic()
 
         fresh_value = self._read_cache_value(
@@ -405,25 +384,6 @@ class PersonalityContextService:
         )
         if fresh_value is not _MISSING:
             return fresh_value
-
-        if self._is_failure_open(
-            failure_deadlines=failure_deadlines,
-            cache_key=cache_key,
-            now=now,
-        ):
-            stale_value = self._read_cache_value(
-                cache=cache,
-                cache_key=cache_key,
-                now=now,
-                max_age_seconds=self.stale_if_error_ttl_seconds,
-            )
-            if stale_value is not _MISSING:
-                _LOGGER.debug(
-                    "Serving stale %s while failure cooldown is open.",
-                    stale_debug_label,
-                )
-                return stale_value
-            return default
 
         event, owns_inflight = self._claim_inflight_slot(
             inflight=inflight,
@@ -440,21 +400,12 @@ class PersonalityContextService:
             if refreshed_value is not _MISSING:
                 return refreshed_value
 
-            stale_value = self._read_cache_value(
-                cache=cache,
-                cache_key=cache_key,
-                now=time.monotonic(),
-                max_age_seconds=self.stale_if_error_ttl_seconds,
-            )
-            if stale_value is not _MISSING:
-                return stale_value
-
             event, owns_inflight = self._claim_inflight_slot(
                 inflight=inflight,
                 cache_key=cache_key,
             )
             if not owns_inflight:
-                return default
+                raise RuntimeError("Personality context load did not produce a fresh value.")
 
         try:
             loaded_value = loader()
@@ -465,19 +416,7 @@ class PersonalityContextService:
                 cache_key=cache_key,
                 now=time.monotonic(),
             )
-            stale_value = self._read_cache_value(
-                cache=cache,
-                cache_key=cache_key,
-                now=time.monotonic(),
-                max_age_seconds=self.stale_if_error_ttl_seconds,
-            )
-            if stale_value is not _MISSING:
-                _LOGGER.debug(
-                    "Serving stale %s after remote-unavailable failure.",
-                    stale_debug_label,
-                )
-                return stale_value
-            return default
+            raise
         except Exception:
             _LOGGER.exception(malformed_log_message)
             self._record_failure(
@@ -485,19 +424,7 @@ class PersonalityContextService:
                 cache_key=cache_key,
                 now=time.monotonic(),
             )
-            stale_value = self._read_cache_value(
-                cache=cache,
-                cache_key=cache_key,
-                now=time.monotonic(),
-                max_age_seconds=self.stale_if_error_ttl_seconds,
-            )
-            if stale_value is not _MISSING:
-                _LOGGER.debug(
-                    "Serving stale %s after malformed-state failure.",
-                    stale_debug_label,
-                )
-                return stale_value
-            return default
+            raise
         else:
             self._store_cache_value(
                 cache=cache,

@@ -27,6 +27,7 @@ _KEEPALIVE_PRIORITY = 0
 _DEFAULT_SAMPLE_RATE_HZ = 24000
 _DEFAULT_CHUNK_MS = 200
 _DIRECT_GUARD_POLL_S = 0.05
+_DIRECT_GUARD_START_TIMEOUT_S = 1.5
 _DIRECT_GUARD_RELEASE_TIMEOUT_S = 1.0
 _DIRECT_GUARD_RESUME_GRACE_S = 0.35
 _KEEPALIVE_ERROR_MAX_CHARS = 180
@@ -94,9 +95,10 @@ def _resolve_playback_sample_rate_hz(config: TwinrConfig) -> int:
         "tts_output_sample_rate",
     ):
         raw_value = getattr(config, attr_name, None)
+        text = str(raw_value or "").strip()
         try:
-            sample_rate = int(raw_value)
-        except (TypeError, ValueError):
+            sample_rate = int(text) if text else 0
+        except ValueError:
             continue
         if sample_rate >= 8000:
             return sample_rate
@@ -140,6 +142,9 @@ class ReSpeakerDuplexKeepalive:
         self._direct_guard_transitioning = False
         self._foreground_playback_depth = 0
         self._resume_guard_not_before_monotonic = 0.0
+        self._startup_state = Condition(Lock())
+        self._startup_ready = False
+        self._startup_error: Exception | None = None
 
     def open(self) -> "ReSpeakerDuplexKeepalive":
         """Start the background keepalive loop once."""
@@ -150,11 +155,22 @@ class ReSpeakerDuplexKeepalive:
                 return self
             self._stop_event.clear()
             with self._direct_guard_state:
-                self._foreground_playback_depth = 0
+                # The runner can enqueue startup_boot_sound before
+                # voice_orchestrator.open() starts the keepalive. Preserve an
+                # already active foreground-playback claim here so the direct
+                # guard waits for the boot sound instead of racing it for the
+                # same ALSA playback device.
+                foreground_playback_active = self._foreground_playback_depth > 0
+                if not foreground_playback_active:
+                    self._foreground_playback_depth = 0
                 self._direct_guard_active = False
                 self._direct_guard_transitioning = False
                 self._resume_guard_not_before_monotonic = 0.0
                 self._direct_guard_state.notify_all()
+            with self._startup_state:
+                self._startup_ready = foreground_playback_active
+                self._startup_error = None
+                self._startup_state.notify_all()
             thread = Thread(
                 target=self._worker_main,
                 name="twinr-respeaker-duplex-keepalive",
@@ -162,6 +178,12 @@ class ReSpeakerDuplexKeepalive:
             )
             self._thread = thread
             thread.start()
+        if self._prefers_direct_guard:
+            try:
+                self._wait_for_initial_direct_guard_start()
+            except Exception:
+                self.close()
+                raise
         self._safe_emit("voice_orchestrator_duplex_keepalive=started")
         return self
 
@@ -176,6 +198,12 @@ class ReSpeakerDuplexKeepalive:
             self._direct_guard_active = False
             self._direct_guard_transitioning = False
             self._direct_guard_state.notify_all()
+        with self._startup_state:
+            if not self._startup_ready and self._startup_error is None:
+                self._startup_error = RuntimeError(
+                    "ReSpeaker duplex keepalive stopped before direct guard attested readiness"
+                )
+            self._startup_state.notify_all()
         coordinator = self._playback_coordinator
         if coordinator is not None:
             coordinator.stop_owner(_KEEPALIVE_OWNER)
@@ -194,6 +222,7 @@ class ReSpeakerDuplexKeepalive:
         if event.owner == _KEEPALIVE_OWNER:
             return
         if event.phase == "starting":
+            self._mark_startup_ready()
             self._pause_direct_guard_for_foreground_playback(owner=event.owner)
             return
         if event.phase == "finished":
@@ -207,7 +236,12 @@ class ReSpeakerDuplexKeepalive:
                         self._run_direct_guard_keepalive()
                     else:
                         self._run_coordinator_keepalive()
-                except Exception as exc:  # Defensive containment: keepalive failures must not kill runtime threads.
+                except Exception as exc:
+                    if self._is_expected_foreground_contention(exc):
+                        if self._stop_event.wait(_RESTART_DELAY_S):
+                            break
+                        continue
+                    self._mark_startup_failed(exc)
                     self._safe_emit(
                         "voice_orchestrator_duplex_keepalive_error="
                         f"{type(exc).__name__}:{self._format_error_detail(exc)}"
@@ -249,10 +283,16 @@ class ReSpeakerDuplexKeepalive:
                     sample_rate_hz=self._sample_rate_hz,
                 )
                 with guard:
+                    guard_active = bool(getattr(guard, "active", True))
                     self._set_direct_guard_state(
-                        active=bool(getattr(guard, "active", False)),
+                        active=guard_active,
                         transitioning=False,
                     )
+                    if not guard_active:
+                        raise RuntimeError(
+                            "ReSpeaker duplex keepalive entered an inactive direct guard"
+                        )
+                    self._mark_startup_ready()
                     while not self._stop_event.wait(_DIRECT_GUARD_POLL_S):
                         with self._direct_guard_state:
                             if self._foreground_playback_depth > 0:
@@ -282,13 +322,14 @@ class ReSpeakerDuplexKeepalive:
             yield chunk
 
     def _pause_direct_guard_for_foreground_playback(self, *, owner: str) -> None:
+        with self._direct_guard_state:
+            self._foreground_playback_depth += 1
+            self._direct_guard_state.notify_all()
         self._safe_emit(
             "voice_orchestrator_duplex_keepalive="
             f"paused_for_playback:{self._format_text(owner)}"
         )
         with self._direct_guard_state:
-            self._foreground_playback_depth += 1
-            self._direct_guard_state.notify_all()
             deadline = time.monotonic() + _DIRECT_GUARD_RELEASE_TIMEOUT_S
             while (
                 (self._direct_guard_active or self._direct_guard_transitioning)
@@ -316,6 +357,46 @@ class ReSpeakerDuplexKeepalive:
             self._direct_guard_active = bool(active)
             self._direct_guard_transitioning = bool(transitioning)
             self._direct_guard_state.notify_all()
+
+    def _is_expected_foreground_contention(self, exc: Exception) -> bool:
+        text = str(exc or "").lower()
+        if "device or resource busy" not in text:
+            return False
+        with self._direct_guard_state:
+            return self._foreground_playback_depth > 0
+
+    def _wait_for_initial_direct_guard_start(self) -> None:
+        deadline = time.monotonic() + _DIRECT_GUARD_START_TIMEOUT_S
+        with self._startup_state:
+            while not self._startup_ready and self._startup_error is None:
+                remaining_s = deadline - time.monotonic()
+                if remaining_s <= 0.0:
+                    break
+                self._startup_state.wait(timeout=remaining_s)
+            if self._startup_ready:
+                return
+            startup_error = self._startup_error
+        if startup_error is not None:
+            raise RuntimeError(
+                "ReSpeaker duplex keepalive could not claim playback ownership: "
+                f"{self._format_error_detail(startup_error)}"
+            ) from startup_error
+        raise RuntimeError(
+            "ReSpeaker duplex keepalive did not claim playback ownership before timeout"
+        )
+
+    def _mark_startup_ready(self) -> None:
+        with self._startup_state:
+            self._startup_ready = True
+            self._startup_error = None
+            self._startup_state.notify_all()
+
+    def _mark_startup_failed(self, exc: Exception) -> None:
+        with self._startup_state:
+            if self._startup_ready or self._startup_error is not None:
+                return
+            self._startup_error = exc
+            self._startup_state.notify_all()
 
     @staticmethod
     def _format_error_detail(exc: Exception) -> str:

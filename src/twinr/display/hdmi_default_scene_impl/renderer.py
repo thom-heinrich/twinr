@@ -21,6 +21,10 @@ from .typing_contracts import (
 )
 
 
+_DEFAULT_BACKGROUND = (0, 0, 0)
+_ACTIVE_WAKE_BACKGROUND = (8, 28, 92)
+
+
 @dataclass(slots=True)
 class HdmiDefaultSceneRenderer(
     HdmiSceneBuilderMixin,
@@ -50,6 +54,7 @@ class HdmiDefaultSceneRenderer(
         animation_frame: int = 0,
         ticker_text: str | None = None,
         face_cue: HdmiFaceCueLike | None = None,
+        wake_cue=None,
         emoji_cue=None,
         ambient_impulse_cue=None,
         service_connect_cue=None,
@@ -77,7 +82,10 @@ class HdmiDefaultSceneRenderer(
             presentation_now=presentation_now,
             ambient_now=ambient_now,
         )
-        draw.rectangle((0, 0, width, height), fill=(0, 0, 0))
+        draw.rectangle(
+            (0, 0, width, height),
+            fill=self._background_fill(status=status, wake_cue=wake_cue),
+        )
         self._draw_twinr_header(draw, box=scene.layout.header_box, header=scene.header)
         self._draw_face(
             draw,
@@ -115,3 +123,15 @@ class HdmiDefaultSceneRenderer(
             self._draw_emoji_reserve(image, draw, box=scene.layout.panel_box, emoji_cue=reserve_bus.emoji_cue)
         if scene.ticker is not None:
             self._draw_news_ticker(draw, box=scene.layout.ticker_box, ticker=scene.ticker)
+
+    def _background_fill(self, *, status: str, wake_cue) -> tuple[int, int, int]:
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status == "listening":
+            return _ACTIVE_WAKE_BACKGROUND
+        if (
+            normalized_status == "waiting"
+            and wake_cue is not None
+            and getattr(wake_cue, "kind", None) == "speculative_wake"
+        ):
+            return _ACTIVE_WAKE_BACKGROUND
+        return _DEFAULT_BACKGROUND

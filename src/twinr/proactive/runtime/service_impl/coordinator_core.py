@@ -38,7 +38,6 @@ from twinr.hardware.portrait_match import PortraitMatchProvider
 from twinr.proactive.runtime.service_impl.compat import (
     _ATTENTION_REFRESH_AUDIO_CACHE_MAX_AGE_S,
     _DEFAULT_PROJECT_ROOT,
-    _VISION_REVIEW_FAIL_OPEN_TRIGGERS,
     _append_ops_event,
     _exception_text,
     _round_optional_seconds,
@@ -880,11 +879,6 @@ class ProactiveCoordinatorCoreMixin:
 
         return bool(self.config.proactive_enabled)
 
-    def _should_fail_open_without_vision_review(self, decision: SocialTriggerDecision) -> bool:
-        """Return whether missing review must not block this safety trigger."""
-
-        return decision.trigger_id in _VISION_REVIEW_FAIL_OPEN_TRIGGERS
-
     def _process_decision(
         self,
         *,
@@ -1372,14 +1366,6 @@ class ProactiveCoordinatorCoreMixin:
                 error=exc,
                 data={"trigger": decision.trigger_id},
             )
-            if self._should_fail_open_without_vision_review(decision):
-                self._append_ops_event(
-                    event="proactive_vision_review_fail_open",
-                    level="warning",
-                    message="A safety-critical proactive trigger proceeded because buffered vision review failed.",
-                    data={"trigger": decision.trigger_id},
-                )
-                return decision, None
             self._record_trigger_skipped_vision_review_unavailable(decision)
             return None, None
         if review is None:
@@ -1388,14 +1374,6 @@ class ProactiveCoordinatorCoreMixin:
                 message="Buffered proactive vision review was enabled but no usable result was available.",
                 data={"trigger": decision.trigger_id},
             )
-            if self._should_fail_open_without_vision_review(decision):
-                self._append_ops_event(
-                    event="proactive_vision_review_fail_open",
-                    level="warning",
-                    message="A safety-critical proactive trigger proceeded because buffered vision review was unavailable.",
-                    data={"trigger": decision.trigger_id},
-                )
-                return decision, None
             self._record_trigger_skipped_vision_review_unavailable(decision)
             return None, None
         self._record_vision_review(decision, review=review)

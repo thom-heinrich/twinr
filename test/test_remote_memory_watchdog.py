@@ -14,6 +14,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.memory.chonkydb.client import ChonkyDBError
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.ops.events import TwinrOpsEventStore
 from twinr.ops.remote_memory_watchdog import (
@@ -151,6 +152,28 @@ class _CorrelatedFailRemoteService:
         del timeout_s
 
 
+class _WarmupPendingRemoteService:
+    def __init__(self) -> None:
+        self.shutdown_calls = 0
+
+    def remote_required(self) -> bool:
+        return True
+
+    def remote_status(self):
+        return SimpleNamespace(mode="remote_primary", ready=True, detail=None)
+
+    def ensure_remote_ready(self) -> None:
+        raise LongTermRemoteUnavailableError("Required remote long-term memory is unavailable.") from ChonkyDBError(
+            "ChonkyDB request failed for GET /v1/external/instance",
+            status_code=503,
+            response_json={"detail": "Service warmup in progress"},
+        )
+
+    def shutdown(self, *, timeout_s: float = 2.0) -> None:
+        del timeout_s
+        self.shutdown_calls += 1
+
+
 class _ShallowFailThenRecoverRemoteService:
     def __init__(self) -> None:
         self.status_calls = 0
@@ -172,6 +195,131 @@ class _ShallowFailThenRecoverRemoteService:
 
     def ensure_remote_ready(self) -> None:
         self.ensure_calls += 1
+
+    def shutdown(self, *, timeout_s: float = 2.0) -> None:
+        del timeout_s
+        self.shutdown_calls += 1
+
+
+class _OperationalProbeAllowedRemoteService:
+    def __init__(self) -> None:
+        self.probe_calls = 0
+        self.shutdown_calls = 0
+
+    def remote_required(self) -> bool:
+        return True
+
+    def remote_status(self):
+        return SimpleNamespace(
+            mode="remote_primary",
+            ready=False,
+            detail="ChonkyDB instance responded but is not ready.",
+            operational_probe_allowed=True,
+        )
+
+    def probe_remote_ready(self, *, bootstrap: bool = True, include_archive: bool = True):
+        del bootstrap, include_archive
+        self.probe_calls += 1
+
+        class _ProbeResult:
+            ready = True
+            detail = None
+            remote_status = SimpleNamespace(
+                mode="remote_primary",
+                ready=False,
+                detail="ChonkyDB instance responded but is not ready.",
+                operational_probe_allowed=True,
+            )
+            warm_result = SimpleNamespace(archive_safe=True, health_tier="ready")
+
+            @staticmethod
+            def to_dict() -> dict[str, object]:
+                return {
+                    "ready": True,
+                    "detail": None,
+                    "remote_status": {
+                        "mode": "remote_primary",
+                        "ready": False,
+                        "detail": "ChonkyDB instance responded but is not ready.",
+                        "operational_probe_allowed": True,
+                    },
+                    "steps": (),
+                    "warm_result": {
+                        "archive_safe": True,
+                        "health_tier": "ready",
+                    },
+                }
+
+        return _ProbeResult()
+
+    def shutdown(self, *, timeout_s: float = 2.0) -> None:
+        del timeout_s
+        self.shutdown_calls += 1
+
+
+class _CooldownRecoveryProbeRemoteService:
+    def __init__(self) -> None:
+        self.probe_kwargs: list[dict[str, object]] = []
+        self.shutdown_calls = 0
+
+    def remote_required(self) -> bool:
+        return True
+
+    def remote_status(self):
+        return SimpleNamespace(
+            mode="remote_primary",
+            ready=False,
+            detail="Remote long-term memory is temporarily cooling down after recent failures.",
+            operational_probe_allowed=False,
+        )
+
+    def probe_remote_ready(
+        self,
+        *,
+        bootstrap: bool = True,
+        include_archive: bool = True,
+        external_attestation_probe: bool = False,
+    ):
+        self.probe_kwargs.append(
+            {
+                "bootstrap": bootstrap,
+                "include_archive": include_archive,
+                "external_attestation_probe": external_attestation_probe,
+            }
+        )
+        if not external_attestation_probe:
+            raise AssertionError("watchdog must force an external attestation probe during local cooldown")
+
+        class _ProbeResult:
+            ready = True
+            detail = "Remote-primary long-term memory recovered after watchdog cooldown reprobe."
+            remote_status = SimpleNamespace(
+                mode="remote_primary",
+                ready=True,
+                detail=None,
+                operational_probe_allowed=True,
+            )
+            warm_result = SimpleNamespace(archive_safe=True, health_tier="ready")
+
+            @staticmethod
+            def to_dict() -> dict[str, object]:
+                return {
+                    "ready": True,
+                    "detail": "Remote-primary long-term memory recovered after watchdog cooldown reprobe.",
+                    "remote_status": {
+                        "mode": "remote_primary",
+                        "ready": True,
+                        "detail": None,
+                        "operational_probe_allowed": True,
+                    },
+                    "steps": (),
+                    "warm_result": {
+                        "archive_safe": True,
+                        "health_tier": "ready",
+                    },
+                }
+
+        return _ProbeResult()
 
     def shutdown(self, *, timeout_s: float = 2.0) -> None:
         del timeout_s
@@ -327,6 +475,9 @@ class _CurrentOnlyProbeRemoteService:
                     "warm_result": {
                         "archive_safe": False,
                         "health_tier": "degraded",
+                        "proof_contract": {
+                            "contract_id": "configured_namespace_current_only_readiness",
+                        },
                     },
                 }
 
@@ -1085,6 +1236,64 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
         self.assertEqual(service.ensure_calls, 1)
         self.assertEqual(service.shutdown_calls, 1)
 
+    def test_probe_once_accepts_archive_safe_deep_probe_success_when_nested_remote_status_stays_unready(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+            )
+            service = _OperationalProbeAllowedRemoteService()
+            watchdog = RemoteMemoryWatchdog(
+                config=config,
+                service_factory=lambda: service,
+                store=RemoteMemoryWatchdogStore.from_config(config),
+                event_store=TwinrOpsEventStore.from_config(config),
+                emit=lambda _line: None,
+            )
+
+            snapshot = watchdog.probe_once()
+            watchdog.close()
+
+        self.assertEqual(snapshot.current.status, "ok")
+        self.assertTrue(snapshot.current.ready)
+        self.assertEqual(service.probe_calls, 1)
+        assert snapshot.current.probe is not None
+        remote_status = _object_dict(snapshot.current.probe["remote_status"])
+        self.assertFalse(remote_status["ready"])
+        self.assertTrue(remote_status["operational_probe_allowed"])
+        self.assertIn("query_surface_ready_despite_instance_flag_false", snapshot.current.detail or "")
+        self.assertEqual(service.shutdown_calls, 1)
+
+    def test_probe_once_reprobes_through_local_cooldown_when_external_attestation_is_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+            )
+            service = _CooldownRecoveryProbeRemoteService()
+            watchdog = RemoteMemoryWatchdog(
+                config=config,
+                service_factory=lambda: service,
+                store=RemoteMemoryWatchdogStore.from_config(config),
+                event_store=TwinrOpsEventStore.from_config(config),
+                emit=lambda _line: None,
+            )
+
+            snapshot = watchdog.probe_once()
+            watchdog.close()
+
+        self.assertEqual(snapshot.current.status, "ok")
+        self.assertTrue(snapshot.current.ready)
+        self.assertEqual(len(service.probe_kwargs), 1)
+        self.assertTrue(service.probe_kwargs[0]["external_attestation_probe"])
+        self.assertEqual(service.shutdown_calls, 1)
+
     def test_probe_once_persists_structured_probe_payload(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1246,6 +1455,7 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
                 runtime_state_path=str(root / "state" / "runtime-state.json"),
                 long_term_memory_enabled=True,
                 long_term_memory_mode="remote_primary",
+                long_term_memory_remote_watchdog_probe_mode="archive_inclusive",
             )
             watchdog = RemoteMemoryWatchdog(
                 config=config,
@@ -1260,6 +1470,54 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
         self.assertEqual(snapshot.current.status, "degraded")
         self.assertFalse(snapshot.current.ready)
         self.assertIn("archive-safe", snapshot.current.detail or "")
+
+    def test_probe_once_accepts_current_only_attestation_when_watchdog_contract_is_current_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_watchdog_probe_mode="current_only",
+            )
+            watchdog = RemoteMemoryWatchdog(
+                config=config,
+                service_factory=_CurrentOnlyProbeRemoteService,
+                store=RemoteMemoryWatchdogStore.from_config(config),
+                event_store=TwinrOpsEventStore.from_config(config),
+                emit=lambda _line: None,
+            )
+
+            snapshot = watchdog.probe_once()
+
+        self.assertEqual(snapshot.current.status, "ok")
+        self.assertTrue(snapshot.current.ready)
+
+    def test_probe_once_defaults_watchdog_artifact_mode_to_current_only_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_runtime_check_mode="watchdog_artifact",
+            )
+            service = _ProbeModeRecordingRemoteService([True])
+            watchdog = RemoteMemoryWatchdog(
+                config=config,
+                service_factory=lambda: service,
+                store=RemoteMemoryWatchdogStore.from_config(config),
+                event_store=TwinrOpsEventStore.from_config(config),
+                emit=lambda _line: None,
+            )
+
+            snapshot = watchdog.probe_once()
+            watchdog.close()
+
+        self.assertEqual(snapshot.current.status, "ok")
+        self.assertEqual(service.calls, [{"bootstrap": True, "include_archive": False}])
 
     def test_probe_once_timestamps_sample_at_probe_completion(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1319,6 +1577,115 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
         transition_event = next(event for event in events if event["event"] == "remote_memory_watchdog_status_changed")
         transition_data = _object_dict(transition_event["data"])
         self.assertEqual(transition_data["remote_write_context"], "[REDACTED]")
+
+    def test_probe_once_prefers_explicit_backend_problem_detail_from_exception_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+            )
+            watchdog = RemoteMemoryWatchdog(
+                config=config,
+                service_factory=_WarmupPendingRemoteService,
+                store=RemoteMemoryWatchdogStore.from_config(config),
+                event_store=TwinrOpsEventStore.from_config(config),
+                emit=lambda _line: None,
+            )
+
+            snapshot = watchdog.probe_once()
+
+        self.assertEqual(snapshot.current.status, "fail")
+        self.assertEqual(snapshot.current.detail, "Service warmup in progress")
+
+    def test_failure_backoff_stays_short_for_explicit_service_warmup_detail(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_watchdog_interval_s=1.0,
+                long_term_memory_remote_watchdog_probe_timeout_s=15.0,
+            )
+            watchdog = RemoteMemoryWatchdog(
+                config=config,
+                service_factory=_AlwaysFailRemoteService,
+                store=RemoteMemoryWatchdogStore.from_config(config),
+                event_store=TwinrOpsEventStore.from_config(config),
+                emit=lambda _line: None,
+                rand=SimpleNamespace(uniform=lambda _low, high: high),
+            )
+
+        generic_sample = RemoteMemoryWatchdogSample(
+            seq=73026,
+            captured_at="2026-04-11T15:39:40Z",
+            status="fail",
+            ready=False,
+            mode="remote_primary",
+            required=True,
+            latency_ms=11305.3,
+            consecutive_ok=0,
+            consecutive_fail=19,
+            detail="ChonkyDB health check failed (ChonkyDBError).",
+        )
+        warmup_sample = RemoteMemoryWatchdogSample(
+            seq=73027,
+            captured_at="2026-04-11T15:41:41Z",
+            status="fail",
+            ready=False,
+            mode="remote_primary",
+            required=True,
+            latency_ms=6943.4,
+            consecutive_ok=0,
+            consecutive_fail=20,
+            detail="Service warmup in progress",
+        )
+        upstream_restart_sample = RemoteMemoryWatchdogSample(
+            seq=73028,
+            captured_at="2026-04-11T15:41:46Z",
+            status="fail",
+            ready=False,
+            mode="remote_primary",
+            required=True,
+            latency_ms=7021.2,
+            consecutive_ok=0,
+            consecutive_fail=21,
+            detail="Upstream unavailable or restarting",
+        )
+        instance_not_ready_sample = RemoteMemoryWatchdogSample(
+            seq=73029,
+            captured_at="2026-04-11T15:41:51Z",
+            status="fail",
+            ready=False,
+            mode="remote_primary",
+            required=True,
+            latency_ms=75221.5,
+            consecutive_ok=0,
+            consecutive_fail=22,
+            detail="ChonkyDB instance responded but is not ready.",
+        )
+        cooldown_sample = RemoteMemoryWatchdogSample(
+            seq=73030,
+            captured_at="2026-04-11T16:24:13Z",
+            status="fail",
+            ready=False,
+            mode="remote_primary",
+            required=True,
+            latency_ms=0.1,
+            consecutive_ok=0,
+            consecutive_fail=38,
+            detail="Remote long-term memory is temporarily cooling down after recent failures.",
+        )
+
+        self.assertGreater(watchdog._failure_backoff_s(last_sample=generic_sample), 100.0)
+        self.assertEqual(watchdog._failure_backoff_s(last_sample=warmup_sample), 5.0)
+        self.assertEqual(watchdog._failure_backoff_s(last_sample=upstream_restart_sample), 5.0)
+        self.assertEqual(watchdog._failure_backoff_s(last_sample=instance_not_ready_sample), 5.0)
+        self.assertEqual(watchdog._failure_backoff_s(last_sample=cooldown_sample), 1.0)
 
 
 if __name__ == "__main__":

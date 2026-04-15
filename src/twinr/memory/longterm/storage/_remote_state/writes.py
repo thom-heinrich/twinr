@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import math
 import time
@@ -28,6 +29,7 @@ from twinr.memory.longterm.storage.remote_read_diagnostics import (
 from twinr.memory.longterm.storage.remote_read_observability import record_remote_write_observation
 
 from .shared import (
+    LongTermRemoteFetchAttempt,
     LongTermRemoteSnapshotProbe,
     LongTermRemoteUnavailableError,
     _DEFAULT_ASYNC_ATTESTATION_POLL_S,
@@ -47,6 +49,15 @@ from .shared import (
 
 _SYNC_SMALL_SNAPSHOT_WRITE_MAX_BYTES = 16_384
 _SYNC_DEFERRED_ID_SNAPSHOT_KINDS = frozenset({"midterm"})
+
+
+@dataclass(frozen=True, slots=True)
+class _StoredSnapshotRecordResult:
+    """Represent one accepted snapshot-record write before pointer publication."""
+
+    document_id: str | None
+    job_id: str | None
+    async_job_resolution_source: str | None
 
 
 class LongTermRemoteStateWriteMixin:
@@ -93,10 +104,11 @@ class LongTermRemoteStateWriteMixin:
         document_id: str | None = None
         attested_payload: dict[str, object] | None = None
         attested_source = "saved_snapshot"
+        stored_record: _StoredSnapshotRecordResult | None = None
         for attempt in range(retry_attempts):
             raise_if_remote_operation_cancelled(operation="Remote snapshot write")
             try:
-                document_id = self._store_snapshot_record(
+                stored_record = self._store_snapshot_record(
                     write_client,
                     snapshot_kind=normalized_snapshot_kind,
                     payload=payload_dict,
@@ -104,6 +116,7 @@ class LongTermRemoteStateWriteMixin:
                     backoff_s=0.0,
                     skip_async_document_id_wait=skip_async_document_id_wait,
                 )
+                document_id = stored_record.document_id
             except LongTermRemoteUnavailableError:
                 self._forget_snapshot_document_id(snapshot_kind=normalized_snapshot_kind)
                 if attempt + 1 >= retry_attempts:
@@ -122,6 +135,23 @@ class LongTermRemoteStateWriteMixin:
                 payload=payload_dict,
                 document_id=document_id,
             )
+            if (
+                attested_probe.payload is None
+                and document_id is None
+                and stored_record is not None
+            ):
+                deferred_document_id = self._resolve_deferred_snapshot_document_id_after_attestation_mismatch(
+                    write_client,
+                    store_result=stored_record,
+                )
+                if deferred_document_id is not None:
+                    document_id = deferred_document_id
+                    attested_probe = self._attest_saved_snapshot_readback(
+                        read_client,
+                        snapshot_kind=normalized_snapshot_kind,
+                        payload=payload_dict,
+                        document_id=document_id,
+                    )
             if attested_probe.payload is not None:
                 document_id = attested_probe.document_id or document_id
                 attested_payload = dict(attested_probe.payload)
@@ -147,7 +177,7 @@ class LongTermRemoteStateWriteMixin:
                 for retry_attempt in range(1, retry_attempts):
                     if retry_backoff_s > 0:
                         time.sleep(retry_backoff_s)
-                    document_id = self._store_snapshot_record(
+                    stored_record = self._store_snapshot_record(
                         write_client,
                         snapshot_kind=normalized_snapshot_kind,
                         payload=payload_dict,
@@ -155,12 +185,30 @@ class LongTermRemoteStateWriteMixin:
                         backoff_s=0.0,
                         skip_async_document_id_wait=skip_async_document_id_wait,
                     )
+                    document_id = stored_record.document_id
                     attested_probe = self._attest_saved_snapshot_readback(
                         read_client,
                         snapshot_kind=normalized_snapshot_kind,
                         payload=payload_dict,
                         document_id=document_id,
                     )
+                    if (
+                        attested_probe.payload is None
+                        and document_id is None
+                        and stored_record is not None
+                    ):
+                        deferred_document_id = self._resolve_deferred_snapshot_document_id_after_attestation_mismatch(
+                            write_client,
+                            store_result=stored_record,
+                        )
+                        if deferred_document_id is not None:
+                            document_id = deferred_document_id
+                            attested_probe = self._attest_saved_snapshot_readback(
+                                read_client,
+                                snapshot_kind=normalized_snapshot_kind,
+                                payload=payload_dict,
+                                document_id=document_id,
+                            )
                     if attested_probe.payload is not None:
                         document_id = attested_probe.document_id or document_id
                         attested_payload = dict(attested_probe.payload)
@@ -216,7 +264,7 @@ class LongTermRemoteStateWriteMixin:
         skip_async_document_id_wait: bool = False,
         forced_execution_mode: str | None = None,
         allow_single_item_sync_rescue: bool = True,
-    ) -> str | None:
+    ) -> _StoredSnapshotRecordResult:
         namespace = self.namespace or "twinr_longterm_v1"
         updated_at = _utcnow_iso()
         started = time.monotonic()
@@ -281,6 +329,7 @@ class LongTermRemoteStateWriteMixin:
                         f"ChonkyDB rejected remote snapshot write: {failure_detail}",
                         response_json=dict(result) if isinstance(result, Mapping) else None,
                     )
+                job_id = _extract_store_job_id(result)
                 self._note_remote_success()
                 document_id = _extract_store_document_id(result)
                 resolved_document_id = (
@@ -327,7 +376,11 @@ class LongTermRemoteStateWriteMixin:
                     outcome="ok",
                     classification="ok",
                 )
-                return resolved_document_id
+                return _StoredSnapshotRecordResult(
+                    document_id=resolved_document_id,
+                    job_id=job_id,
+                    async_job_resolution_source=async_job_resolution_source,
+                )
             except Exception as exc:
                 if store_transport_ms is None:
                     store_transport_ms = max(0.0, (time.monotonic() - attempt_started) * 1000.0)
@@ -443,6 +496,29 @@ class LongTermRemoteStateWriteMixin:
             self._remote_failure_detail("write", snapshot_kind, exc=last_error)
         ) from last_error
 
+    def _resolve_deferred_snapshot_document_id_after_attestation_mismatch(
+        self,
+        write_client: ChonkyDBClient,
+        *,
+        store_result: _StoredSnapshotRecordResult,
+    ) -> str | None:
+        """Escalate one deferred-id snapshot write to jobs-endpoint proof on URI mismatch.
+
+        The tiny midterm compatibility head may skip the initial jobs wait when
+        same-URI readback should be enough. If that attestation instead proves a
+        stale same-URI history hit, resolve the accepted async job to an exact
+        document id before declaring the write unavailable.
+        """
+
+        if store_result.document_id is not None:
+            return store_result.document_id
+        if store_result.async_job_resolution_source != "skipped_projection_complete":
+            return None
+        job_id = _normalize_text(store_result.job_id)
+        if not job_id:
+            return None
+        return self._await_async_store_document_id_from_job_id(write_client, job_id=job_id)
+
     @staticmethod
     def _clone_snapshot_write_client_with_timeout(
         write_client: ChonkyDBClient,
@@ -544,6 +620,16 @@ class LongTermRemoteStateWriteMixin:
         job_id = _extract_store_job_id(result)
         if job_id is None:
             return None
+        return self._await_async_store_document_id_from_job_id(write_client, job_id=job_id)
+
+    def _await_async_store_document_id_from_job_id(
+        self,
+        write_client: ChonkyDBClient,
+        *,
+        job_id: str,
+    ) -> str | None:
+        """Resolve one accepted async snapshot write job id to its exact document id."""
+
         job_status_client = self._status_probe_client(write_client)
         poll_interval_s = max(self._retry_backoff_s(), _DEFAULT_ASYNC_ATTESTATION_POLL_S)
         total_timeout_s = self._async_job_visibility_timeout_s()
@@ -659,7 +745,7 @@ class LongTermRemoteStateWriteMixin:
         """Poll one just-written snapshot until the expected payload is visible."""
 
         started = time.monotonic()
-        attempt_records: list[object] = []
+        attempt_records: list[LongTermRemoteFetchAttempt] = []
         expected_payload_dict = dict(expected_payload)
         poll_interval_s = max(self._retry_backoff_s(), _DEFAULT_ASYNC_ATTESTATION_POLL_S)
         resolved_attempts = self._retry_attempts()
@@ -772,7 +858,7 @@ class LongTermRemoteStateWriteMixin:
             write_client,
             snapshot_kind=self._pointer_snapshot_kind(snapshot_kind),
             payload=pointer_payload,
-        )
+        ).document_id
 
 
 __all__ = ["LongTermRemoteStateWriteMixin"]

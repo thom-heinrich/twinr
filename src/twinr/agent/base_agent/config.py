@@ -14,6 +14,7 @@ from ._config.constants import (
     GPIO_DISPLAY_DRIVERS,
     SUPPORTED_DISPLAY_LAYOUTS,
     DEFAULT_OPENAI_MAIN_MODEL,
+    DEFAULT_OPENAI_SEARCH_MODEL,
 )
 from ._config.parsing import (
     _read_dotenv,
@@ -48,6 +49,7 @@ __all__ = [
     "GPIO_DISPLAY_DRIVERS",
     "SUPPORTED_DISPLAY_LAYOUTS",
     "DEFAULT_OPENAI_MAIN_MODEL",
+    "DEFAULT_OPENAI_SEARCH_MODEL",
     "_read_dotenv",
     "_parse_bool",
     "_parse_optional_bool",

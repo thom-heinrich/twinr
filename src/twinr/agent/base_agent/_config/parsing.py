@@ -158,7 +158,7 @@ def _derive_proactive_vision_provider(
     del camera_host_mode, proactive_remote_camera_base_url
     if _uses_aideck_camera_device(camera_device):
         return "aideck_openai"
-    return "local_first"
+    return "local"
 
 
 def _normalize_model_setting(value: object, *, fallback: str) -> str:

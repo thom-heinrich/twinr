@@ -1,10 +1,13 @@
 # CHANGELOG: 2026-03-27
 # BUG-1: Respected check_required_remote_dependency(force_sync=True); startup no longer ignores the caller's explicit request for a direct required-remote readiness probe.
-# BUG-2: Made degraded-startup telemetry best-effort; a broken ops event sink no longer crashes an otherwise recoverable boot.
+# BUG-2: Required-remote bootstrap failures now move Twinr into an explicit startup
+#        error instead of an implicit partial-boot state.
 # BUG-3: Serialized shutdown snapshot capture against the runtime flow lock when available; this closes a real race with in-flight turn/state mutations.
 # BUG-4: Required-remote bootstrap now honors `watchdog_artifact` mode instead of forcing a second deep remote probe that can outlive the Pi supervisor startup budget and strand Twinr on a stale ERROR snapshot.
 # SEC-1: Hardened file-backed state path preflight to reject symlinked parent chains and non-regular targets before bootstrap touches runtime-owned storage paths.
-# IMP-1: Added supervisor-grade lifecycle metadata plus a redacted health_snapshot() surface that separates conversation state from runtime readiness/degraded/stopping phases.
+# IMP-1: Added supervisor-grade lifecycle metadata plus a redacted health_snapshot()
+#        surface that separates conversation state from runtime readiness/failure/
+#        stopping phases.
 # IMP-2: Added optional native systemd sd_notify READY/STATUS/STOPPING/WATCHDOG support for modern Raspberry Pi service deployments without introducing a new dependency.
 # IMP-3: Upgraded shutdown to bounded fan-out with isolated daemon worker threads so one hung component does not starve every later flush/close step.
 
@@ -47,7 +50,6 @@ class TwinrLifecyclePhase(StrEnum):
 
     INITIALIZING = "initializing"
     RUNNING = "running"
-    DEGRADED = "degraded"
     FAILED = "failed"
     STOPPING = "stopping"
     STOPPED = "stopped"
@@ -81,11 +83,6 @@ class TwinrRuntimeBase:
         repr=False,
         default=TwinrLifecyclePhase.INITIALIZING,
     )  # IMP-1: Runtime-Lifecycle separat vom Gesprächsstatus exponieren.
-    startup_degraded_reason: str | None = field(
-        init=False,
-        repr=False,
-        default=None,
-    )  # IMP-1: Betreiberfreundliche Degraded-Ursache ohne PII-Content.
     startup_failed_reason: str | None = field(
         init=False,
         repr=False,
@@ -123,7 +120,6 @@ class TwinrRuntimeBase:
     )  # IMP-2: Optionaler systemd-Watchdog-Pinger.
 
     def __post_init__(self) -> None:
-        long_term_startup_warning: str | None = None
         long_term_startup_error: str | None = None
         self._notify_systemd_status("Bootstrapping Twinr runtime.")
         try:
@@ -158,33 +154,20 @@ class TwinrRuntimeBase:
                 )
             except LongTermRemoteUnavailableError as exc:
                 detail = self._sanitize_status_text(exc, default="Required remote long-term memory is unavailable.")
-                if self.remote_dependency_required():
-                    long_term_startup_error = detail
-                    _LOGGER.error(
-                        "Twinr runtime startup entered error because required remote long-term memory is unavailable: %s",
-                        long_term_startup_error,
-                    )
-                else:
-                    long_term_startup_warning = detail
-                    _LOGGER.warning(
-                        "Twinr runtime startup degraded because remote long-term memory is unavailable: %s",
-                        long_term_startup_warning,
-                    )
+                long_term_startup_error = detail
+                _LOGGER.error(
+                    "Twinr runtime startup entered error because required remote long-term memory is unavailable: %s",
+                    long_term_startup_error,
+                )
             except Exception as exc:
                 detail = self._sanitize_status_text(
                     exc,
                     default="Remote long-term memory readiness check failed unexpectedly.",
                 )
-                if self.remote_dependency_required():
-                    long_term_startup_error = detail
-                    _LOGGER.exception(
-                        "Twinr runtime startup entered error because the required remote long-term memory check crashed.",
-                    )
-                else:
-                    long_term_startup_warning = detail
-                    _LOGGER.exception(
-                        "Twinr runtime startup degraded because the optional remote long-term memory check crashed.",
-                    )
+                long_term_startup_error = detail
+                _LOGGER.exception(
+                    "Twinr runtime startup entered error because the required remote long-term memory check crashed.",
+                )
 
             self.reminder_store = ReminderStore(
                 reminder_store_path,
@@ -214,14 +197,6 @@ class TwinrRuntimeBase:
             self.ops_events = TwinrOpsEventStore.from_config(self.config)
             self.proactive_governor = ProactiveGovernor.from_config(self.config)
 
-            if long_term_startup_warning:
-                self.startup_degraded_reason = long_term_startup_warning
-                self._append_ops_event_safe(
-                    event="longterm_startup_degraded",
-                    message="Twinr started without remote long-term memory because the remote snapshot was unavailable.",
-                    data={"detail": long_term_startup_warning},
-                )
-
             if self.config.restore_runtime_state_on_startup:
                 restore_snapshot_context = getattr(self, "_restore_snapshot_context", None)
                 if callable(restore_snapshot_context):
@@ -240,11 +215,7 @@ class TwinrRuntimeBase:
                     if callable(persist_snapshot):
                         persist_snapshot()  # pylint: disable=not-callable
             else:
-                self.lifecycle_phase = (
-                    TwinrLifecyclePhase.DEGRADED
-                    if long_term_startup_warning
-                    else TwinrLifecyclePhase.RUNNING
-                )
+                self.lifecycle_phase = TwinrLifecyclePhase.RUNNING
                 persist_snapshot = getattr(self, "_persist_snapshot", None)
                 if callable(persist_snapshot):
                     persist_snapshot()  # pylint: disable=not-callable
@@ -278,7 +249,7 @@ class TwinrRuntimeBase:
     def ready(self) -> bool:
         """Return whether the runtime finished boot and is able to serve requests."""
 
-        return self.lifecycle_phase in {TwinrLifecyclePhase.RUNNING, TwinrLifecyclePhase.DEGRADED}
+        return self.lifecycle_phase == TwinrLifecyclePhase.RUNNING
 
     @property
     def is_shutting_down(self) -> bool:
@@ -296,7 +267,6 @@ class TwinrRuntimeBase:
             "lifecycle_phase": getattr(lifecycle_phase, "value", str(lifecycle_phase)),
             "ready": self.ready,
             "shutdown_started": bool(getattr(self, "_shutdown_started", False)),
-            "startup_degraded_reason": self.startup_degraded_reason,
             "startup_failed_reason": self.startup_failed_reason,
             "remote_dependency_required": self.remote_dependency_required(),
             "last_error": self._sanitize_status_text(
@@ -680,9 +650,7 @@ class TwinrRuntimeBase:
         status_value = getattr(getattr(self, "status", None), "value", "unknown")
         detail: str | None = None
 
-        if phase == TwinrLifecyclePhase.DEGRADED:
-            detail = self.startup_degraded_reason
-        elif phase == TwinrLifecyclePhase.FAILED:
+        if phase == TwinrLifecyclePhase.FAILED:
             detail = self.startup_failed_reason or getattr(self.state_machine, "last_error", None)
 
         if detail:

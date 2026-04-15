@@ -10,6 +10,7 @@ from twinr.agent.base_agent import TwinrConfig
 from twinr.display.emoji_cues import DisplayEmojiCue
 from twinr.proactive.runtime.display_gesture_emoji import (
     DisplayGestureEmojiPublisher,
+    display_gesture_refresh_supported,
     derive_display_gesture_emoji,
     resolve_display_gesture_refresh_interval,
 )
@@ -116,6 +117,34 @@ class DisplayGestureEmojiTests(unittest.TestCase):
         interval_s = resolve_display_gesture_refresh_interval(config)
 
         self.assertEqual(interval_s, 0.2)
+
+    def test_refresh_interval_fails_closed_when_voice_orchestrator_is_enabled(self) -> None:
+        config = TwinrConfig(
+            project_root=".",
+            display_gesture_refresh_interval_s=0.2,
+            voice_orchestrator_enabled=True,
+            voice_orchestrator_ws_url="ws://example.invalid/ws/orchestrator/voice",
+        )
+
+        interval_s = resolve_display_gesture_refresh_interval(config)
+
+        self.assertIsNone(interval_s)
+
+    def test_gesture_refresh_support_fails_closed_when_voice_orchestrator_is_enabled(self) -> None:
+        config = TwinrConfig(
+            project_root=".",
+            display_driver="hdmi_wayland",
+            display_gesture_refresh_interval_s=0.2,
+            voice_orchestrator_enabled=True,
+            voice_orchestrator_ws_url="ws://example.invalid/ws/orchestrator/voice",
+        )
+
+        supported = display_gesture_refresh_supported(
+            config=config,
+            vision_observer=type("_VisionObserver", (), {"supports_gesture_refresh": True})(),
+        )
+
+        self.assertFalse(supported)
 
     def test_derive_prefers_fine_hand_gesture_symbols(self) -> None:
         decision = derive_display_gesture_emoji(

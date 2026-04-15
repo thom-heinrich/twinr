@@ -18,6 +18,7 @@ from .constants import (
     SUPPORTED_DISPLAY_DRIVERS,
     SUPPORTED_DISPLAY_LAYOUTS,
     DEFAULT_OPENAI_MAIN_MODEL,
+    DEFAULT_OPENAI_SEARCH_MODEL,
 )
 from .parsing import (
     _normalize_model_setting,
@@ -75,6 +76,10 @@ def normalize_twinr_config(config: "TwinrConfig") -> None:
     if not math.isfinite(normalized_display_face_cue_ttl_s):
         raise ValueError("display_face_cue_ttl_s must be finite")
     normalized_display_face_cue_ttl_s = max(0.1, normalized_display_face_cue_ttl_s)
+    normalized_display_wake_cue_ttl_s = float(config.display_wake_cue_ttl_s)
+    if not math.isfinite(normalized_display_wake_cue_ttl_s):
+        raise ValueError("display_wake_cue_ttl_s must be finite")
+    normalized_display_wake_cue_ttl_s = max(0.1, normalized_display_wake_cue_ttl_s)
     normalized_display_emoji_cue_ttl_s = float(config.display_emoji_cue_ttl_s)
     if not math.isfinite(normalized_display_emoji_cue_ttl_s):
         raise ValueError("display_emoji_cue_ttl_s must be finite")
@@ -109,7 +114,7 @@ def normalize_twinr_config(config: "TwinrConfig") -> None:
     )
     normalized_openai_search_model = _normalize_model_setting(
         config.openai_search_model,
-        fallback=normalized_default_model,
+        fallback=DEFAULT_OPENAI_SEARCH_MODEL,
     )
     normalized_display_reserve_generation_model = _normalize_model_setting(
         config.display_reserve_generation_model,
@@ -514,6 +519,15 @@ def normalize_twinr_config(config: "TwinrConfig") -> None:
             - normalized_attention_servo_min_pulse_width_us,
         ),
     )
+    normalized_attention_servo_visible_retarget_cooldown_s = float(
+        config.attention_servo_visible_retarget_cooldown_s
+    )
+    if not math.isfinite(normalized_attention_servo_visible_retarget_cooldown_s):
+        raise ValueError("attention_servo_visible_retarget_cooldown_s must be finite")
+    normalized_attention_servo_visible_retarget_cooldown_s = max(
+        0.0,
+        normalized_attention_servo_visible_retarget_cooldown_s,
+    )
     normalized_attention_servo_soft_limit_margin_us = max(
         0,
         min(
@@ -752,6 +766,12 @@ def normalize_twinr_config(config: "TwinrConfig") -> None:
         ).strip()
         or "artifacts/stores/ops/display_face_cue.json"
     )
+    normalized_display_wake_cue_path = (
+        str(
+            config.display_wake_cue_path or "artifacts/stores/ops/display_wake_cue.json"
+        ).strip()
+        or "artifacts/stores/ops/display_wake_cue.json"
+    )
     normalized_display_emoji_cue_path = (
         str(
             config.display_emoji_cue_path or "artifacts/stores/ops/display_emoji.json"
@@ -852,9 +872,24 @@ def normalize_twinr_config(config: "TwinrConfig") -> None:
         strip_trailing_slash=True,
     )
     normalized_proactive_vision_provider = (
-        str(config.proactive_vision_provider or "local_first").strip().lower()
-        or "local_first"
+        str(config.proactive_vision_provider or "local").strip().lower()
+        or "local"
     )
+    normalized_proactive_vision_provider = {
+        "local_first": "local",
+        "local_camera": "local",
+        "local_only": "local",
+        "local_strict": "local",
+        "picamera2": "local",
+        "libcamera": "local",
+        "rpicam": "local",
+        "imx500": "local",
+        "pi_ai_camera": "local",
+        "ai_camera": "local",
+        "aideck": "aideck_openai",
+        "cloud": "openai",
+        "openai_remote": "openai",
+    }.get(normalized_proactive_vision_provider, normalized_proactive_vision_provider)
     if config.voice_orchestrator_enabled and not normalized_voice_orchestrator_ws_url:
         raise ValueError(
             "voice_orchestrator_enabled requires TWINR_VOICE_ORCHESTRATOR_WS_URL; "

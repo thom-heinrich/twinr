@@ -5,7 +5,11 @@
 # SEC-1: Serialize access to the Crazyradio/target with an advisory lock to prevent concurrent flash/probe races on shared Raspberry Pi deployments.
 # SEC-2: Require an explicit acknowledgement for cold-boot flashing because Bitcraze documents untargeted cold boot as unpredictable if multiple Crazyflies are in bootloader range.
 # IMP-1: Support manifest-aware artifacts (.bin, Bitcraze release .zip, or manifest.json) and record SHA-256 + manifest metadata in the report.
-# IMP-2: Add transient-aware retry policy, sanitized cfloader subprocess environment, per-URI TOC cache isolation, and optional link-statistics capture during verification.
+# IMP-2: Add sanitized cfloader subprocess environment and per-URI TOC cache isolation during verification.
+# BUG-3: 2026-04-11 removed automatic flash/probe retries and lane ambiguity; the helper now fails closed unless one explicit firmware lane, one explicit device role, and one matching attestation agree.
+# BUG-4: 2026-04-12 the post-flash probe now persists and reconstructs the full OnDeviceFailsafeAvailability surface instead of dropping optional codes/enable state and crashing during report assembly.
+# SEC-3: 2026-04-11 operator devices are now blocked from raw custom `stm32-fw` flashes; only promoted operator releases or official recovery ZIPs are accepted.
+# SEC-4: 2026-04-11 recovery and custom firmware are now split into different lanes so operator recovery can no longer be confused with ad-hoc app deployment.
 
 """Flash and verify the Twinr on-device Crazyflie failsafe app.
 
@@ -14,22 +18,38 @@ Purpose
 Keep the firmware rollout for the on-device STM32 failsafe deterministic and
 operator-friendly. This script flashes the already-built OOT firmware image
 through ``cfloader`` and then proves that the new ``twinrFs`` app-layer param
-surface is visible over the normal radio link.
+surface is visible over the normal radio link. The helper now enforces one
+explicit firmware lane per run:
+
+- ``dev`` for direct development flashes onto dev hardware only
+- ``bench`` for promoted bench-validation artifacts
+- ``operator`` for operator-approved promoted artifacts only
+- ``recovery`` for official Bitcraze release ZIP recovery only
 
 Usage
 -----
 Command-line examples::
 
-    /twinr/bitcraze/.venv/bin/python hardware/bitcraze/flash_on_device_failsafe.py
-    /twinr/bitcraze/.venv/bin/python hardware/bitcraze/flash_on_device_failsafe.py --skip-probe
-    /twinr/bitcraze/.venv/bin/python hardware/bitcraze/flash_on_device_failsafe.py --boot-mode cold --allow-unsafe-cold-boot --json
-    /twinr/bitcraze/.venv/bin/python hardware/bitcraze/flash_on_device_failsafe.py --binary release-2025.09.zip --expected-sha256 <sha256>
+    /twinr/bitcraze/.venv/bin/python hardware/bitcraze/flash_on_device_failsafe.py \
+        --lane dev \
+        --device-role dev \
+        --attestation hardware/bitcraze/twinr_on_device_failsafe/build/twinr_on_device_failsafe.build-attestation.json
+    /twinr/bitcraze/.venv/bin/python hardware/bitcraze/flash_on_device_failsafe.py \
+        --lane operator \
+        --device-role operator \
+        --attestation /path/to/twinr_on_device_failsafe.operator.release.json
+    /twinr/bitcraze/.venv/bin/python hardware/bitcraze/flash_on_device_failsafe.py \
+        --lane recovery \
+        --device-role operator \
+        --binary /tmp/cf-recovery/firmware-cf2-2025.12.1.zip \
+        --expected-sha256 <sha256>
 
 Inputs
 ------
 - A reachable Crazyflie on ``radio://0/80/2M`` by default
-- A raw STM32 image, or a Bitcraze release ZIP / ``manifest.json`` that contains
-  one main-board ``cf2``/``stm32`` firmware entry
+- One explicit firmware lane and one explicit device role
+- A raw STM32 image plus matching attestation for ``dev``/``bench``/``operator``,
+  or a Bitcraze release ZIP / ``manifest.json`` for ``recovery``
 - A working Bitcraze workspace under ``/twinr/bitcraze``
 
 Outputs
@@ -70,6 +90,15 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from firmware_release_policy import (  # noqa: E402
+    FlashAuthorization,
+    FirmwareReleasePolicyError,
+    LANE_BENCH,
+    LANE_DEV,
+    LANE_OPERATOR,
+    LANE_RECOVERY,
+    authorize_flash_request,
+)
 from on_device_failsafe import OnDeviceFailsafeAvailability, probe_on_device_failsafe  # noqa: E402
 
 
@@ -77,20 +106,22 @@ DEFAULT_URI = "radio://0/80/2M"
 DEFAULT_WORKSPACE = Path("/twinr/bitcraze")
 DEFAULT_BINARY = SCRIPT_DIR / "twinr_on_device_failsafe" / "build" / "twinr_on_device_failsafe.bin"
 DEFAULT_CFLOADER = DEFAULT_WORKSPACE / ".venv" / "bin" / "cfloader"
+DEFAULT_ATTESTATION = (
+    SCRIPT_DIR
+    / "twinr_on_device_failsafe"
+    / "build"
+    / "twinr_on_device_failsafe.build-attestation.json"
+)
 
 DEFAULT_FLASH_TIMEOUT_S = 120.0
-DEFAULT_FLASH_ATTEMPTS_WARM = 2
-DEFAULT_FLASH_ATTEMPTS_COLD = 1
-DEFAULT_FLASH_RETRY_BACKOFF_S = 1.5
+DEFAULT_FLASH_ATTEMPTS = 1
 
 DEFAULT_PROBE_SETTLE_S = 3.0
 DEFAULT_PROBE_TIMEOUT_S = 20.0
-DEFAULT_PROBE_ATTEMPTS = 3
-DEFAULT_PROBE_RETRY_BACKOFF_S = 1.0
-DEFAULT_PROBE_LINK_STATS_SAMPLE_S = 0.35
+DEFAULT_PROBE_ATTEMPTS = 1
 
 DEFAULT_LOCK_TIMEOUT_S = 15.0
-REPORT_VERSION = 2
+REPORT_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -126,10 +157,18 @@ class OnDeviceFailsafeFlashReport:
     """Persist the bounded outcome of one firmware flash/probe run."""
 
     report_version: int
+    lane: str
+    device_role: str
     uri: str
     workspace: str
     requested_binary_path: str
     binary_path: str
+    attestation_path: str | None
+    attestation_kind: str | None
+    attested_release_id: str | None
+    source_firmware_git_commit: str | None
+    source_firmware_git_tag: str | None
+    source_app_tree_sha256: str | None
     cfloader_executable: str
     boot_mode: str
     flash_command: tuple[str, ...]
@@ -205,7 +244,16 @@ def _snapshot_availability(availability: Any) -> dict[str, Any] | None:
     if availability is None:
         return None
 
-    preferred_fields = ("loaded", "protocol_version", "state_name", "reason_name", "failures")
+    preferred_fields = (
+        "loaded",
+        "protocol_version",
+        "enabled",
+        "state_code",
+        "state_name",
+        "reason_code",
+        "reason_name",
+        "failures",
+    )
     snapshot: dict[str, Any] = {}
     for name in preferred_fields:
         if hasattr(availability, name):
@@ -222,14 +270,27 @@ def _snapshot_availability(availability: Any) -> dict[str, Any] | None:
 
 
 def _reconstruct_availability(snapshot: dict[str, Any] | None) -> OnDeviceFailsafeAvailability | None:
-    """Best-effort reconstruction for programmatic callers."""
+    """Reconstruct one availability snapshot or fail closed."""
 
     if not snapshot:
         return None
-    try:
-        return OnDeviceFailsafeAvailability(**snapshot)
-    except Exception:
-        return None
+    failures_raw = snapshot.get("failures", ())
+    if isinstance(failures_raw, (list, tuple)):
+        failures = tuple(str(item) for item in failures_raw)
+    elif failures_raw in (None, ""):
+        failures = ()
+    else:
+        failures = (str(failures_raw),)
+    return OnDeviceFailsafeAvailability(
+        loaded=bool(snapshot.get("loaded", False)),
+        protocol_version=cast(int | None, snapshot.get("protocol_version")),
+        enabled=cast(int | None, snapshot.get("enabled")),
+        state_code=cast(int | None, snapshot.get("state_code")),
+        state_name=cast(str | None, snapshot.get("state_name")),
+        reason_code=cast(int | None, snapshot.get("reason_code")),
+        reason_name=cast(str | None, snapshot.get("reason_name")),
+        failures=failures,
+    )
 
 
 def _availability_value(
@@ -282,10 +343,7 @@ def _ensure_directory(path: Path) -> None:
 def _write_private_file(path: Path, data: bytes) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     path.write_bytes(data)
-    try:
-        path.chmod(stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        pass
+    path.chmod(stat.S_IRUSR | stat.S_IWUSR)
 
 
 def _select_bitcraze_manifest_entry(manifest: Mapping[str, Any]) -> tuple[str, Mapping[str, Any]]:
@@ -308,10 +366,6 @@ def _select_bitcraze_manifest_entry(manifest: Mapping[str, Any]) -> tuple[str, M
 
     if len(candidates) == 1:
         return candidates[0]
-
-    preferred = [item for item in candidates if str(item[1].get("repository", "")).strip() == "crazyflie-firmware"]
-    if len(preferred) == 1:
-        return preferred[0]
 
     names = ", ".join(sorted(name for name, _ in candidates))
     raise ValueError(f"manifest contains multiple STM32 firmware entries: {names}")
@@ -596,13 +650,6 @@ def _run_cfloader_attempt(
     return completed, attempt_report
 
 
-def _remove_callback(callback_container: Any, callback: Callable[..., Any]) -> None:
-    try:
-        callback_container.remove_callback(callback)
-    except Exception:
-        pass
-
-
 @contextmanager
 def _radio_lock(
     *,
@@ -640,10 +687,7 @@ def _radio_lock(
         yield str(lock_path)
     finally:
         if acquired and fcntl is not None:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
+            fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
 
@@ -666,7 +710,6 @@ def _probe_loaded_failsafe(
     uri: str,
     workspace: Path,
     settle_s: float,
-    link_stats_sample_s: float,
     sleep: Callable[[float], None] = time.sleep,
 ) -> tuple[OnDeviceFailsafeAvailability, dict[str, Any]]:
     """Reconnect over the normal radio link and prove that ``twinrFs`` is live."""
@@ -700,27 +743,18 @@ def _probe_loaded_failsafe(
                 registered_callbacks.append((callback_container, _callback))
 
             if hasattr(link_statistics, "start"):
-                try:
-                    link_statistics.start()
-                except Exception:
-                    pass
+                link_statistics.start()
 
         if hasattr(sync_cf, "wait_for_params"):
             sync_cf.wait_for_params()
 
         availability = probe_on_device_failsafe(sync_cf)
 
-        if link_stats_sample_s > 0.0:
-            sleep(float(link_stats_sample_s))
-
         if link_statistics is not None and hasattr(link_statistics, "stop"):
-            try:
-                link_statistics.stop()
-            except Exception:
-                pass
+            link_statistics.stop()
 
         for callback_container, callback in registered_callbacks:
-            _remove_callback(callback_container, callback)
+            callback_container.remove_callback(callback)
 
         return availability, captured_link_stats
 
@@ -731,7 +765,6 @@ def _probe_worker(
     uri: str,
     workspace: str,
     settle_s: float,
-    link_stats_sample_s: float,
 ) -> None:
     """Child-process worker to keep the parent probe fully bounded."""
 
@@ -740,7 +773,6 @@ def _probe_worker(
             uri=uri,
             workspace=Path(workspace),
             settle_s=settle_s,
-            link_stats_sample_s=link_stats_sample_s,
         )
         result_queue.put(
             {
@@ -765,7 +797,6 @@ def _run_probe_with_timeout(
     workspace: Path,
     settle_s: float,
     timeout_s: float,
-    link_stats_sample_s: float,
 ) -> tuple[dict[str, Any] | None, dict[str, Any], str | None, tuple[str, ...]]:
     """Run one probe attempt in a child process and bound it with a hard timeout."""
 
@@ -778,7 +809,6 @@ def _run_probe_with_timeout(
             "uri": str(uri),
             "workspace": str(workspace),
             "settle_s": float(settle_s),
-            "link_stats_sample_s": float(link_stats_sample_s),
         },
     )
     process.daemon = True
@@ -789,16 +819,10 @@ def _run_probe_with_timeout(
         process.terminate()
         process.join(2.0)
         if process.is_alive() and hasattr(process, "kill"):
-            process.kill()  # pragma: no cover - hard hang fallback
+            process.kill()  # pragma: no cover - hard hang termination
             process.join(2.0)
-        try:
-            result_queue.close()
-        except Exception:
-            pass
-        try:
-            result_queue.join_thread()
-        except Exception:
-            pass
+        result_queue.close()
+        result_queue.join_thread()
         return None, {}, f"probe timed out after {float(timeout_s):.1f}s", ()
 
     try:
@@ -806,14 +830,8 @@ def _run_probe_with_timeout(
     except queue.Empty:
         return None, {}, f"probe subprocess exited with code {process.exitcode} without a result", ()
     finally:
-        try:
-            result_queue.close()
-        except Exception:
-            pass
-        try:
-            result_queue.join_thread()
-        except Exception:
-            pass
+        result_queue.close()
+        result_queue.join_thread()
 
     if not payload.get("ok", False):
         error = str(payload.get("error", f"probe subprocess exited with code {process.exitcode}"))
@@ -831,25 +849,21 @@ def _run_probe_with_timeout(
     return snapshot, link_stats, None, ()
 
 
-def _default_flash_attempts(boot_mode: str) -> int:
-    return DEFAULT_FLASH_ATTEMPTS_WARM if str(boot_mode).strip().lower() == "warm" else DEFAULT_FLASH_ATTEMPTS_COLD
-
-
 def flash_on_device_failsafe(
     *,
+    lane: str,
+    device_role: str,
     uri: str = DEFAULT_URI,
     workspace: Path = DEFAULT_WORKSPACE,
     binary_path: Path = DEFAULT_BINARY,
+    attestation_path: Path | None = None,
     cfloader_executable: Path = DEFAULT_CFLOADER,
     boot_mode: str = "warm",
     flash_timeout_s: float = DEFAULT_FLASH_TIMEOUT_S,
-    flash_attempts: int | None = None,
-    flash_retry_backoff_s: float = DEFAULT_FLASH_RETRY_BACKOFF_S,
+    flash_attempts: int = DEFAULT_FLASH_ATTEMPTS,
     probe_settle_s: float = DEFAULT_PROBE_SETTLE_S,
     probe_timeout_s: float = DEFAULT_PROBE_TIMEOUT_S,
     probe_attempts: int = DEFAULT_PROBE_ATTEMPTS,
-    probe_retry_backoff_s: float = DEFAULT_PROBE_RETRY_BACKOFF_S,
-    probe_link_stats_sample_s: float = DEFAULT_PROBE_LINK_STATS_SAMPLE_S,
     lock_timeout_s: float = DEFAULT_LOCK_TIMEOUT_S,
     expected_sha256: str | None = None,
     allow_unsafe_cold_boot: bool = False,
@@ -862,10 +876,15 @@ def flash_on_device_failsafe(
     started_at_epoch_s = time.time()
     overall_started = time.monotonic()
 
+    normalized_lane = str(lane).strip().lower()
+    normalized_device_role = str(device_role).strip().lower()
     normalized_uri = str(uri).strip() or DEFAULT_URI
     normalized_boot_mode = str(boot_mode).strip().lower() or "warm"
     normalized_workspace = Path(workspace).expanduser()
     normalized_cfloader = Path(cfloader_executable).expanduser()
+    normalized_attestation_path = (
+        None if attestation_path is None else Path(attestation_path).expanduser()
+    )
 
     failures: list[str] = []
     warnings: list[str] = []
@@ -886,6 +905,7 @@ def flash_on_device_failsafe(
     lock_path: str | None = None
     flash_command: tuple[str, ...] = ()
     resolved_artifact: ResolvedFlashArtifact | None = None
+    flash_authorization: FlashAuthorization | None = None
 
     try:
         normalized_expected_sha256 = _normalize_sha256(expected_sha256)
@@ -904,12 +924,13 @@ def flash_on_device_failsafe(
         # BREAKING: cold boot now requires an explicit acknowledgement because Bitcraze documents untargeted
         # cold-boot flashing as unpredictable if multiple Crazyflies are in bootloader range.
 
-    requested_flash_attempts = int(flash_attempts) if flash_attempts is not None else _default_flash_attempts(normalized_boot_mode)
-    requested_flash_attempts = max(1, requested_flash_attempts)
+    requested_flash_attempts = max(1, int(flash_attempts))
+    if requested_flash_attempts != 1:
+        failures.append("automatic flash retries are disabled; use --flash-attempts 1")
 
-    if normalized_boot_mode == "cold" and requested_flash_attempts > 1:
-        failures.append("cold boot does not support automatic multi-attempt flashing; use --flash-attempts 1")
-        # BREAKING: cold boot retries remain disabled because retries cannot target one specific device in untargeted bootloader discovery.
+    requested_probe_attempts = max(1, int(probe_attempts))
+    if requested_probe_attempts != 1:
+        failures.append("automatic probe retries are disabled; use --probe-attempts 1")
 
     normalized_cfloader_resolved: Path | None = None
     if not failures:
@@ -940,6 +961,25 @@ def flash_on_device_failsafe(
 
     if not failures and normalized_cfloader_resolved is not None and resolved_artifact is not None:
         try:
+            flash_authorization = authorize_flash_request(
+                lane=normalized_lane,
+                device_role=normalized_device_role,
+                artifact_path=Path(resolved_artifact.binary_path),
+                artifact_sha256=resolved_artifact.sha256,
+                artifact_size_bytes=resolved_artifact.size_bytes,
+                artifact_source_kind=resolved_artifact.source_kind,
+                artifact_release=resolved_artifact.release,
+                artifact_repository=resolved_artifact.repository,
+                artifact_platform=resolved_artifact.platform,
+                artifact_target=resolved_artifact.target,
+                artifact_firmware_type=resolved_artifact.firmware_type,
+                attestation_path=normalized_attestation_path,
+            )
+        except FirmwareReleasePolicyError as exc:
+            failures.append(str(exc))
+
+    if not failures and normalized_cfloader_resolved is not None and resolved_artifact is not None:
+        try:
             flash_command = build_cfloader_command(
                 cfloader_executable=normalized_cfloader_resolved,
                 binary_path=Path(resolved_artifact.binary_path),
@@ -953,10 +993,18 @@ def flash_on_device_failsafe(
         finished_at_epoch_s = time.time()
         return OnDeviceFailsafeFlashReport(
             report_version=REPORT_VERSION,
+            lane=normalized_lane,
+            device_role=normalized_device_role,
             uri=normalized_uri,
             workspace=str(normalized_workspace),
             requested_binary_path=str(binary_path),
             binary_path=str(resolved_artifact.binary_path) if resolved_artifact is not None else str(Path(binary_path).expanduser()),
+            attestation_path=None if normalized_attestation_path is None else str(normalized_attestation_path),
+            attestation_kind=None if flash_authorization is None else flash_authorization.attestation_kind,
+            attested_release_id=None if flash_authorization is None else flash_authorization.release_id,
+            source_firmware_git_commit=None if flash_authorization is None else flash_authorization.source_firmware_git_commit,
+            source_firmware_git_tag=None if flash_authorization is None else flash_authorization.source_firmware_git_tag,
+            source_app_tree_sha256=None if flash_authorization is None else flash_authorization.source_app_tree_sha256,
             cfloader_executable=str(normalized_cfloader),
             boot_mode=normalized_boot_mode,
             flash_command=flash_command,
@@ -979,7 +1027,7 @@ def flash_on_device_failsafe(
             artifact_firmware_type=resolved_artifact.firmware_type if resolved_artifact is not None else None,
             flash_attempt_reports=(),
             flash_attempts_requested=requested_flash_attempts,
-            probe_attempts_requested=0 if skip_probe else max(1, int(probe_attempts)),
+            probe_attempts_requested=0 if skip_probe else requested_probe_attempts,
             probe_attempts_used=0,
             flash_elapsed_s=0.0,
             probe_elapsed_s=None,
@@ -1004,86 +1052,54 @@ def flash_on_device_failsafe(
         ) as acquired_lock_path:
             lock_path = acquired_lock_path
 
-            for attempt_index in range(1, requested_flash_attempts + 1):
-                completed, attempt_report = _run_cfloader_attempt(
-                    flash_command,
-                    cwd=normalized_workspace,
-                    timeout_s=flash_timeout_s,
-                    env=env,
-                    attempt_index=attempt_index,
-                    runner=runner,
-                )
-                flash_attempt_reports.append(attempt_report)
-                stdout_tail = attempt_report.stdout_tail
-                stderr_tail = attempt_report.stderr_tail
-
-                if completed is not None and completed.returncode == 0:
-                    flashed = True
-                    break
-
-                if attempt_index < requested_flash_attempts:
-                    warnings.append(
-                        f"flash attempt {attempt_index}/{requested_flash_attempts} failed: {attempt_report.error or 'unknown error'}"
-                    )
-                    sleep(max(0.0, float(flash_retry_backoff_s)) * float(attempt_index))
+            completed, attempt_report = _run_cfloader_attempt(
+                flash_command,
+                cwd=normalized_workspace,
+                timeout_s=flash_timeout_s,
+                env=env,
+                attempt_index=1,
+                runner=runner,
+            )
+            flash_attempt_reports.append(attempt_report)
+            stdout_tail = attempt_report.stdout_tail
+            stderr_tail = attempt_report.stderr_tail
+            flashed = completed is not None and completed.returncode == 0
 
             flash_elapsed_s = time.monotonic() - flash_started
 
             if not flashed:
-                last_error = flash_attempt_reports[-1].error if flash_attempt_reports else "unknown flash failure"
-                failures.append(f"cfloader failed after {requested_flash_attempts} attempt(s): {last_error}")
+                last_error = attempt_report.error or "unknown flash failure"
+                failures.append(f"cfloader failed: {last_error}")
 
             if flashed and not skip_probe:
                 probe_attempted = True
                 probe_started = time.monotonic()
-                requested_probe_attempts = max(1, int(probe_attempts))
-                for attempt_index in range(1, requested_probe_attempts + 1):
-                    probe_attempts_used = attempt_index
-                    snapshot, captured_link_stats, probe_error, traceback_tail = _run_probe_with_timeout(
-                        uri=normalized_uri,
-                        workspace=normalized_workspace,
-                        settle_s=probe_settle_s if attempt_index == 1 else 0.0,
-                        timeout_s=probe_timeout_s,
-                        link_stats_sample_s=probe_link_stats_sample_s,
-                    )
-                    if probe_error is not None:
-                        if attempt_index < requested_probe_attempts:
-                            warnings.append(f"probe attempt {attempt_index}/{requested_probe_attempts} failed: {probe_error}")
-                            if traceback_tail:
-                                warnings.extend(f"probe traceback={line}" for line in traceback_tail)
-                            sleep(max(0.0, float(probe_retry_backoff_s)) * float(attempt_index))
-                            continue
-                        failures.append(probe_error)
-                        if traceback_tail:
-                            failures.extend(f"probe traceback={line}" for line in traceback_tail)
-                        break
-
+                probe_attempts_used = 1
+                snapshot, captured_link_stats, probe_error, traceback_tail = _run_probe_with_timeout(
+                    uri=normalized_uri,
+                    workspace=normalized_workspace,
+                    settle_s=probe_settle_s,
+                    timeout_s=probe_timeout_s,
+                )
+                if probe_error is not None:
+                    failures.append(probe_error)
+                    if traceback_tail:
+                        failures.extend(f"probe traceback={line}" for line in traceback_tail)
+                else:
                     availability_snapshot = snapshot
                     availability = _reconstruct_availability(snapshot)
                     link_stats = dict(captured_link_stats)
 
-                    probe_failures = tuple(str(item) for item in _availability_value(availability, snapshot, "failures", ()) or ())
+                    probe_failures = tuple(
+                        str(item)
+                        for item in _availability_value(availability, snapshot, "failures", ()) or ()
+                    )
                     loaded = bool(_availability_value(availability, snapshot, "loaded", False))
                     if probe_failures:
-                        if attempt_index < requested_probe_attempts:
-                            warnings.extend(probe_failures)
-                            warnings.append(
-                                f"probe attempt {attempt_index}/{requested_probe_attempts} did not pass validation; retrying"
-                            )
-                            sleep(max(0.0, float(probe_retry_backoff_s)) * float(attempt_index))
-                            continue
                         failures.extend(probe_failures)
 
                     if not loaded:
-                        error_text = "post-flash probe did not see the `twinrFs` firmware app"
-                        if attempt_index < requested_probe_attempts:
-                            warnings.append(f"{error_text}; retrying")
-                            sleep(max(0.0, float(probe_retry_backoff_s)) * float(attempt_index))
-                            continue
-                        failures.append(error_text)
-                        break
-
-                    break
+                        failures.append("post-flash probe did not see the `twinrFs` firmware app")
 
                 probe_elapsed_s = time.monotonic() - probe_started
 
@@ -1094,10 +1110,18 @@ def flash_on_device_failsafe(
     finished_at_epoch_s = time.time()
     return OnDeviceFailsafeFlashReport(
         report_version=REPORT_VERSION,
+        lane=normalized_lane,
+        device_role=normalized_device_role,
         uri=normalized_uri,
         workspace=str(normalized_workspace),
         requested_binary_path=str(binary_path),
         binary_path=str(resolved_artifact.binary_path),
+        attestation_path=None if normalized_attestation_path is None else str(normalized_attestation_path),
+        attestation_kind=None if flash_authorization is None else flash_authorization.attestation_kind,
+        attested_release_id=None if flash_authorization is None else flash_authorization.release_id,
+        source_firmware_git_commit=None if flash_authorization is None else flash_authorization.source_firmware_git_commit,
+        source_firmware_git_tag=None if flash_authorization is None else flash_authorization.source_firmware_git_tag,
+        source_app_tree_sha256=None if flash_authorization is None else flash_authorization.source_app_tree_sha256,
         cfloader_executable=str(normalized_cfloader_resolved),
         boot_mode=normalized_boot_mode,
         flash_command=flash_command,
@@ -1120,7 +1144,7 @@ def flash_on_device_failsafe(
         artifact_firmware_type=resolved_artifact.firmware_type,
         flash_attempt_reports=tuple(flash_attempt_reports),
         flash_attempts_requested=requested_flash_attempts,
-        probe_attempts_requested=0 if skip_probe else max(1, int(probe_attempts)),
+        probe_attempts_requested=0 if skip_probe else requested_probe_attempts,
         probe_attempts_used=probe_attempts_used,
         flash_elapsed_s=flash_elapsed_s,
         probe_elapsed_s=probe_elapsed_s,
@@ -1133,6 +1157,18 @@ def flash_on_device_failsafe(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Flash and verify the Twinr on-device Crazyflie failsafe app.")
+    parser.add_argument(
+        "--lane",
+        required=True,
+        choices=(LANE_DEV, LANE_BENCH, LANE_OPERATOR, LANE_RECOVERY),
+        help="Firmware lane to use: dev, bench, operator, or recovery.",
+    )
+    parser.add_argument(
+        "--device-role",
+        required=True,
+        choices=("dev", "bench", "operator"),
+        help="Declared device role. The lane policy blocks unsafe combinations.",
+    )
     parser.add_argument("--uri", default=DEFAULT_URI, help="Crazyflie radio URI for warm-boot flashing and probing.")
     parser.add_argument("--workspace", default=str(DEFAULT_WORKSPACE), help="Bitcraze workspace root (default: /twinr/bitcraze).")
     parser.add_argument(
@@ -1143,6 +1179,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Firmware artifact to flash: raw .bin, Bitcraze release .zip, or Bitcraze manifest.json "
             f"(default: {DEFAULT_BINARY})."
+        ),
+    )
+    parser.add_argument(
+        "--attestation",
+        default=None,
+        help=(
+            "Build or promoted release attestation for dev/bench/operator lanes. "
+            f"Recovery lane rejects this argument. Dev lane typically uses {DEFAULT_ATTESTATION}."
         ),
     )
     parser.add_argument(
@@ -1170,19 +1214,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--flash-timeout-s",
         type=float,
         default=DEFAULT_FLASH_TIMEOUT_S,
-        help="Maximum seconds to wait for each cfloader attempt before failing (default: 120).",
+        help="Maximum seconds to wait for the single cfloader attempt before failing (default: 120).",
     )
     parser.add_argument(
         "--flash-attempts",
         type=int,
-        default=None,
-        help="Flash attempts before giving up (default: 2 for warm boot, 1 for cold boot).",
-    )
-    parser.add_argument(
-        "--flash-retry-backoff-s",
-        type=float,
-        default=DEFAULT_FLASH_RETRY_BACKOFF_S,
-        help="Seconds to wait between flash retries (default: 1.5).",
+        default=DEFAULT_FLASH_ATTEMPTS,
+        help="Must remain 1. Automatic flash retries are disabled.",
     )
     parser.add_argument(
         "--probe-settle-s",
@@ -1200,19 +1238,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--probe-attempts",
         type=int,
         default=DEFAULT_PROBE_ATTEMPTS,
-        help="Number of bounded probe attempts before failing (default: 3).",
-    )
-    parser.add_argument(
-        "--probe-retry-backoff-s",
-        type=float,
-        default=DEFAULT_PROBE_RETRY_BACKOFF_S,
-        help="Seconds to wait between probe retries (default: 1.0).",
-    )
-    parser.add_argument(
-        "--probe-link-stats-sample-s",
-        type=float,
-        default=DEFAULT_PROBE_LINK_STATS_SAMPLE_S,
-        help="Extra seconds to keep the link open after probing so current cflib link statistics can update (default: 0.35).",
+        help="Must remain 1. Automatic probe retries are disabled.",
     )
     parser.add_argument(
         "--lock-timeout-s",
@@ -1226,20 +1252,31 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _format_command(command: Sequence[str]) -> str:
-    try:
-        return shlex.join(list(command))
-    except Exception:
-        return " ".join(command)
+    return shlex.join(list(command))
 
 
 def _print_human_report(report: OnDeviceFailsafeFlashReport) -> None:
     """Print one compact operator-facing flash/probe report."""
 
     print(f"flashed={str(report.flashed).lower()}")
+    print(f"lane={report.lane}")
+    print(f"device_role={report.device_role}")
     print(f"uri={report.uri}")
     print(f"workspace={report.workspace}")
     print(f"requested_binary_path={report.requested_binary_path}")
     print(f"binary_path={report.binary_path}")
+    if report.attestation_path is not None:
+        print(f"attestation.path={report.attestation_path}")
+    if report.attestation_kind is not None:
+        print(f"attestation.kind={report.attestation_kind}")
+    if report.attested_release_id is not None:
+        print(f"attestation.release_id={report.attested_release_id}")
+    if report.source_firmware_git_commit is not None:
+        print(f"attestation.source_firmware_git_commit={report.source_firmware_git_commit}")
+    if report.source_firmware_git_tag is not None:
+        print(f"attestation.source_firmware_git_tag={report.source_firmware_git_tag}")
+    if report.source_app_tree_sha256 is not None:
+        print(f"attestation.source_app_tree_sha256={report.source_app_tree_sha256}")
     print(f"artifact.source_kind={report.artifact_source_kind}")
     if report.artifact_sha256 is not None:
         print(f"artifact.sha256={report.artifact_sha256}")
@@ -1312,19 +1349,19 @@ def main() -> int:
 
     args = _build_parser().parse_args()
     report = flash_on_device_failsafe(
+        lane=str(args.lane).strip(),
+        device_role=str(args.device_role).strip(),
         uri=str(args.uri).strip() or DEFAULT_URI,
         workspace=Path(str(args.workspace).strip() or str(DEFAULT_WORKSPACE)),
         binary_path=Path(str(args.binary).strip() or str(DEFAULT_BINARY)),
+        attestation_path=None if args.attestation is None else Path(str(args.attestation).strip()),
         cfloader_executable=Path(str(args.cfloader).strip() or str(DEFAULT_CFLOADER)),
         boot_mode=str(args.boot_mode).strip() or "warm",
         flash_timeout_s=max(5.0, float(args.flash_timeout_s)),
-        flash_attempts=None if args.flash_attempts is None else max(1, int(args.flash_attempts)),
-        flash_retry_backoff_s=max(0.0, float(args.flash_retry_backoff_s)),
+        flash_attempts=max(1, int(args.flash_attempts)),
         probe_settle_s=max(0.0, float(args.probe_settle_s)),
         probe_timeout_s=max(1.0, float(args.probe_timeout_s)),
         probe_attempts=max(1, int(args.probe_attempts)),
-        probe_retry_backoff_s=max(0.0, float(args.probe_retry_backoff_s)),
-        probe_link_stats_sample_s=max(0.0, float(args.probe_link_stats_sample_s)),
         lock_timeout_s=max(0.1, float(args.lock_timeout_s)),
         expected_sha256=args.expected_sha256,
         allow_unsafe_cold_boot=bool(args.allow_unsafe_cold_boot),

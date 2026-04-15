@@ -325,6 +325,15 @@ class RemoteTranscriptCommitCoordinator:
                 return False
             return self._bind_item_unlocked(handle, item_id=item_id)
 
+    def has_wait(self, *, wait_id: str) -> bool:
+        """Return whether one wait_id is still active inside the coordinator."""
+
+        if not wait_id:
+            raise ValueError("wait_id must be non-empty")
+
+        with self._lock:
+            return wait_id in self._waits
+
     def commit(
         self,
         *,

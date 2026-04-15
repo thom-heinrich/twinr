@@ -67,6 +67,9 @@ class TwinrRealtimeToolDelegatesMixin:
     def _handle_remember_memory_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
         return self.tool_executor.handle_remember_memory(arguments)
 
+    def _handle_review_saved_memories_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_review_saved_memories(arguments)
+
     def _handle_remember_contact_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
         return self.tool_executor.handle_remember_contact(arguments)
 

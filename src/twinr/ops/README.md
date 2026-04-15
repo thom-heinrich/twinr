@@ -13,28 +13,38 @@ tools.
 - resolve canonical paths for ops artifacts and stores
 - persist sanitized ops events and usage telemetry
 - keep the sanitized ops-event JSONL store readable across Pi runtime/operator users so deploy and acceptance diagnostics do not go blind when services and probes run under different accounts
-- keep shared ops JSON artifacts such as `remote_memory_watchdog.json` and `display_ambient_impulse.json` readable across Pi runtime/operator users while still confining them inside the `0700` ops directory, so fail-closed runtime probes can consume fresh watchdog/display state without needing `sudo`
-- collect config, device, and system-health snapshots, including bounded memory-pressure hysteresis so near-threshold Pi reclaim jitter does not flap operator-facing `warn`/`error` state and swap-saturated Pi hosts stay degraded instead of snapping back to misleading `ok`
+- keep shared ops JSON artifacts such as `remote_memory_watchdog.json`, `display_ambient_impulse.json`, `display_heartbeat.json`, and `streaming_memory_segments.json` readable across Pi runtime/operator users while still confining them inside the `0700` ops directory, so fail-closed runtime probes can consume fresh watchdog/display state without needing `sudo`
+- keep `display_render_state.json` under that same shared readable contract and
+  treat it as the only authoritative source for claims about what the visible
+  panel currently shows; heartbeat remains liveness only
+- collect config, device, and system-health snapshots, including bounded memory-pressure hysteresis so near-threshold Pi reclaim jitter does not flap operator-facing `warn`/`error` state and swap-saturated Pi hosts stay degraded only when Twinr's live runtime actually owns swapped-out pages instead of lingering in misleading `warn` from cold non-Twinr desktop swap alone
 - validate the Pi-side OpenAI env contract for acceptance scripts so `/twinr/.env` can be trusted directly for provider probes without one-off shell injection
 - run a dedicated rolling ChonkyDB remote-memory watchdog
 - persist structured remote-readiness probe evidence and supervisor-seeded watchdog bootstrap snapshots so restart phases do not look like dead/stale watchdog failures
-- run strict bootstrap/recovery remote probes once, then reuse a no-bootstrap steady-state keepalive that still proves archive-safe remote readability without reseeding every snapshot on every tick
+- run strict bootstrap/recovery remote probes once, then reuse a no-bootstrap steady-state keepalive that proves the configured required-remote contract without reseeding every snapshot on every tick; live Pi `watchdog_artifact` mode defaults that contract to the backend's current-only/`token_fast` serving lane while explicit archive-inclusive proof remains available when needed
 - keep fresh watchdog heartbeats authoritative during bounded steady-state idle gaps so the supervisor does not false-fail a healthy remote watchdog between deep probes
 - persist only compact recent-sample summaries in watchdog artifacts so Pi heartbeats stay cheap instead of fsyncing multi-megabyte historical probe payloads every tick
-- keep watchdog attestation tiers explicit so current-only probes stay degraded and only archive-safe probes become green/ready
-- keep the watchdog proof contract explicit inside the persisted probe payload so `ready=true` is documented as configured-namespace archive-inclusive warm-read health, not as a blanket proof for isolated-namespace write/retention/fresh-reader transactions
+- keep watchdog attestation tiers and proof contracts explicit so persisted samples can distinguish current-only versus archive-inclusive readiness and only turn green when they satisfy the configured required-remote contract
+- persist watchdog `pid_starttime_ticks` as the primary identity attestation and keep epoch `pid_create_time_s` as legacy compatibility evidence only, because live Pi wall-clock corrections can shift `/proc/stat btime` without meaning the watchdog PID changed
+- keep the watchdog proof contract explicit inside the persisted probe payload so `ready=true` is documented as the configured-namespace warm-read contract, not as a blanket proof for isolated-namespace write/retention/fresh-reader transactions
 - recover the structured per-probe retention-canary report when the remote canary outlives the SSH stdout timeout, so deploy output still surfaces `failure_stage` plus the watchdog/canary relation instead of collapsing the mismatch into a generic timeout
 - persist structured long-term remote-read diagnostics when ChonkyDB retrieve/fetch paths fail or degrade to bounded fallback, including exact endpoint and request-payload type, so operators can separate backend HTTP flakes, timeouts, and client-contract issues
 - diagnose the public Twinr-facing ChonkyDB URL against the dedicated backend service, its loopback `127.0.0.1:3044` surface, and any foreign non-Twinr consumers still pointed at that dedicated backend so P0 incidents can be repaired without blind backend restarts
+- fail closed when the remote backend's own status surface still says `ready=false` unless the stronger deep probe already satisfies the configured required-remote proof contract, so the watchdog only advertises green readiness when the query/read surface it actually depends on is proven
+- preserve explicit transient backend details such as `Service warmup in progress`, `Upstream unavailable or restarting`, and backend `ready=false` / `instance responded but is not ready` surfaces all the way into watchdog samples, so restart transit stays on the short reprobe lane instead of decaying into a stale generic `ChonkyDBError` block; local remote-state cooldown samples also stay on the base 1s cadence so the supervisor sees fresh fail-closed evidence instead of a stale artifact while recovery is still in progress
+- let the authoritative watchdog run one explicit external-attestation reprobe through a local remote-state cooldown gate, so the Pi can recover automatically once the backend is healthy again instead of waiting forever on a process-local circuit breaker that only an external proof can clear
 - stabilize the dedicated ChonkyDB host itself when shared-host systemd system units, user-session units, or non-Twinr workers directly wired to `127.0.0.1:3044` reclaim CPU/I/O from Twinr's required backend
 - force-repair unreadable prompt-memory and managed-context `catalog/current` heads on an explicit remote namespace when a broken blank head times out before the normal probe-first repair path can publish the canonical empty head
 - ensure the dedicated remote-memory watchdog process is running for live Pi runtimes
 - allow the productive runtime supervisor to consume that external watchdog as the long-lived owner, so restarting the supervisor does not cold-reset the watchdog's warm remote state
 - let the productive runtime supervisor self-heal a dead externally managed watchdog owner by requesting the dedicated systemd watchdog unit instead of spawning a second raw watchdog process behind systemd's back
-- reseed the persisted watchdog bootstrap snapshot when the detached companion adopts or spawns a new external owner PID, so handoff windows do not keep advertising a dead previous process
+- keep the Pi watchdog on one authoritative owner lane: when a dedicated systemd watchdog unit is configured, the companion may request that unit but must never raw-spawn a second detached watchdog outside systemd
+- reseed the persisted watchdog bootstrap snapshot when the companion adopts or starts a new authoritative owner PID, so handoff windows do not keep advertising a dead previous process
+- keep the productive runtime supervisor fail-closed on startup so the streaming loop never starts before the required-remote watchdog reports ready; the watchdog startup grace is only for watchdog-stall recovery, not for bypassing required-remote gating
 - seed detached Pi runtime processes with the user-session audio env they need for Pulse/ALSA default playback, including the configured desktop runtime dir on productive root-owned Pi services where the live audio session belongs to the logged-in user
-- supervise the productive Pi streaming loop and, when configured, consume the external remote watchdog artifact instead of always recycling a fresh watchdog child
+- supervise the productive Pi display loop and streaming loop and, when configured, consume the external remote watchdog artifact instead of always recycling a fresh watchdog child
 - launch supervisor-owned runtime children in dedicated process groups so restart/stop paths also tear down helper descendants that still own GPIO or other runtime-critical resources
+- keep the authoritative visible Twinr screen alive even while required-remote gating legitimately blocks the speech runtime, so backend outages show a real Twinr error/blocked surface instead of falling back to the desktop
 - adopt an already-running streaming-loop owner after supervisor restarts instead of thrashing new children into singleton-lock failures
 - consume the shared display heartbeat contract so ops health and the runtime supervisor read the same companion-progress semantics the display loop writes
 - keep display-companion degradation visible in ops health without letting a display fault tear down the speech path
@@ -46,8 +56,9 @@ tools.
 - tolerate bounded display-render inflight windows when evaluating companion health, so long Waveshare refreshes are not misclassified as dead threads
 - coordinate per-loop singleton locks
 - run bounded self-tests and build support bundles
-- mirror the authoritative leading repo into `/twinr` while preserving Pi-local runtime-only paths such as `.env`, `.venv`, `state/`, `artifacts/`, and `.cache/`, healing acceptance drift, using exact-content checks by default so false-clean metadata matches do not slip through, and ignoring transient local devices/FIFOs/special files that do not belong in the Pi checkout
-- deploy the authoritative leading repo plus runtime `.env` onto the Pi acceptance host, refresh the editable install, heal direct-dependency duplicates where a stale venv copy shadows a bridged Pi system package such as `PyQt5`, install optional mirrored browser-automation runtime manifests when present, replace the old manual mirror-as-deploy workflow, independently attest the mirrored repo contents by SHA256/link-target before restart, restart the productive Pi service set, run the bounded live retention canary, diagnose dedicated-backend host contention on canary failure, apply one bounded remote-host stabilization pass, re-diagnose after failed stabilization so overload that worsens during the stabilization window is not missed, escalate once into the guarded dedicated-backend repair flow when the backend itself stays unhealthy afterwards, then retry the canary once, and verify post-restart health
+- mirror the authoritative leading repo into `/twinr` while preserving Pi-local runtime-only paths such as `.env`, `.venv`, `state/`, `artifacts/`, and `.cache/`, healing acceptance drift, using exact-content checks by default so false-clean metadata matches do not slip through, ignoring transient local devices/FIFOs/special files that do not belong in the Pi checkout, and mirroring only a deterministic tracked-file snapshot so ignored or untracked workspace debris never becomes Pi runtime code
+- deploy the authoritative leading repo plus runtime `.env` onto the Pi acceptance host, refresh the editable install, heal direct-dependency duplicates where a stale venv copy shadows a bridged Pi system package such as `PyQt5`, install browser-automation runtime support only when its allowlisted manifests are already part of the same authoritative release snapshot, replace the old manual mirror-as-deploy workflow, independently attest the mirrored repo contents by SHA256/link-target before restart, persist the last successful tracked-file release manifest under `artifacts/stores/ops/current_release_manifest.json`, restart the productive Pi service set, run the bounded live retention canary, diagnose dedicated-backend host contention on canary failure, apply one bounded remote-host stabilization pass, re-diagnose after failed stabilization so overload that worsens during the stabilization window is not missed, escalate once into the guarded dedicated-backend repair flow when the backend itself stays unhealthy afterwards, re-diagnose again after a successful repair so reactivated conflict units or unhealthy query surfaces cannot slip into the retry window, apply one extra bounded post-repair host stabilization when that quiet-host hold already broke again, wait for a fresh Pi watchdog-ready sample after the repair path, then retry the canary once, and verify post-restart health
+- produce one compact read-only Pi release audit that joins the current local authoritative release, the persisted deployed `current_release_manifest.json`, and a live checksum drift probe into a single operator-facing status view
 - snapshot the authoritative repo mirror scope before Pi deploy sync so shared-worktree edits cannot self-abort a rollout or mix multiple source states into one acceptance checkout
 - repair known shared `/twinr/state` ownership and mode contracts during Pi deploys so cross-user runtime files such as `automations.json`, `automations.json.lock`, and `user_discovery.json` stay usable after rollout
 - verify those shared `/twinr/state` ownership and mode contracts again after the productive services restarted, so post-restart acceptance fails closed if a service recreated one of the shared files with the wrong owner or mode
@@ -73,21 +84,22 @@ tools.
 | [checks.py](./checks.py) | Config audit checks |
 | [process_memory.py](./process_memory.py) | Procfs-backed streaming-loop memory attribution snapshot keyed to the live owner PID/start-time so ops health can report the concrete heavy subsystem behind memory pressure |
 | [openai_env_contract.py](./openai_env_contract.py) | Fail-closed validation for the Pi-side OpenAI `.env` contract used by acceptance probes |
-| [health.py](./health.py) | Host and service health, including display-companion assessment via the shared display heartbeat contract, supervisor-aware degradation when the streaming child is being restarted, argv-exact service detection that ignores shell debug script text, procfs-backed memory-owner attribution for the live streaming PID, and memory-pressure classification that prefers `MemAvailable` headroom over raw used-percent alone while holding de-escalation until real recovery headroom is stable |
+| [health.py](./health.py) | Host and service health, including display-companion assessment via the shared display heartbeat contract, supervisor-aware degradation when the streaming child is being restarted, argv-exact service detection that ignores shell debug script text, procfs-backed memory-owner attribution for the live streaming PID, and memory-pressure classification that prefers `MemAvailable` headroom over raw used-percent alone while only treating saturated swap as degraded when Twinr's live streaming process itself is swapped out |
 | [remote_memory_watchdog.py](./remote_memory_watchdog.py) | Continuous fail-closed ChonkyDB readiness watchdog plus structured probe/bootstrap artifacts |
-| [remote_chonkydb_repair.py](./remote_chonkydb_repair.py) | Operator-facing diagnosis and bounded repair planner for the dedicated remote ChonkyDB backend, including detection of active foreign services still pointed at `127.0.0.1:3044` |
-| [remote_chonkydb_host_stabilizer.py](./remote_chonkydb_host_stabilizer.py) | Operator-facing host-contention stabilizer that runtime-masks known conflicting shared-host system units plus user-session units, quiesces heavyweight non-Twinr workers such as `ollama-gpu.service`, `caia-ops-chonky-search-guardrail.service`, CPU-hogging `caia-consumer-portal*.service` backends, `caia-ccodex-memory-api.service`, and `caia-chonkycode-api.service`, bounded-kills proven stale user-session code-graph benchmark runners plus long-running `chonkycode.cli artifact-ingest` and `ccodex_memory_locomo_mc10_eval.py` workloads, unmanaged loopback `chonkydb.api.server` listeners outside the allowed systemd cgroups, plus direct writers against the dedicated `twinr_dedicated_<port>/data` ChonkyDB path that bypass systemd unit control, raises backend CPU/IO priority, and validates the public empty-scope-safe current-scope query surface instead of a weaker `/instance` liveness-only check |
+| [remote_chonkydb_repair.py](./remote_chonkydb_repair.py) | Operator-facing diagnosis and bounded repair planner for the dedicated remote ChonkyDB backend, including detection of active foreign services still pointed at `127.0.0.1:3044`, startup-contract repair for unsafe token-fast fulltext gating plus a disabled payload-read startup lane, and automatic widening of an undersized vector warmup timeout when full-scope readiness is configured to wait longer |
+| [remote_chonkydb_host_stabilizer.py](./remote_chonkydb_host_stabilizer.py) | Operator-facing host-contention stabilizer that quiesces the proven non-Twinr shared-host conflict set plus user-session units, installs a reboot-persistent boot-pacing policy so the same CAIA services/timers/paths come back in controlled waves instead of a single boot burst, keeps `caia-external-site.service`, `caia-consumer-portal-demo.service`, `caia-ollama-gpu-proxy.service`, and user-session `caia-molt.service` out of that boot release lane, still suppresses external CAIA live-restart guard service/timer/path lanes plus `codex-portal-live-override.service` when they were proven to re-enable `caia-consumer-portal.service` and `caia-ccodex-memory-api.service` mid-pass, blocks the remote `caia-twinr-host-control-guard.service` while the quiet-host lane is active so it cannot immediately reopen the very services Twinr just suppressed, stages runtime `/run/systemd/system/<unit>.d/91-twinr-private-host-stabilizer-block.conf` guards for the live quiet-host window, adds persistent `/etc` boot-pacer drop-ins plus a dedicated `caia-twinr-host-boot-pacer.service` for reboot recovery, explicitly cleans up the legacy shared `90-twinr-host-stabilizer-block.conf` guard filename, inserts a short per-unit quiesce pause plus a longer post-kill cooldown so live reclaim happens incrementally instead of one burst, bounded-kills proven stale user-session code-graph benchmark runners plus long-running `chonkycode.cli artifact-ingest` and `ccodex_memory_locomo_mc10_eval.py` workloads, unmanaged loopback `chonkydb.api.server` listeners outside the allowed systemd cgroups, plus direct writers against the dedicated `twinr_dedicated_<port>/data` ChonkyDB path that bypass systemd unit control, raises backend CPU/IO priority, still surfaces the remote host-control guard `required_units` for operator forensics, and validates the public empty-scope-safe current-scope query surface instead of a weaker `/instance` liveness-only check |
 | [remote_prompt_current_head_repair.py](./remote_prompt_current_head_repair.py) | Operator-facing forced empty-head publisher for prompt-memory, user-context, and personality-context `catalog/current` repair on one explicit remote namespace |
 | [remote_memory_watchdog_state.py](./remote_memory_watchdog_state.py) | Internal sample/snapshot/store helpers for persisted watchdog state and bootstrap artifacts |
-| [remote_memory_watchdog_companion.py](./remote_memory_watchdog_companion.py) | Start or adopt the external watchdog owner for live Pi loops, preferring the dedicated systemd unit on `/twinr` and reseeding bootstrap attestation when the owner PID changes |
+| [remote_memory_watchdog_companion.py](./remote_memory_watchdog_companion.py) | Start or adopt the external watchdog owner for live Pi loops, preferring the dedicated systemd unit on `/twinr`, forbidding raw detached watchdog spawns when that unit is configured, and reseeding bootstrap attestation when the owner PID changes |
 | [runtime_env.py](./runtime_env.py) | Seed detached Pi runtimes with the minimal user audio-session environment, preferring the configured desktop runtime dir for productive root-owned Pi services when needed |
 | [runtime_scope.py](./runtime_scope.py) | Build scoped runtime configs so auxiliary loops do not overwrite the primary display/runtime snapshot |
-| [runtime_supervisor.py](./runtime_supervisor.py) | Authoritative Pi runtime supervisor for the streaming loop that can either own or consume the dedicated remote watchdog, self-heal a dead external watchdog owner, and leave display degradation to ops health instead of recycling the speech path |
+| [runtime_supervisor.py](./runtime_supervisor.py) | Authoritative Pi runtime supervisor for the display loop and streaming loop that can either own or consume the dedicated remote watchdog, self-heal a dead external watchdog owner, keep the visible Twinr screen alive across required-remote gate blocks, and avoid recycling the speech path for display faults |
 | [runtime_supervisor_process.py](./runtime_supervisor_process.py) | Internal child-process, timestamp, and runtime-env helpers kept separate from supervisor orchestration, including dedicated child process-group handling for restart-safe teardown |
-| [pi_repo_mirror.py](./pi_repo_mirror.py) | One-way repo mirror watchdog that keeps `/twinr` aligned with the authoritative leading repo without deleting Pi-local runtime state |
-| [pi_runtime_deploy.py](./pi_runtime_deploy.py) | Operator-facing Pi deploy orchestration: snapshot the authoritative mirror scope, mirror that stable code image, sync the authoritative runtime `.env`, independently attest the mirrored repo contents before restart, refresh the editable install, heal stale venv duplicates of bridged Pi system packages before dependency verification, verify critical direct-import runtime modules including the memory bootstrap path, repair and then post-restart verify shared `/twinr/state` permissions, restart the base services plus any repo-backed Pi runtime units already enabled on the host, run the bounded live retention canary, diagnose dedicated-backend host contention on canary failure, apply one bounded host-stabilization pass, re-diagnose when failed stabilization still leaves the public surface unhealthy, escalate once into the guarded backend-repair flow when the service remains unhealthy afterwards, keep the recovery SSH budget aligned with the stabilizer/repair path instead of truncating it, support first rollout of disabled optional Pi units, and verify restart health |
+| [pi_repo_mirror.py](./pi_repo_mirror.py) | One-way repo mirror watchdog that keeps `/twinr` aligned with the authoritative leading repo without deleting Pi-local runtime state, but now mirrors from a deterministic tracked-file snapshot instead of the raw workspace |
+| [pi_runtime_deploy.py](./pi_runtime_deploy.py) | Operator-facing Pi deploy orchestration: build a deterministic tracked-file snapshot and release manifest, mirror that stable code image, sync the authoritative runtime `.env`, independently attest the mirrored repo contents before restart, refresh the editable install, heal stale venv duplicates of bridged Pi system packages before dependency verification, install browser-automation runtime support only when its allowlisted manifests are already inside the authoritative release snapshot, verify critical direct-import runtime modules including the memory bootstrap path, repair and then post-restart verify shared `/twinr/state` permissions, persist the last successful release manifest under `artifacts/stores/ops/current_release_manifest.json`, restart the base services plus any repo-backed Pi runtime units already enabled on the host, run the bounded live retention canary, diagnose dedicated-backend host contention on canary failure, apply one bounded host-stabilization pass, re-diagnose when failed stabilization still leaves the public surface unhealthy, escalate once into the guarded backend-repair flow when the service remains unhealthy afterwards, re-diagnose the host again after a successful repair, restabilize once more when conflict units or unhealthy query surfaces already returned, wait for a fresh post-repair watchdog-ready sample before the retry, keep the recovery SSH budget aligned with the stabilizer/repair path instead of truncating it, support first rollout of disabled optional Pi units, and verify restart health |
+| [pi_release_audit.py](./pi_release_audit.py) | Compact read-only operator audit that joins the current local release summary, the Pi's persisted `current_release_manifest.json`, and a live checksum drift probe into one status report |
 | [pi_runtime_deploy_remote.py](./pi_runtime_deploy_remote.py) | Internal SSH/SCP/service-state helper layer kept separate from deploy phase orchestration, including remote repo-content attestation, bridged-system duplicate cleanup, shared-state permission repair/verification helpers, and the remote retention-canary probe |
-| [retention_canary_host_recovery.py](./retention_canary_host_recovery.py) | Diagnose dedicated ChonkyDB host contention for failed retention canaries, run one bounded host-stabilization recovery pass first, re-diagnose after failed stabilization, and escalate once into guarded backend repair when the service still remains unhealthy afterwards |
+| [retention_canary_host_recovery.py](./retention_canary_host_recovery.py) | Diagnose dedicated ChonkyDB host contention for failed retention canaries, run one bounded host-stabilization recovery pass first, re-diagnose after failed stabilization, escalate once into guarded backend repair when the service still remains unhealthy afterwards, and fail closed when the post-repair host already lost its quiet-hold again until one extra bounded restabilization proves that conflicts stayed away |
 | [venv_bridged_system_cleanup.py](./venv_bridged_system_cleanup.py) | Detect direct dependencies where a stale venv dist shadows an acceptable bridged Pi system dist |
 | [self_coding_pi.py](./self_coding_pi.py) | Pi bootstrap for pinned self-coding Codex bridge, CLI, auth sync, and remote self-test |
 | [remote_memory_watchdog_soak.py](./remote_memory_watchdog_soak.py) | Bounded soak recorder for watchdog stability proof |
@@ -120,10 +132,27 @@ The live current ops event stream (`events.jsonl` plus its lock file) is kept
 on a shared-writer permission contract so Pi services and operator-triggered
 runtime probes append to the same sanitized diagnostics stream without
 cross-user `PermissionError` drift. Shared read-mostly ops artifacts such as
-`remote_memory_watchdog.json` and `display_ambient_impulse.json` likewise stay
+`remote_memory_watchdog.json`, `current_release_manifest.json`,
+`display_ambient_impulse.json`, `display_heartbeat.json`, and
+`display_render_state.json`, and `streaming_memory_segments.json` likewise stay
 operator-readable inside the otherwise `0700` ops directory so non-root
 acceptance probes can fail closed on the same fresh artifacts the productive
-root-owned services write.
+root-owned services write. `current_release_manifest.json` is the last
+successful tracked-file Pi deploy manifest, so operators can see exactly which
+release payload the acceptance host is supposed to be running.
+The private usage SQLite sidecar (`usage.jsonl.sqlite3` plus its lock) stays on
+an explicit owner-only deploy-repair contract as well, so root-owned service
+restarts cannot strand later `thh` acceptance probes behind stale lock-file
+ownership drift.
+
+Health payloads now expose separate visible-display fields
+(`display_visible_state`, `display_visible_operator_status`,
+`display_visible_state_verdict`, `display_visible_state_reason`,
+`display_visible_state_source`, `display_visible_rendered_at`) so callers do
+not infer panel truth from `display_heartbeat.json`. The verdict is only
+`proved` when the rendered-state artifact itself supports the claim; drift
+between heartbeat render evidence and that artifact is surfaced explicitly via
+`display_visible_state_verdict="drift"`.
 
 ```python
 from twinr.ops import TwinrSelfTestRunner, collect_system_health
@@ -174,18 +203,43 @@ PYTHONPATH=src python3 -m twinr --env-file .env --long-term-memory-live-acceptan
 
 The repo mirror uses `rsync --checksum` on every cycle by default. Only opt
 into `--metadata-only` when you explicitly accept the weaker quick-check plus
-periodic checksum-audit model.
+periodic checksum-audit model. The mirror now snapshots git-tracked files
+first, so ignored or untracked workspace clutter no longer enters the Pi
+authority contract.
 When the live remote-memory endpoint is unhealthy on the development host, use
 `hardware/ops/repair_remote_chonkydb.py` before restarting anything by hand.
 That command proves whether the public `https://tessairact.com:2149` URL, the
 dedicated backend service, or the backend loopback `127.0.0.1:3044` is the
 actual failing layer, surfaces active foreign consumers still pointed at the
-dedicated backend, now also surfaces dedicated data-dir owner/group drift
-against the service account so root-owned WAL/index files do not masquerade as
-"backend needs restart", hardens the remote systemd env when `FT_REBUILD_ON_OPEN`
-was left active without the matching query-surface warmup gate, and only
-restarts the backend when the backend itself is unhealthy instead of when
-shared-host contention or permission drift is the proven root cause.
+dedicated backend, repairs dedicated data-dir owner/group drift against the
+service account before any guarded restart so root-owned WAL/index files do not
+survive as latent startup poison, now also detects the proven Twinr outage
+shape where the dedicated startup contract drifted away from the sanctioned
+payload-read lane or where the `token_fast` serving contract was incorrectly
+re-blocked on fulltext warmup, rewrites those dedicated startup drop-ins back
+to the canonical Twinr contract before restart, now also disables the dedicated
+`payloads_sync_bulk` API-ready gate
+when the service is still pinned to full-scope startup readiness even though
+Twinr only needs the current-scope query/write surface, hardens the remote
+systemd env when `FT_REBUILD_ON_OPEN` was left active without the matching
+query-surface warmup gate, and only restarts the backend when the backend
+itself is the proven failing layer instead of when shared-host contention is
+the root cause. When the dedicated unit still reports `active/running` but the
+loopback probe times out with `status_code=0`, the diagnose path now classifies
+that state as `backend_active_but_unresponsive` so operators do not confuse a
+hung-but-running backend with a healthy one. The guarded restart path now creates
+the short-lived `/run/caia/maintenance/twinr_host_control.permit` contract
+required by the host control guard, temporarily removes the persistent
+`10-refuse-manual-restart.conf` drop-in because live-host systemd does not load
+fresh `[Unit]` `RefuseManual*=no` drop-ins into `DropInPaths` during the same
+repair window, verifies that `RefuseManualStart/Stop` actually opened, performs
+the bounded stop/kill/start bounce, and then restores and re-verifies the
+protected drop-in immediately afterwards. The Pi-side remote-memory watchdog now
+also preserves explicit backend warmup details such as `Service warmup in
+progress` in its rolling artifact and keeps a short re-probe cadence while that
+exact server-reported startup state is active, so Twinr recovers promptly once
+the dedicated backend finishes warming instead of waiting through the generic
+multi-minute failure backoff.
 If the backend is up but one prompt `catalog/current` head itself is a broken
 blank document that times out on every read, use
 `hardware/ops/repair_remote_prompt_current_heads.py` with an explicit namespace
@@ -195,24 +249,63 @@ already-broken old head.
 If the public endpoint stays up but becomes slow or freeze-prone because the
 dedicated backend host is reclaiming CPU or I/O for unrelated CAIA work, use
 `hardware/ops/stabilize_remote_chonkydb_host.py`. That command touches the
-host-side kill-switches for the worst reoffenders, disables the curated
+host-side kill-switches for the worst reoffenders, disables the full proven
 conflict-unit set across both systemd system scope and the active `thh`
-user-session scope, runtime-masks heavyweight non-Twinr workers such as
-`ollama-gpu.service`, now also quiesces the always-on
-`caia-consumer-portal.service`, `caia-consumer-portal-demo.service`, and
-`caia-ops-chonky-search-guardrail.service` when they reclaim CPU from Twinr's
+user-session scope, still exposes the remote
+`caia-twinr-host-control-guard.service` `required_units` only as operator
+forensics, temporarily blocks that same guard service so it cannot reopen the
+quiet-host lane mid-pass, and now preempts heavyweight workers such as
+`caia-consumer-portal.service`, `caia-consumer-portal-demo.service`,
+`caia-ops-chonky-search-guardrail.service`, and `ollama-gpu.service` when they
+reclaim CPU from Twinr's
 dedicated backend, bounded-kills proven stale long-running code-graph
 benchmark runners, long-running user-session `chonkycode.cli artifact-ingest`
 and `ccodex_memory_locomo_mc10_eval.py` workloads, and direct non-systemd
 writers against the dedicated `twinr_dedicated_<port>/data` store path when
 they bypass those unit lists through interactive user sessions, raises `caia-twinr-chonkydb-alt.service`
-CPU/IO weights
+CPU/IO weights, keeps the short-lived
+`/run/caia/maintenance/twinr_host_control.permit` contract open for the full
+quiet-host window while the remote guard SSOT is being consulted, stages
+system-scope runtime block drop-ins under `/run/systemd/system/<unit>.d/`
+instead of relying on `mask` against `/etc/systemd/system` unit files that
+cannot be replaced in place,
+does the same for user-scope conflicts under
+`$XDG_RUNTIME_DIR/systemd/user/<unit>.d/` plus an explicit user-manager
+`daemon-reload` instead of trying to `mask` real `~/.config/systemd/user/*.service`
+files in place,
+and now also syncs reboot-persistent boot-release drop-ins under `/etc` plus a
+dedicated `caia-twinr-host-boot-pacer.service` that recreates those same
+conflict lanes in ordered post-boot waves rather than letting dependency,
+timer, path, or guard activation stampede the host all at once,
+keeps those runtime blockers tied to a Twinr-private maintenance token instead
+of the historical shared `twinr_host_stabilizer_unblock` path that the
+external CAIA host-control guard can also write,
+and now stages them under the private
+`91-twinr-private-host-stabilizer-block.conf` filename while deleting the
+legacy shared `90-twinr-host-stabilizer-block.conf` file so foreign or stale
+writers cannot silently switch Twinr back onto the shared unblock contract,
+while leaving `caia-external-site.service`,
+`caia-consumer-portal-demo.service`, `caia-ollama-gpu-proxy.service`, and
+user-session `caia-molt.service` out of the boot-release plan entirely,
+stages its remote sudo Python helper plus JSON payload through root-owned temp
+files so large stabilization payloads cannot break on nested shell quoting, and
+excludes that helper's own SSH/sudo process tree from the stale-process killer
+so the stabilization pass cannot terminate itself while matching dedicated
+backend data-path writers, and now bounds every remote `systemctl stop` with a
+short timeout plus `kill --kill-who=all --signal=SIGKILL` fallback so one
+stuck or `RefuseManualStop=yes` shared-host service cannot hang the whole
+stabilization run or be silently treated as stopped, and only issues
+`reset-failed` when a unit still reports a loaded failed/non-success state
+instead of unconditionally tripping over inactive units that systemd no longer
+considers resettable,
 to the highest priority, and then re-probes the live public current-scope query
 surface with the same empty-scope-safe `404 document_not_found` semantics used
 by the repair helper. It now also verifies that the quiesced conflict units
 really ended `inactive` and not still `enabled`; if systemd reactivates a held
-unit during the first reload storm, the stabilizer runs one bounded recovery
-pass for the violating units and otherwise fails closed with
+unit during the first reload storm, the stabilizer first runs one short bounded
+quiet-hold poll window so transient `active`/`enabled` samples can settle back
+to `inactive` or `not-found`, then runs one bounded recovery pass for the still
+violating units, and otherwise fails closed with
 `conflict_units_reactivated_after_host_stabilization` instead of pretending the
 host is quiet.
 After a healing sync, the watchdog also retries one extra sync+verify pass if
@@ -263,10 +356,10 @@ requirement, selective backfill of mirrored project runtime dependencies that
 are still missing or out of spec on the Pi, optional
 Pi-only runtime supplement installs via `hardware/ops/pi_runtime_requirements.txt`,
 which mirrors `project.optional-dependencies.pi-runtime` in `pyproject.toml`,
-optional mirrored browser-automation runtime installs via
+optional browser-automation runtime installs via
 `browser_automation/runtime_requirements.txt` plus
-`browser_automation/playwright_browsers.txt`, with those ignored workspace
-manifests synced explicitly before the remote install step, productive unit
+`browser_automation/playwright_browsers.txt` when those allowlisted manifests
+are already part of the authoritative release snapshot, productive unit
 installation/restart, a fixed `/twinr/.venv/bin/python` import contract for
 critical direct-import modules, and bounded post-restart verification. By default it
 always manages the base runtime units and also picks up any repo-backed Pi unit

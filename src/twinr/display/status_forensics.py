@@ -152,6 +152,25 @@ class DisplaySystemStatusDecision:
     disk_used_percent: float | None = None
     cpu_temperature_c: float | None = None
 
+    def stability_signature(self) -> tuple[object, ...]:
+        """Return the bounded qualitative decision used for recovery holds."""
+
+        disk_status = "warn" if self.disk_used_percent is not None and self.disk_used_percent >= 85.0 else "ok"
+        return (
+            self.status,
+            self.label,
+            self.reason_codes,
+            self.reason_detail,
+            self.snapshot_status,
+            self.snapshot_error,
+            self.runtime_error,
+            self.health_status,
+            self.conversation_loop_running,
+            self.conversation_loop_count,
+            self.memory_pressure_status,
+            disk_status,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class DisplayStatusForensics:

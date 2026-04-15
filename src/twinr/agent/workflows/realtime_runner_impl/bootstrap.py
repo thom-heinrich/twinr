@@ -20,6 +20,7 @@ from threading import Event, Lock, RLock, Thread
 from typing import Any, Callable, cast
 import copy
 import inspect
+import logging
 import time
 
 from twinr.agent.base_agent.config import TwinrConfig
@@ -51,6 +52,7 @@ from twinr.agent.workflows.startup_boot_sound import start_startup_boot_sound
 from twinr.agent.workflows.streaming_transcript_verifier import StreamingTranscriptVerifierRuntime
 from twinr.agent.workflows.turn_guidance import TurnGuidanceRuntime
 from twinr.agent.workflows.voice_orchestrator import EdgeVoiceOrchestrator
+from twinr.display.wake_cues import DisplayWakeCueController
 from twinr.hardware.audio import AmbientAudioSampler, SilenceDetectedRecorder, WaveAudioPlayer
 from twinr.hardware.buttons import configured_button_monitor
 from twinr.hardware.camera import V4L2StillCamera
@@ -68,10 +70,6 @@ from twinr.providers.openai.realtime import OpenAIRealtimeSession
 
 
 _DEFAULT_SENSITIVE_REALTIME_TOOL_FRAGMENTS: tuple[str, ...] = (
-    "camera",
-    "photo",
-    "snapshot",
-    "image",
     "print",
     "printer",
     "smart_home",
@@ -95,6 +93,25 @@ _DEFAULT_SENSITIVE_REALTIME_TOOL_FRAGMENTS: tuple[str, ...] = (
     "contact",
 )
 _OPENAI_REALTIME_PCM_SAMPLE_RATE = 24_000
+_LOGGER = logging.getLogger(__name__)
+
+
+def _wrap_cleanup_error(label: str, exc: Exception) -> RuntimeError:
+    """Preserve which shutdown component failed while surfacing the cause."""
+
+    wrapped = RuntimeError(f"{label} cleanup failed: {type(exc).__name__}: {exc}")
+    wrapped.__cause__ = exc
+    return wrapped
+
+
+def _raise_cleanup_errors(context: str, errors: list[Exception]) -> None:
+    """Raise one cleanup error directly or aggregate multiple failures."""
+
+    if not errors:
+        return
+    if len(errors) == 1:
+        raise errors[0]
+    raise ExceptionGroup(context, errors)
 
 
 class TwinrRealtimeBootstrapMixin:
@@ -232,11 +249,7 @@ class TwinrRealtimeBootstrapMixin:
         self._answer_interrupt_event: Event | None = None
         self._conversation_session_lock = Lock()
         self._remote_transcript_commits = RemoteTranscriptCommitCoordinator(
-            # The current edge/server transcript-commit contract still delivers
-            # only `source` + `transcript`. Until wait_id/item_id travel end to
-            # end, legacy source correlation must stay enabled here or remote
-            # same-stream listening can never resolve on the Pi.
-            allow_legacy_source_match=True,
+            allow_legacy_source_match=False,
         )
         self._current_turn_audio_pcm: bytes | None = None
         self._current_turn_audio_sample_rate: int = self.config.openai_realtime_input_sample_rate
@@ -344,6 +357,7 @@ class TwinrRealtimeBootstrapMixin:
         self._last_status: str | None = None
         self._voice_orchestrator_runtime_state_lock = RLock()
         self._last_voice_orchestrator_runtime_state: tuple[str, str | None, bool] | None = None
+        self._last_voice_orchestrator_runtime_wait_id: str | None = None
         self._last_voice_orchestrator_intent_context: VoiceRuntimeIntentContext | None = None
         self._last_voice_orchestrator_quiet_until_utc: str | None = None
         self._last_voice_identity_profile_revision: str | None = None
@@ -376,6 +390,10 @@ class TwinrRealtimeBootstrapMixin:
             project_root=self._project_root,
             service=self.__class__.__name__,
         )
+        self.display_wake_cue_controller = DisplayWakeCueController.from_config(
+            config,
+            default_source="voice_orchestrator",
+        )
         self.voice_orchestrator = (
             EdgeVoiceOrchestrator(
                 config=config,
@@ -385,6 +403,8 @@ class TwinrRealtimeBootstrapMixin:
                 on_transcript_committed=self.handle_remote_transcript_committed,
                 on_follow_up_closed=self.handle_remote_follow_up_closed,
                 on_barge_in_interrupt=lambda: self._request_answer_interrupt("voice_orchestrator"),
+                on_speculative_wake=self._show_speculative_wake_display_cue,
+                on_speculative_wake_cleared=self._clear_speculative_wake_display_cue,
                 on_recent_remote_audio=(
                     lambda pcm_bytes, source: voice_identity_runtime.update_household_voice_assessment_from_pcm(
                         self,
@@ -511,27 +531,21 @@ class TwinrRealtimeBootstrapMixin:
     ) -> None:
         if once and code in self._bootstrap_notice_once_codes:
             return
-        if once:
-            self._bootstrap_notice_once_codes.add(code)
-        try:
-            self.emit(f"{code}={message}")
-        except Exception:
-            pass
+        self.emit(f"{code}={message}")
         trace_event = getattr(self, "_trace_event", None)
         if callable(trace_event):
-            try:
-                trace_event_callable = cast(Callable[..., Any], trace_event)
-                trace_payload = {"message": message}
-                if details:
-                    trace_payload.update(dict(details))
-                trace_event_callable(  # pylint: disable=not-callable
-                    code,
-                    kind="bootstrap",
-                    level=level,
-                    details=trace_payload,
-                )
-            except Exception:
-                pass
+            trace_event_callable = cast(Callable[..., Any], trace_event)
+            trace_payload = {"message": message}
+            if details:
+                trace_payload.update(dict(details))
+            trace_event_callable(  # pylint: disable=not-callable
+                code,
+                kind="bootstrap",
+                level=level,
+                details=trace_payload,
+            )
+        if once:
+            self._bootstrap_notice_once_codes.add(code)
 
     def _resolve_ambient_audio_sampler(
         self,
@@ -568,8 +582,10 @@ class TwinrRealtimeBootstrapMixin:
         try:
             if isinstance(provider, protocol_type):
                 return provider
-        except TypeError:
-            pass
+        except TypeError as exc:
+            raise TypeError(
+                f"{protocol_type.__name__} must be @runtime_checkable for provider contract coercion"
+            ) from exc
         required_callables = self._protocol_callable_names(protocol_type)
         if required_callables and all(callable(getattr(provider, name, None)) for name in required_callables):
             return provider
@@ -942,16 +958,8 @@ class TwinrRealtimeBootstrapMixin:
         except Exception as exc:
             emit = getattr(self, "emit", None)
             if callable(emit):
-                try:
-                    emit(f"record_event_failed={type(exc).__name__}")
-                except Exception:
-                    self._trace_event(
-                        "record_event_emit_failed",
-                        kind="error",
-                        level="ERROR",
-                        details={"error_type": type(exc).__name__},
-                    )
-            return None
+                emit(f"record_event_failed={type(exc).__name__}")
+            raise
 
     def _record_usage(self, *args, **kwargs):
         try:
@@ -959,16 +967,8 @@ class TwinrRealtimeBootstrapMixin:
         except Exception as exc:
             emit = getattr(self, "emit", None)
             if callable(emit):
-                try:
-                    emit(f"record_usage_failed={type(exc).__name__}")
-                except Exception:
-                    self._trace_event(
-                        "record_usage_emit_failed",
-                        kind="error",
-                        level="ERROR",
-                        details={"error_type": type(exc).__name__},
-                    )
-            return None
+                emit(f"record_usage_failed={type(exc).__name__}")
+            raise
 
     def _start_startup_boot_sound(self) -> None:
         start_startup_boot_sound(
@@ -1025,36 +1025,38 @@ class TwinrRealtimeBootstrapMixin:
                 return
             self._closed = True
 
+        cleanup_errors: list[Exception] = []
         playback_coordinator = getattr(self, "playback_coordinator", None)
         if playback_coordinator is not None:
             try:
                 playback_coordinator.close(immediate=True, timeout_s=min(timeout, 2.0))
-            except Exception:
-                pass
+            except Exception as exc:
+                cleanup_errors.append(_wrap_cleanup_error("playback_coordinator.close", exc))
 
         realtime_session = getattr(self, "realtime_session", None)
         realtime_session_close = getattr(realtime_session, "close", None)
         if callable(realtime_session_close):
             try:
                 realtime_session_close()
-            except Exception:
-                pass
+            except Exception as exc:
+                cleanup_errors.append(_wrap_cleanup_error("realtime_session.close", exc))
 
         runtime = getattr(self, "runtime", None)
         runtime_shutdown = getattr(runtime, "shutdown", None)
         if callable(runtime_shutdown):
             try:
                 runtime_shutdown(timeout_s=min(timeout, 2.0))
-            except Exception:
-                pass
+            except Exception as exc:
+                cleanup_errors.append(_wrap_cleanup_error("runtime.shutdown", exc))
 
         workflow_forensics = getattr(self, "workflow_forensics", None)
         workflow_forensics_close = getattr(workflow_forensics, "close", None)
         if callable(workflow_forensics_close):
             try:
                 workflow_forensics_close()
-            except Exception:
-                pass
+            except Exception as exc:
+                cleanup_errors.append(_wrap_cleanup_error("workflow_forensics.close", exc))
+        _raise_cleanup_errors("Twinr realtime bootstrap close failed.", cleanup_errors)
 
     def __enter__(self):
         return self
@@ -1067,4 +1069,7 @@ class TwinrRealtimeBootstrapMixin:
         try:
             self.close(timeout_s=0.2)
         except Exception:
-            pass
+            _LOGGER.warning(
+                "Twinr realtime bootstrap cleanup failed during garbage collection.",
+                exc_info=True,
+            )

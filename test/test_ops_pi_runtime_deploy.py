@@ -81,6 +81,14 @@ _TEST_PI_ATTRIBUTE_CONTRACTS: dict[str, Sequence[str]] = {
 }
 
 
+def _init_git_repo(root: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "Twinr Tests"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "tests@example.com"], cwd=root, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=root, check=True)
+
+
 def _completed(
     args: list[str],
     *,
@@ -536,6 +544,7 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 encoding="utf-8",
             )
             local_sha = hashlib.sha256(env_path.read_bytes()).hexdigest()
+            _init_git_repo(root)
             mirror = _FakeMirrorWatchdog()
 
             def _runner(args, **kwargs):
@@ -616,9 +625,12 @@ class PiRuntimeDeployTests(unittest.TestCase):
             )
 
         self.assertTrue(result.ok)
+        self.assertRegex(result.release_id, r"^[0-9a-f]{64}$")
+        self.assertRegex(result.source_commit, r"^[0-9a-f]{40}$")
         self.assertTrue(result.repo_mirror.sync_applied)
         self.assertEqual(result.repo_attestation.verified_entry_count, 1)
         self.assertEqual(result.repo_attestation.mismatch_count, 0)
+        self.assertTrue(result.release_manifest_sync.remote_path.endswith("current_release_manifest.json"))
         self.assertTrue(result.env_sync is not None)
         assert result.env_sync is not None
         self.assertEqual(result.env_sync.sha256, local_sha)
@@ -643,6 +655,7 @@ class PiRuntimeDeployTests(unittest.TestCase):
         self.assertIn("pip install --no-deps -e", joined)
         self.assertIn("repair_venv_python_shebangs", joined)
         self.assertIn("repo_attestation_manifest_path", joined)
+        self.assertIn("current_release_manifest.json", joined)
         self.assertIn("systemctl daemon-reload", joined)
         self.assertIn("systemctl restart", joined)
         self.assertIn("--live-text", joined)
@@ -675,6 +688,7 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            _init_git_repo(root)
             mirror = _FakeMirrorWatchdog()
 
             def _runner(args, **kwargs):
@@ -735,6 +749,7 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            _init_git_repo(root)
             mirror = _MutatingSourceMirrorWatchdog(root)
 
             def _runner(args, **kwargs):
@@ -778,6 +793,65 @@ class PiRuntimeDeployTests(unittest.TestCase):
 
         joined = "\n".join(" ".join(command) for command in commands)
         self.assertIn("repo_attestation_manifest_path", joined)
+
+    def test_deploy_retargets_default_watchdog_to_repo_snapshot(self) -> None:
+        commands: list[list[str]] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "README.md").write_text("Twinr\n", encoding="utf-8")
+            env_path = root / ".env"
+            env_path.write_text(f"OPENAI_API_KEY={_TEST_OPENAI_API_KEY}\n", encoding="utf-8")
+            pi_env_path = root / ".env.pi"
+            pi_env_path.write_text(
+                "\n".join(
+                    (
+                        f'PI_HOST="{_TEST_PI_HOST}"',
+                        f'PI_SSH_USER="{_TEST_PI_SSH_USER}"',
+                        f'PI_SSH_PW="{_TEST_PI_SSH_PASSWORD}"',
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            _init_git_repo(root)
+            mirror = _FakeMirrorWatchdog()
+
+            def _runner(args, **kwargs):
+                command = [str(part) for part in args]
+                commands.append(command)
+                rendered = " ".join(command)
+                if "sha256sum /twinr/.env" in rendered:
+                    return _completed(command, stdout="")
+                if "repo_attestation_manifest_path" in rendered:
+                    return _completed(command, stdout=_repo_attestation_stdout())
+                if "importlib.import_module" in rendered:
+                    return _completed(command, stdout=_import_contract_stdout())
+                if "ActiveState,SubState,UnitFileState,MainPID,ExecMainStatus" in rendered:
+                    return _completed(
+                        command,
+                        stdout='[{"name": "twinr-runtime-supervisor.service", "active_state": "active", "sub_state": "running", "unit_file_state": "enabled", "main_pid": "102", "exec_main_status": "0"}]\n',
+                    )
+                if "check_pi_openai_env_contract.py" in rendered:
+                    return _completed(command, stdout='{"ok": true}\n')
+                if "actual_sha=$(sha256sum" in rendered:
+                    return _completed(command, stdout="")
+                return _completed(command)
+
+            with mock.patch("twinr.ops.pi_runtime_deploy.PiRepoMirrorWatchdog.from_env", return_value=mirror):
+                result = deploy_pi_runtime(
+                    project_root=root,
+                    pi_env_path=pi_env_path,
+                    services=("twinr-runtime-supervisor",),
+                    subprocess_runner=_runner,
+                    install_editable=False,
+                    install_systemd_units=False,
+                )
+
+        self.assertTrue(result.ok)
+        assert mirror.project_root is not None
+        self.assertEqual(mirror.project_root.name, "authoritative_repo")
+        self.assertTrue(getattr(mirror, "_authoritative_source_is_snapshot"))
 
     def test_install_editable_package_syncs_only_pending_project_dependencies(self) -> None:
         commands: list[list[str]] = []
@@ -1217,7 +1291,6 @@ class PiRuntimeDeployTests(unittest.TestCase):
 
     def test_deploy_installs_optional_browser_automation_runtime_support(self) -> None:
         commands: list[list[str]] = []
-        copied_manifests: set[str] = set()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1245,27 +1318,18 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 "chromium\n",
                 encoding="utf-8",
             )
+            _init_git_repo(root)
             mirror = _FakeMirrorWatchdog()
 
             def _runner(args, **kwargs):
                 command = [str(part) for part in args]
                 commands.append(command)
                 rendered = " ".join(command)
-                if " scp " in f" {rendered} ":
-                    if "browser_automation-runtime_requirements.txt" in rendered:
-                        copied_manifests.add("runtime_requirements")
-                    if "browser_automation-playwright_browsers.txt" in rendered:
-                        copied_manifests.add("playwright_browsers")
-                    return _completed(command)
                 if "sha256sum /twinr/.env" in rendered:
                     return _completed(command, stdout="")
                 if 'pip install -r "$requirements_path"' in rendered and "browser_automation" in rendered:
-                    if "runtime_requirements" not in copied_manifests:
-                        return _completed(command, returncode=1, stderr="missing browser automation requirements manifest")
                     return _completed(command, stdout="Successfully installed playwright\n")
                 if "playwright install" in rendered:
-                    if "playwright_browsers" not in copied_manifests:
-                        return _completed(command, returncode=1, stderr="missing Playwright browser manifest")
                     return _completed(command, stdout="Downloaded Chromium\n")
                 if "pip install --no-deps -e" in rendered:
                     return _completed(command, stdout="Successfully installed twinr\n")
@@ -1299,6 +1363,8 @@ class PiRuntimeDeployTests(unittest.TestCase):
         self.assertIn("pip install -r \"$requirements_path\"", joined)
         self.assertIn("deps_summary = run", joined)
         self.assertIn("install_summary = run", joined)
+        self.assertNotIn("browser_automation-runtime_requirements.txt", joined)
+        self.assertNotIn("browser_automation-playwright_browsers.txt", joined)
 
     def test_deploy_installs_optional_pi_runtime_requirements_manifest(self) -> None:
         commands: list[list[str]] = []
@@ -1325,6 +1391,7 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 "rapidfuzz>=3.14,<4\nwcwidth>=0.6,<1\n",
                 encoding="utf-8",
             )
+            _init_git_repo(root)
             mirror = _FakeMirrorWatchdog()
 
             def _runner(args, **kwargs):
@@ -1401,6 +1468,7 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 encoding="utf-8",
             )
             local_sha = hashlib.sha256(env_path.read_bytes()).hexdigest()
+            _init_git_repo(root)
             mirror = _FakeMirrorWatchdog()
 
             def _runner(args, **kwargs):
@@ -1435,7 +1503,7 @@ class PiRuntimeDeployTests(unittest.TestCase):
         assert result.env_sync is not None
         self.assertFalse(result.env_sync.changed)
         joined = "\n".join(" ".join(command) for command in commands)
-        self.assertNotIn("sshpass -d 0 scp", joined)
+        self.assertNotIn("authoritative.env", joined)
 
     def test_deploy_emits_phase_progress_events(self) -> None:
         progress_events: list[dict[str, object]] = []
@@ -1456,6 +1524,7 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            _init_git_repo(root)
             mirror = _FakeMirrorWatchdog()
 
             def _runner(args, **kwargs):
@@ -1499,6 +1568,8 @@ class PiRuntimeDeployTests(unittest.TestCase):
         self.assertIn(("end", "repo_mirror"), phase_events)
         self.assertIn(("start", "repo_attestation"), phase_events)
         self.assertIn(("end", "repo_attestation"), phase_events)
+        self.assertIn(("start", "release_manifest_sync"), phase_events)
+        self.assertIn(("end", "release_manifest_sync"), phase_events)
         self.assertIn(("start", "python_import_contract"), phase_events)
         self.assertIn(("end", "python_import_contract"), phase_events)
         self.assertTrue(all(event.get("kind") == "pi_runtime_deploy_progress" for event in progress_events))
@@ -1522,6 +1593,7 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            _init_git_repo(root)
             mirror = _FakeMirrorWatchdog()
 
             def _runner(args, **kwargs):
@@ -1569,16 +1641,26 @@ class PiRuntimeDeployTests(unittest.TestCase):
         self.assertIn('repair_path_if_exists "$ops_dir/.events.jsonl.lock" 666', joined)
         self.assertIn('repair_path_if_exists "$ops_dir/remote_memory_watchdog.json" 644', joined)
         self.assertIn('repair_path_if_exists "$ops_dir/display_ambient_impulse.json" 644', joined)
+        self.assertIn('repair_path_if_exists "$ops_dir/display_heartbeat.json" 644', joined)
+        self.assertIn('repair_path_if_exists "$ops_dir/display_render_state.json" 644', joined)
+        self.assertIn('repair_path_if_exists "$ops_dir/streaming_memory_segments.json" 644', joined)
         self.assertIn('verify_mode_if_exists "$ops_dir/events.jsonl" 666', joined)
         self.assertIn('verify_mode_if_exists "$ops_dir/.events.jsonl.lock" 666', joined)
         self.assertIn('verify_mode_if_exists "$ops_dir/remote_memory_watchdog.json" 644', joined)
         self.assertIn('verify_mode_if_exists "$ops_dir/display_ambient_impulse.json" 644', joined)
+        self.assertIn('verify_mode_if_exists "$ops_dir/display_heartbeat.json" 644', joined)
+        self.assertIn('verify_mode_if_exists "$ops_dir/display_render_state.json" 644', joined)
+        self.assertIn('verify_mode_if_exists "$ops_dir/streaming_memory_segments.json" 644', joined)
         self.assertLess(joined.index('repair_path_if_exists "$state_dir/automations.json" 600'), joined.index("sudo systemctl restart"))
         self.assertLess(joined.index('repair_path_if_exists "$ops_dir/events.jsonl" 666'), joined.index("sudo systemctl restart"))
         self.assertLess(joined.index('repair_path_if_exists "$ops_dir/remote_memory_watchdog.json" 644'), joined.index("sudo systemctl restart"))
+        self.assertLess(joined.index('repair_path_if_exists "$ops_dir/display_heartbeat.json" 644'), joined.index("sudo systemctl restart"))
+        self.assertLess(joined.index('repair_path_if_exists "$ops_dir/display_render_state.json" 644'), joined.index("sudo systemctl restart"))
         self.assertLess(joined.index("sudo systemctl restart"), joined.index('verify_path_if_exists "$state_dir/automations.json" 600'))
         self.assertLess(joined.index("sudo systemctl restart"), joined.index('verify_mode_if_exists "$ops_dir/events.jsonl" 666'))
         self.assertLess(joined.index("sudo systemctl restart"), joined.index('verify_mode_if_exists "$ops_dir/remote_memory_watchdog.json" 644'))
+        self.assertLess(joined.index("sudo systemctl restart"), joined.index('verify_mode_if_exists "$ops_dir/display_heartbeat.json" 644'))
+        self.assertLess(joined.index("sudo systemctl restart"), joined.index('verify_mode_if_exists "$ops_dir/display_render_state.json" 644'))
 
     def test_deploy_rebases_repo_owned_workflow_trace_env_path_for_pi_sync(self) -> None:
         synced_env_snapshots: dict[str, str] = {}
@@ -1610,6 +1692,7 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            _init_git_repo(root)
             mirror = _FakeMirrorWatchdog()
 
             def _runner(args, **kwargs):
@@ -1671,6 +1754,7 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            _init_git_repo(root)
             mirror = _FakeMirrorWatchdog()
 
             def _runner(args, **kwargs):
@@ -1735,6 +1819,7 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            _init_git_repo(root)
             mirror = _FakeMirrorWatchdog()
 
             def _runner(args, **kwargs):
@@ -1795,6 +1880,7 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            _init_git_repo(root)
             mirror = _FakeMirrorWatchdog()
 
             failed_payload = {
@@ -1916,6 +2002,7 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            _init_git_repo(root)
             mirror = _FakeMirrorWatchdog()
 
             failed_payload = {
@@ -2056,6 +2143,7 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            _init_git_repo(root)
             mirror = _FakeMirrorWatchdog()
 
             failed_payload = {
@@ -2165,6 +2253,7 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            _init_git_repo(root)
             mirror = _FakeMirrorWatchdog()
 
             failed_payload = {
@@ -2261,6 +2350,7 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 "[Service]\nWorkingDirectory=/home/thh/twinr\nExecStart=/home/thh/twinr/.venv/bin/python -m twinr --run-orchestrator-server\n",
                 encoding="utf-8",
             )
+            _init_git_repo(root)
             mirror = _FakeMirrorWatchdog()
 
             def _runner(args, **kwargs):
@@ -2366,6 +2456,7 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 "[Service]\nWorkingDirectory=/twinr\nExecStart=/twinr/.venv/bin/python -m twinr --env-file .env --run-whatsapp-channel\n",
                 encoding="utf-8",
             )
+            _init_git_repo(root)
             mirror = _FakeMirrorWatchdog()
 
             def _runner(args, **kwargs):
@@ -2471,6 +2562,7 @@ class PiRuntimeDeployTests(unittest.TestCase):
                 "[Install]\nWantedBy=multi-user.target\n[Service]\nWorkingDirectory=/twinr\nExecStart=/twinr/.venv/bin/python -m twinr --env-file .env --run-whatsapp-channel\n",
                 encoding="utf-8",
             )
+            _init_git_repo(root)
             mirror = _FakeMirrorWatchdog()
 
             def _runner(args, **kwargs):

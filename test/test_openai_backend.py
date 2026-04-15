@@ -6,6 +6,8 @@ import sys
 import tempfile
 import unittest
 
+import httpx
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
@@ -187,6 +189,70 @@ class FakeSpeechAPI:
                 return _Manager()
 
         return _StreamingWrapper()
+
+
+class FakeHttpxStreamResponse:
+    def __init__(self, payload: bytes, *, status_code: int = 200, body: dict | None = None) -> None:
+        self._payload = payload
+        self.status_code = status_code
+        self._body = body or {}
+        self.closed = False
+        self.request = httpx.Request("POST", "https://api.openai.com/v1/audio/speech")
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"status={self.status_code}",
+                request=self.request,
+                response=httpx.Response(
+                    self.status_code,
+                    request=self.request,
+                    json=self._body,
+                ),
+            )
+
+    def iter_bytes(self, _chunk_size: int | None = None):
+        midpoint = max(1, len(self._payload) // 2)
+        yield self._payload[:midpoint]
+        if self.closed:
+            return
+        yield self._payload[midpoint:]
+
+    def json(self) -> dict:
+        return dict(self._body)
+
+    @property
+    def text(self) -> str:
+        return json.dumps(self._body)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeHttpxClient:
+    def __init__(self, responses: list[FakeHttpxStreamResponse] | None = None) -> None:
+        self.calls: list[dict] = []
+        self.responses = list(responses or [FakeHttpxStreamResponse(b"AUDIO")])
+
+    def stream(self, method: str, url: str, *, headers=None, json=None):
+        self.calls.append(
+            {
+                "method": method,
+                "url": url,
+                "headers": dict(headers or {}),
+                "json": dict(json or {}),
+            }
+        )
+        response = self.responses.pop(0)
+
+        class _Manager:
+            def __enter__(self):
+                return response
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+        return _Manager()
 
 
 class FakeChatCompletionsAPI:
@@ -531,6 +597,66 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertEqual(remaining_chunks, [])
         self.assertTrue(self.speech.streaming_responses)
         self.assertTrue(self.speech.streaming_responses[0].closed)
+
+    def test_synthesize_stream_uses_raw_http_transport_when_available(self) -> None:
+        http_client = FakeHttpxClient()
+        backend = OpenAIBackend(
+            config=self.config,
+            client=SimpleNamespace(
+                responses=self.responses,
+                audio=SimpleNamespace(
+                    transcriptions=self.transcriptions,
+                    speech=FakeSpeechAPI(),
+                ),
+                _client=http_client,
+                base_url="https://api.openai.com/v1/",
+                default_headers={
+                    "Authorization": "Bearer test-key",
+                    "Content-Type": "application/json",
+                    "OpenAI-Project": "proj_test",
+                },
+            ),
+        )
+
+        chunks = list(backend.synthesize_stream("Hello from Twinr"))
+
+        self.assertEqual(chunks, [b"AU", b"DIO"])
+        self.assertEqual(len(http_client.calls), 1)
+        call = http_client.calls[0]
+        self.assertEqual(call["method"], "POST")
+        self.assertEqual(call["url"], "https://api.openai.com/v1/audio/speech")
+        self.assertEqual(call["headers"]["Authorization"], "Bearer test-key")
+        self.assertEqual(call["json"]["model"], "gpt-4o-mini-tts")
+        self.assertEqual(call["json"]["voice"], "marin")
+
+    def test_synthesize_stream_raw_http_close_closes_active_response(self) -> None:
+        response = FakeHttpxStreamResponse(b"AUDIO")
+        http_client = FakeHttpxClient(responses=[response])
+        backend = OpenAIBackend(
+            config=self.config,
+            client=SimpleNamespace(
+                responses=self.responses,
+                audio=SimpleNamespace(
+                    transcriptions=self.transcriptions,
+                    speech=FakeSpeechAPI(),
+                ),
+                _client=http_client,
+                base_url="https://api.openai.com/v1/",
+                default_headers={
+                    "Authorization": "Bearer test-key",
+                    "Content-Type": "application/json",
+                },
+            ),
+        )
+
+        stream = backend.synthesize_stream("Hello from Twinr")
+        first_chunk = next(stream)
+        stream.close()
+        remaining_chunks = list(stream)
+
+        self.assertEqual(first_chunk, b"AU")
+        self.assertEqual(remaining_chunks, [])
+        self.assertTrue(response.closed)
 
     def test_phrase_due_reminder_builds_short_reminder_request(self) -> None:
         from twinr.memory.reminders import ReminderEntry, now_in_timezone
@@ -1198,6 +1324,13 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertIn("Explicit place context: Schwarzenbek", prompt)
         self.assertEqual(len(self.responses.calls), 1)
         self.assertEqual(self.responses.calls[0]["text"]["format"]["name"], "twinr_live_search_spoken_answer")
+
+    def test_default_search_model_prefers_fast_preview_search(self) -> None:
+        self.assertEqual(self.config.openai_search_model, "gpt-4o-mini-search-preview")
+        self.assertEqual(
+            self.backend._candidate_search_models()[:3],
+            ("gpt-4o-mini-search-preview", "gpt-5.2", "gpt-5.4-mini"),
+        )
 
     def test_search_live_info_preview_path_passes_literal_explicit_date_question(self) -> None:
         backend = OpenAIBackend(

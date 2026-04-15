@@ -80,6 +80,28 @@ class DisplayFaceCueTests(unittest.TestCase):
         self.assertEqual(loaded, saved)
         self.assertIsNone(expired)
 
+    def test_signature_ignores_lifetime_refresh_fields(self) -> None:
+        first = DisplayFaceCue(
+            source="camera_surface",
+            updated_at="2026-04-07T08:00:00+00:00",
+            expires_at="2026-04-07T08:00:04+00:00",
+            gaze_x=2,
+            mouth="smile",
+            brows="raised",
+            head_dx=1,
+        )
+        refreshed = DisplayFaceCue(
+            source="camera_surface",
+            updated_at="2026-04-07T08:00:03+00:00",
+            expires_at="2026-04-07T08:00:07+00:00",
+            gaze_x=2,
+            mouth="smile",
+            brows="raised",
+            head_dx=1,
+        )
+
+        self.assertEqual(first.signature(), refreshed.signature())
+
     def test_clear_removes_existing_cue_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(project_root=temp_dir)

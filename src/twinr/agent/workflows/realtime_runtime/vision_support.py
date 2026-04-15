@@ -86,6 +86,12 @@ def validate_reference_image_base_dir(loop: Any, path: Path) -> bool:
     return True
 
 
+def _multimodal_evidence_enabled(loop: Any) -> bool:
+    """Return whether this runtime lane should persist durable multimodal evidence."""
+
+    return bool(getattr(loop, "_persist_multimodal_evidence", True))
+
+
 def safe_read_reference_image_bytes(path: Path, *, max_bytes: int) -> bytes:
     """Read a reference image without following symlinks and with size checks."""
 
@@ -571,20 +577,23 @@ def build_vision_images(
     loop._try_emit(f"camera_input_format={input_format}")
     loop._try_emit(f"camera_capture_bytes={len(capture_bytes)}")
 
-    try:
-        loop.runtime.long_term_memory.enqueue_multimodal_evidence(
-            event_name="camera_capture",
-            modality="camera",
-            source="camera_tool",
-            message="Live camera frame captured for device interaction.",
-            data={
-                "purpose": "vision_inspection",
-                "source_device": source_device,
-                "input_format": input_format,
-            },
-        )
-    except Exception as exc:
-        loop._try_emit(f"camera_memory_error={loop._safe_error_text(exc)}")
+    if _multimodal_evidence_enabled(loop):
+        try:
+            loop.runtime.long_term_memory.enqueue_multimodal_evidence(
+                event_name="camera_capture",
+                modality="camera",
+                source="camera_tool",
+                message="Live camera frame captured for device interaction.",
+                data={
+                    "purpose": "vision_inspection",
+                    "source_device": source_device,
+                    "input_format": input_format,
+                },
+            )
+        except Exception as exc:
+            loop._try_emit(f"camera_memory_error={loop._safe_error_text(exc)}")
+    else:
+        loop._try_emit("camera_memory_persist=disabled")
 
     try:
         prepared_capture = _prepare_capture_image(

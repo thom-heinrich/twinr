@@ -45,30 +45,59 @@ class StructuredStoreMixinBase:
     def load_current_state_fine_grained_for_write(self) -> StructuredStoreCurrentState:
         raise NotImplementedError
 
-    def load_objects_by_ids(self, memory_ids: Iterable[str]) -> tuple[LongTermMemoryObjectV1, ...]:
+    def load_objects_by_ids(
+        self,
+        memory_ids: Iterable[str],
+        *,
+        allow_cold_remote_catalog_scan: bool = True,
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
         raise NotImplementedError
 
-    def load_objects_by_slot_keys(self, slot_keys: Iterable[str]) -> tuple[LongTermMemoryObjectV1, ...]:
+    def load_objects_by_slot_keys(
+        self,
+        slot_keys: Iterable[str],
+        *,
+        allow_cold_remote_catalog_scan: bool = True,
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
         raise NotImplementedError
 
-    def load_objects_by_event_ids(self, event_ids: Iterable[str]) -> tuple[LongTermMemoryObjectV1, ...]:
+    def load_objects_by_event_ids(
+        self,
+        event_ids: Iterable[str],
+        *,
+        allow_cold_remote_catalog_scan: bool = True,
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        raise NotImplementedError
+
+    def load_objects_by_projection_filter(
+        self,
+        *,
+        predicate: Any,
+        allow_cold_remote_catalog_scan: bool = True,
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
         raise NotImplementedError
 
     def load_objects_referencing_memory_ids(
         self,
         memory_ids: Iterable[str],
+        *,
+        allow_cold_remote_catalog_scan: bool = True,
     ) -> tuple[LongTermMemoryObjectV1, ...]:
         raise NotImplementedError
 
     def load_conflicts_by_slot_keys(
         self,
         slot_keys: Iterable[str],
+        *,
+        allow_cold_remote_catalog_scan: bool = True,
     ) -> tuple[LongTermMemoryConflictV1, ...]:
         raise NotImplementedError
 
     def load_conflicts_for_memory_ids(
         self,
         memory_ids: Iterable[str],
+        *,
+        allow_cold_remote_catalog_scan: bool = True,
     ) -> tuple[LongTermMemoryConflictV1, ...]:
         raise NotImplementedError
 

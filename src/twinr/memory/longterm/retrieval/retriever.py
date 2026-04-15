@@ -113,8 +113,9 @@ class LongTermRetriever:
     """Assemble prompt-ready long-term memory context for one query.
 
     The retriever keeps store access read-only, bounds prompt payload sizes,
-    and degrades gracefully on partial data corruption. Remote-memory
-    unavailability is surfaced to callers so runtime policy can fail closed.
+    and surfaces retrieval failures instead of degrading to synthetic partial
+    context. Remote-memory unavailability is surfaced to callers so runtime
+    policy can fail closed.
     """
 
     config: TwinrConfig
@@ -141,8 +142,8 @@ class LongTermRetriever:
 
         Returns:
             A ``LongTermMemoryContext`` containing every available retrieval
-            section. Blank queries or non-remote failures yield an empty or
-            partial context instead of crashing the turn.
+            section. Blank queries yield an empty context without triggering
+            broad recall.
 
         Raises:
             LongTermRemoteUnavailableError: If the remote long-term memory
@@ -169,7 +170,7 @@ class LongTermRetriever:
                     details={"query_variants": 0},
                 )
                 return self._empty_context()
-            try:  # AUDIT-FIX(#1): A single broken store or malformed record must not crash the whole turn.
+            try:
                 with workflow_span(
                     name="longterm_retriever_load_context_inputs",
                     kind="retrieval",
@@ -188,14 +189,14 @@ class LongTermRetriever:
             except LongTermRemoteUnavailableError:
                 raise
             except Exception:
-                logger.exception("Long-term memory context build failed; returning empty memory context.")
+                logger.exception("Long-term memory context build failed.")
                 workflow_event(
                     kind="exception",
                     msg="longterm_retriever_build_context_failed",
                     details={"query_variants": len(query_texts)},
                     level="ERROR",
                 )
-                return self._empty_context()
+                raise
 
     def build_tool_context(
         self,
@@ -254,14 +255,14 @@ class LongTermRetriever:
             except LongTermRemoteUnavailableError:
                 raise
             except Exception:
-                logger.exception("Long-term tool context build failed; returning empty memory context.")
+                logger.exception("Long-term tool context build failed.")
                 workflow_event(
                     kind="exception",
                     msg="longterm_retriever_build_tool_context_failed",
                     details={"query_variants": len(query_texts)},
                     level="ERROR",
                 )
-                return self._empty_context()
+                raise
 
     def _build_context_from_inputs(
         self,
@@ -542,41 +543,29 @@ class LongTermRetriever:
             shared_by_query[query_text] = sections
             return sections
 
-        try:
-            episodic_collect_limit = max(
-                resolved_limit,
-                resolved_limit * max(1, len(query_texts)),
-            )
-            episodic_objects = self._merge_unique_results(
-                query_texts=query_texts,
-                load_results=lambda query_text: load_sections(query_text)[0],
-                result_key=lambda item: self._normalize_text(getattr(item, "memory_id", None), limit=256),
-                limit=resolved_limit,
-                collect_limit=episodic_collect_limit,
-            )
-        except LongTermRemoteUnavailableError:
-            raise
-        except Exception:
-            logger.exception("Long-term episodic retrieval failed; continuing without episodic context.")
-            episodic_objects = ()
+        episodic_collect_limit = max(
+            resolved_limit,
+            resolved_limit * max(1, len(query_texts)),
+        )
+        episodic_objects = self._merge_unique_results(
+            query_texts=query_texts,
+            load_results=lambda query_text: load_sections(query_text)[0],
+            result_key=lambda item: self._normalize_text(getattr(item, "memory_id", None), limit=256),
+            limit=resolved_limit,
+            collect_limit=episodic_collect_limit,
+        )
 
-        try:
-            durable_collect_limit = max(
-                resolved_limit,
-                resolved_limit * max(1, len(query_texts)),
-            )
-            durable_objects = self._merge_unique_results(
-                query_texts=query_texts,
-                load_results=lambda query_text: load_sections(query_text)[1],
-                result_key=lambda item: self._normalize_text(getattr(item, "memory_id", None), limit=256),
-                limit=resolved_limit,
-                collect_limit=durable_collect_limit,
-            )
-        except LongTermRemoteUnavailableError:
-            raise
-        except Exception:
-            logger.exception("Long-term durable retrieval failed; continuing without durable context.")
-            durable_objects = ()
+        durable_collect_limit = max(
+            resolved_limit,
+            resolved_limit * max(1, len(query_texts)),
+        )
+        durable_objects = self._merge_unique_results(
+            query_texts=query_texts,
+            load_results=lambda query_text: load_sections(query_text)[1],
+            result_key=lambda item: self._normalize_text(getattr(item, "memory_id", None), limit=256),
+            limit=resolved_limit,
+            collect_limit=durable_collect_limit,
+        )
 
         entries: list[UnifiedEpisodicSelectionInput] = []
         ranked_episodic = self.object_store.rank_selected_objects(
@@ -664,7 +653,7 @@ class LongTermRetriever:
             default=1,
             minimum=1,
         )
-        try:  # AUDIT-FIX(#1): Conflict retrieval must degrade gracefully when the store is temporarily broken.
+        try:
             conflicts = self._merge_unique_results(
                 query_texts=query_texts,
                 load_results=lambda query_text: self.object_store.select_open_conflicts(
@@ -677,10 +666,10 @@ class LongTermRetriever:
         except LongTermRemoteUnavailableError:
             raise
         except Exception:
-            logger.exception("Long-term conflict retrieval failed; continuing without conflict context.")
-            return _ConflictQueueSelection(queue=(), supporting_objects=())
+            logger.exception("Long-term conflict retrieval failed.")
+            raise
 
-        try:  # AUDIT-FIX(#1): A failure to load supporting objects must not abort the whole memory path.
+        try:
             related_memory_ids = tuple(
                 dict.fromkeys(
                     memory_id
@@ -711,8 +700,8 @@ class LongTermRetriever:
         except LongTermRemoteUnavailableError:
             raise
         except Exception:
-            logger.exception("Long-term object load failed during conflict queue build; using empty object set.")
-            objects = ()
+            logger.exception("Long-term object load failed during conflict queue build.")
+            raise
 
         try:
             queue = self.conflict_resolver.build_queue_items(
@@ -720,8 +709,8 @@ class LongTermRetriever:
                 objects=objects,
             )
         except Exception:
-            logger.exception("Long-term conflict queue build failed; continuing without conflict context.")
-            return _ConflictQueueSelection(queue=(), supporting_objects=tuple(self._coerce_iterable(objects)))
+            logger.exception("Long-term conflict queue build failed.")
+            raise
         return _ConflictQueueSelection(
             queue=tuple(self._coerce_iterable(queue)),
             supporting_objects=tuple(self._coerce_iterable(objects)),
@@ -799,7 +788,7 @@ class LongTermRetriever:
             default=1,
             minimum=1,
         )
-        try:  # AUDIT-FIX(#1): Mid-term retrieval failures should not abort the response turn.
+        try:
             packets = self._merge_unique_results(
                 query_texts=query_texts,
                 load_results=lambda query_text: self.midterm_store.select_relevant_packets(
@@ -812,8 +801,8 @@ class LongTermRetriever:
         except LongTermRemoteUnavailableError:
             raise
         except Exception:
-            logger.exception("Long-term mid-term retrieval failed; continuing without mid-term context.")
-            return ()
+            logger.exception("Long-term mid-term retrieval failed.")
+            raise
         return tuple(self._coerce_iterable(packets))
 
     def _select_durable_objects(
@@ -1106,8 +1095,8 @@ class LongTermRetriever:
                 )
             )
         except Exception:
-            logger.exception("Adaptive long-term policy build failed; continuing without adaptive policies.")
-            return ()
+            logger.exception("Adaptive long-term policy build failed.")
+            raise
 
     def _episodic_entry_from_object(self, item: object) -> PersistentMemoryEntry | None:
         """Convert a stored episodic object into ``PersistentMemoryEntry``."""

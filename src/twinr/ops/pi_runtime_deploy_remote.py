@@ -16,8 +16,8 @@
 
 This module owns the SSH/SCP-side primitives used by the operator-facing Pi
 deploy flow. Besides core repo/env/systemd steps, it also installs optional
-runtime support files that live inside mirrored local workspaces such as the
-ignored ``browser_automation/`` tree.
+browser-automation runtime support from manifests that are already present
+inside the mirrored authoritative release snapshot.
 """
 
 from __future__ import annotations
@@ -61,8 +61,14 @@ _OPS_DIR_MODE = "700"
 _OPS_ARTIFACT_PERMISSION_SPECS: tuple[tuple[str, str], ...] = (
     ("events.jsonl", "666"),
     (".events.jsonl.lock", "666"),
+    ("usage.jsonl.sqlite3", "600"),
+    ("usage.jsonl.sqlite3.lock", "600"),
     ("remote_memory_watchdog.json", "644"),
+    ("current_release_manifest.json", "644"),
     ("display_ambient_impulse.json", "644"),
+    ("display_heartbeat.json", "644"),
+    ("display_render_state.json", "644"),
+    ("streaming_memory_segments.json", "644"),
 )
 _SERVICE_HEALTHY_SUBSTATES = frozenset({"running", "listening", "exited"})
 
@@ -1524,7 +1530,7 @@ def install_browser_automation_runtime_support(
     install_playwright_browsers: bool,
     progress_callback: ProgressCallback | None = None,
 ) -> str:
-    """Install mirrored browser-automation runtime requirements on the Pi.
+    """Install browser-automation runtime support from the deployed snapshot.
 
     Args:
         remote: Remote executor targeting the Pi acceptance host.
@@ -2139,6 +2145,15 @@ def run_retention_canary_probe(
 ) -> dict[str, object]:
     """Run the bounded live retention canary and parse its JSON result."""
 
+    def _load_report_payload_after_inline_stdout() -> dict[str, object] | None:
+        return _wait_for_remote_retention_canary_report(
+            remote=remote,
+            remote_root=remote_root,
+            probe_id=probe_id,
+            wait_timeout_s=5.0,
+            poll_interval_s=1.0,
+        )
+
     remote_python = f"{remote_root}/.venv/bin/python"
     effective_command_timeout_s = remote.timeout_s if command_timeout_s is None else float(command_timeout_s)
     if effective_command_timeout_s <= 0:
@@ -2158,6 +2173,11 @@ def run_retention_canary_probe(
         completed = remote.run_ssh(
             "\n".join(
                 (
+                    "set -euo pipefail",
+                    "cd " + shlex.quote(remote_root),
+                    "export PYTHONPATH="
+                    + shlex.quote(f"{remote_root}/src")
+                    + ':${PYTHONPATH:-""}',
                     "set +e",
                     "retention_output=$(" + command + " 2>&1)",
                     "retention_status=$?",
@@ -2186,15 +2206,25 @@ def run_retention_canary_probe(
             f"probe_id={probe_id} timeout_s={exc.timeout}"
         ) from exc
     exit_status, raw_output = _parse_remote_retention_canary_stdout(completed.stdout or "")
-    payload = _parse_retention_canary_payload(raw_output)
+    try:
+        payload = _parse_retention_canary_payload(raw_output)
+    except json.JSONDecodeError as exc:
+        report_payload = _load_report_payload_after_inline_stdout()
+        if isinstance(report_payload, dict) and report_payload:
+            if not bool(report_payload.get("ready")):
+                raise RetentionCanaryProbeError(
+                    "retention canary emitted non-JSON inline output but produced a Pi report: "
+                    + _summarize_retention_canary_failure_payload(report_payload),
+                    payload=report_payload,
+                ) from exc
+            return report_payload
+        raw_detail = summarize_text(raw_output) if raw_output.strip() else "no stdout/stderr payload"
+        raise RuntimeError(
+            "retention canary emitted malformed inline JSON and no final Pi report was available: "
+            f"probe_id={probe_id} exit_status={exit_status} detail={raw_detail} parse_error={exc}"
+        ) from exc
     if payload is None:
-        report_payload = _wait_for_remote_retention_canary_report(
-            remote=remote,
-            remote_root=remote_root,
-            probe_id=probe_id,
-            wait_timeout_s=5.0,
-            poll_interval_s=1.0,
-        )
+        report_payload = _load_report_payload_after_inline_stdout()
         if isinstance(report_payload, dict) and report_payload:
             if not bool(report_payload.get("ready")):
                 raise RetentionCanaryProbeError(
@@ -2264,7 +2294,7 @@ def _wait_for_remote_retention_canary_report(
         / f"{str(probe_id).strip()}.json"
     )
     while True:
-        payload = _load_remote_json_artifact(remote=remote, remote_path=str(report_path))
+        payload = load_remote_json_artifact(remote=remote, remote_path=str(report_path))
         if isinstance(payload, dict) and payload.get("probe_id") == probe_id:
             status = str(payload.get("status") or "").strip().lower()
             if status in {"ok", "failed"}:
@@ -2274,7 +2304,7 @@ def _wait_for_remote_retention_canary_report(
         time.sleep(max(0.1, poll_interval_s))
 
 
-def _load_remote_json_artifact(
+def load_remote_json_artifact(
     *,
     remote: PiRemoteExecutor,
     remote_path: str,
@@ -2401,6 +2431,7 @@ __all__ = [
     "install_python_requirements_manifest",
     "install_service_units",
     "load_journal_excerpt",
+    "load_remote_json_artifact",
     "load_service_states",
     "parse_optional_int",
     "read_remote_sha256",

@@ -46,7 +46,11 @@ _DEFAULT_DRONE_POOL_TIMEOUT_S: Final[float] = 0.25
 _DEFAULT_DRONE_CONNECT_RETRIES: Final[int] = 1
 _DEFAULT_DRONE_MAX_RESPONSE_BYTES: Final[int] = 1_048_576
 _DEFAULT_USER_AGENT: Final[str] = "TwinrDroneClient/2026.03"
-_DEFAULT_ALLOWED_MISSION_TYPES: Final[tuple[str, ...]] = ("inspect", "hover_test")
+_DEFAULT_ALLOWED_MISSION_TYPES: Final[tuple[str, ...]] = (
+    "inspect",
+    "hover_test",
+    "inspect_local_zone",
+)
 _LOCAL_HOSTS: Final[frozenset[str]] = frozenset({"localhost", "127.0.0.1", "::1"})
 _TOKEN_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _MISSING: Final[object] = object()
@@ -107,9 +111,10 @@ def _normalize_uds_path(value: object) -> str | None:
     normalized = _normalize_optional_text(value)
     if not normalized:
         return None
-    if "\x00" in normalized:
+    normalized_text = str(normalized)
+    if "\x00" in normalized_text:
         raise DroneSecurityError("Twinr drone socket path must not contain NUL bytes")
-    return normalized
+    return normalized_text
 
 
 def _bounded_timeout_s(value: object, *, default: float) -> float:
@@ -381,6 +386,61 @@ def _wire_string_tuple(raw: dict[str, object], key: str) -> tuple[str, ...]:
         if normalized:
             result.append(normalized)
     return tuple(result)
+
+
+def _wire_optional_mapping(raw: dict[str, object], key: str) -> dict[str, object]:
+    """Read one optional nested JSON object from a daemon payload."""
+
+    value = raw.get(key, None)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise DroneProtocolError(f"Twinr drone daemon field '{key}' must be a JSON object")
+    return value
+
+
+def _wire_float_mapping(raw: dict[str, object], key: str) -> dict[str, float | None]:
+    """Read one string-keyed float mapping from a daemon payload."""
+
+    nested = _wire_optional_mapping(raw, key)
+    result: dict[str, float | None] = {}
+    for nested_key, nested_value in nested.items():
+        if not isinstance(nested_key, str):
+            raise DroneProtocolError(f"Twinr drone daemon field '{key}' must use string keys")
+        if nested_value is None:
+            result[nested_key] = None
+            continue
+        if isinstance(nested_value, bool) or not isinstance(nested_value, (int, float)):
+            raise DroneProtocolError(
+                f"Twinr drone daemon field '{key}.{nested_key}' must be a JSON number or null"
+            )
+        parsed = float(nested_value)
+        if not math.isfinite(parsed):
+            raise DroneProtocolError(
+                f"Twinr drone daemon field '{key}.{nested_key}' must be finite"
+            )
+        result[nested_key] = parsed
+    return result
+
+
+def _wire_int_mapping(raw: dict[str, object], key: str) -> dict[str, int | None]:
+    """Read one string-keyed int mapping from a daemon payload."""
+
+    nested = _wire_optional_mapping(raw, key)
+    result: dict[str, int | None] = {}
+    for nested_key, nested_value in nested.items():
+        if not isinstance(nested_key, str):
+            raise DroneProtocolError(f"Twinr drone daemon field '{key}' must use string keys")
+        if nested_value is None:
+            result[nested_key] = None
+            continue
+        if isinstance(nested_value, bool) or not isinstance(nested_value, (int, float)):
+            raise DroneProtocolError(
+                f"Twinr drone daemon field '{key}.{nested_key}' must be a JSON number or null"
+            )
+        parsed = int(nested_value)
+        result[nested_key] = parsed
+    return result
 
 
 def _new_request_id() -> str:
@@ -706,6 +766,334 @@ class DroneSafetyStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class DroneTelemetryCatalog:
+    """Represent bounded telemetry catalog counts from the daemon state."""
+
+    log_group_count: int
+    log_variable_count: int
+    param_group_count: int
+    param_count: int
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "DroneTelemetryCatalog":
+        raw = _require_mapping(payload, field="telemetry.catalog")
+        return cls(
+            log_group_count=int(_wire_float(raw, "log_group_count", default=0.0) or 0.0),
+            log_variable_count=int(_wire_float(raw, "log_variable_count", default=0.0) or 0.0),
+            param_group_count=int(_wire_float(raw, "param_group_count", default=0.0) or 0.0),
+            param_count=int(_wire_float(raw, "param_count", default=0.0) or 0.0),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DroneDeckTelemetrySnapshot:
+    """Represent the daemon's current deck-flag snapshot."""
+
+    flags: dict[str, int | None]
+    refreshed_age_s: float | None
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "DroneDeckTelemetrySnapshot":
+        raw = _require_mapping(payload, field="telemetry.deck")
+        return cls(
+            flags=_wire_int_mapping(raw, "flags"),
+            refreshed_age_s=_wire_float(raw, "refreshed_age_s", default=None),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DronePowerTelemetrySnapshot:
+    """Represent the daemon's current power telemetry snapshot."""
+
+    vbat_v: float | None
+    battery_level: int | None
+    state: int | None
+    state_name: str
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "DronePowerTelemetrySnapshot":
+        raw = _require_mapping(payload, field="telemetry.power")
+        battery_level = _wire_float(raw, "battery_level", default=None)
+        state = _wire_float(raw, "state", default=None)
+        return cls(
+            vbat_v=_wire_float(raw, "vbat_v", default=None),
+            battery_level=None if battery_level is None else int(battery_level),
+            state=None if state is None else int(state),
+            state_name=_wire_token(raw, "state_name", default="unknown"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DroneRangeTelemetrySnapshot:
+    """Represent the daemon's current range telemetry snapshot."""
+
+    zrange_m: float | None
+    front_m: float | None
+    back_m: float | None
+    left_m: float | None
+    right_m: float | None
+    up_m: float | None
+    downward_observed: bool
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "DroneRangeTelemetrySnapshot":
+        raw = _require_mapping(payload, field="telemetry.range")
+        return cls(
+            zrange_m=_wire_float(raw, "zrange_m", default=None),
+            front_m=_wire_float(raw, "front_m", default=None),
+            back_m=_wire_float(raw, "back_m", default=None),
+            left_m=_wire_float(raw, "left_m", default=None),
+            right_m=_wire_float(raw, "right_m", default=None),
+            up_m=_wire_float(raw, "up_m", default=None),
+            downward_observed=_wire_bool(raw, "downward_observed", default=False),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DroneFlightTelemetrySnapshot:
+    """Represent the daemon's current flight telemetry snapshot."""
+
+    roll_deg: float | None
+    pitch_deg: float | None
+    yaw_deg: float | None
+    x_m: float | None
+    y_m: float | None
+    z_m: float | None
+    vx_mps: float | None
+    vy_mps: float | None
+    vz_mps: float | None
+    thrust: float | None
+    motion_squal: int | None
+    supervisor_info: int | None
+    can_fly: bool | None
+    is_flying: bool | None
+    unsafe_supervisor_flags: tuple[str, ...]
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "DroneFlightTelemetrySnapshot":
+        raw = _require_mapping(payload, field="telemetry.flight")
+        motion_squal = _wire_float(raw, "motion_squal", default=None)
+        supervisor_info = _wire_float(raw, "supervisor_info", default=None)
+        can_fly = raw.get("can_fly", None)
+        is_flying = raw.get("is_flying", None)
+        if can_fly is not None and not isinstance(can_fly, bool):
+            raise DroneProtocolError("Twinr drone daemon field 'telemetry.flight.can_fly' must be a JSON boolean or null")
+        if is_flying is not None and not isinstance(is_flying, bool):
+            raise DroneProtocolError("Twinr drone daemon field 'telemetry.flight.is_flying' must be a JSON boolean or null")
+        return cls(
+            roll_deg=_wire_float(raw, "roll_deg", default=None),
+            pitch_deg=_wire_float(raw, "pitch_deg", default=None),
+            yaw_deg=_wire_float(raw, "yaw_deg", default=None),
+            x_m=_wire_float(raw, "x_m", default=None),
+            y_m=_wire_float(raw, "y_m", default=None),
+            z_m=_wire_float(raw, "z_m", default=None),
+            vx_mps=_wire_float(raw, "vx_mps", default=None),
+            vy_mps=_wire_float(raw, "vy_mps", default=None),
+            vz_mps=_wire_float(raw, "vz_mps", default=None),
+            thrust=_wire_float(raw, "thrust", default=None),
+            motion_squal=None if motion_squal is None else int(motion_squal),
+            supervisor_info=None if supervisor_info is None else int(supervisor_info),
+            can_fly=can_fly,
+            is_flying=is_flying,
+            unsafe_supervisor_flags=_wire_string_tuple(raw, "unsafe_supervisor_flags"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DroneLinkTelemetrySnapshot:
+    """Represent the daemon's current radio/link telemetry snapshot."""
+
+    radio_connected: bool | None
+    rssi_dbm: float | None
+    observation_age_s: float | None
+    latency_ms: float | None
+    link_quality: float | None
+    uplink_rssi: float | None
+    uplink_rate_hz: float | None
+    downlink_rate_hz: float | None
+    uplink_congestion: float | None
+    downlink_congestion: float | None
+    monitor_available: bool
+    monitor_failure: str | None
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "DroneLinkTelemetrySnapshot":
+        raw = _require_mapping(payload, field="telemetry.link")
+        radio_connected = raw.get("radio_connected", None)
+        if radio_connected is not None and not isinstance(radio_connected, bool):
+            raise DroneProtocolError("Twinr drone daemon field 'telemetry.link.radio_connected' must be a JSON boolean or null")
+        return cls(
+            radio_connected=radio_connected,
+            rssi_dbm=_wire_float(raw, "rssi_dbm", default=None),
+            observation_age_s=_wire_float(raw, "observation_age_s", default=None),
+            latency_ms=_wire_float(raw, "latency_ms", default=None),
+            link_quality=_wire_float(raw, "link_quality", default=None),
+            uplink_rssi=_wire_float(raw, "uplink_rssi", default=None),
+            uplink_rate_hz=_wire_float(raw, "uplink_rate_hz", default=None),
+            downlink_rate_hz=_wire_float(raw, "downlink_rate_hz", default=None),
+            uplink_congestion=_wire_float(raw, "uplink_congestion", default=None),
+            downlink_congestion=_wire_float(raw, "downlink_congestion", default=None),
+            monitor_available=_wire_bool(raw, "monitor_available", default=False),
+            monitor_failure=_wire_optional_string(raw, "monitor_failure", max_len=256),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DroneFailsafeTelemetrySnapshot:
+    """Represent the daemon's current `twinrFs` telemetry snapshot."""
+
+    loaded: bool
+    protocol_version: int | None
+    enabled: bool | None
+    state_code: int | None
+    state_name: str | None
+    reason_code: int | None
+    reason_name: str | None
+    heartbeat_age_ms: int | None
+    last_status_received_age_s: float | None
+    session_id: int | None
+    rejected_packets: int | None
+    last_reject_code: int | None
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "DroneFailsafeTelemetrySnapshot":
+        raw = _require_mapping(payload, field="telemetry.failsafe")
+        enabled = raw.get("enabled", None)
+        if enabled is not None and not isinstance(enabled, bool):
+            raise DroneProtocolError("Twinr drone daemon field 'telemetry.failsafe.enabled' must be a JSON boolean or null")
+        return cls(
+            loaded=_wire_bool(raw, "loaded", default=False),
+            protocol_version=_wire_optional_int(raw, "protocol_version"),
+            enabled=enabled,
+            state_code=_wire_optional_int(raw, "state_code"),
+            state_name=_wire_optional_string(raw, "state_name", max_len=128),
+            reason_code=_wire_optional_int(raw, "reason_code"),
+            reason_name=_wire_optional_string(raw, "reason_name", max_len=128),
+            heartbeat_age_ms=_wire_optional_int(raw, "heartbeat_age_ms"),
+            last_status_received_age_s=_wire_float(raw, "last_status_received_age_s", default=None),
+            session_id=_wire_optional_int(raw, "session_id"),
+            rejected_packets=_wire_optional_int(raw, "rejected_packets"),
+            last_reject_code=_wire_optional_int(raw, "last_reject_code"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DroneCommandTelemetrySnapshot:
+    """Represent the daemon's current command-state snapshot."""
+
+    mission_name: str | None
+    phase: str
+    phase_status: str | None
+    age_s: float | None
+    target_height_m: float | None
+    hover_duration_s: float | None
+    forward_m: float | None
+    left_m: float | None
+    translation_velocity_mps: float | None
+    takeoff_confirmed: bool
+    aborted: bool
+    abort_reason: str | None
+    last_message: str | None
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "DroneCommandTelemetrySnapshot":
+        raw = _require_mapping(payload, field="telemetry.command")
+        return cls(
+            mission_name=_wire_optional_string(raw, "mission_name", max_len=128),
+            phase=_wire_token(raw, "phase", default="idle"),
+            phase_status=_wire_optional_string(raw, "phase_status", max_len=128),
+            age_s=_wire_float(raw, "age_s", default=None),
+            target_height_m=_wire_float(raw, "target_height_m", default=None),
+            hover_duration_s=_wire_float(raw, "hover_duration_s", default=None),
+            forward_m=_wire_float(raw, "forward_m", default=None),
+            left_m=_wire_float(raw, "left_m", default=None),
+            translation_velocity_mps=_wire_float(raw, "translation_velocity_mps", default=None),
+            takeoff_confirmed=_wire_bool(raw, "takeoff_confirmed", default=False),
+            aborted=_wire_bool(raw, "aborted", default=False),
+            abort_reason=_wire_optional_string(raw, "abort_reason", max_len=256),
+            last_message=_wire_optional_string(raw, "last_message", max_len=256),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DroneTelemetryDivergence:
+    """Represent one bounded command-vs-observed divergence event."""
+
+    code: str
+    severity: str
+    message: str
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "DroneTelemetryDivergence":
+        raw = _require_mapping(payload, field="telemetry.divergence")
+        return cls(
+            code=_wire_token(raw, "code"),
+            severity=_wire_token(raw, "severity", default="warning"),
+            message=_wire_string(raw, "message", max_len=512),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DroneTelemetrySnapshot:
+    """Represent one bounded runtime telemetry snapshot from the daemon."""
+
+    profile: str
+    collected_at: str
+    healthy: bool
+    failures: tuple[str, ...]
+    freshness_by_signal: dict[str, float | None]
+    catalog: DroneTelemetryCatalog
+    deck: DroneDeckTelemetrySnapshot
+    power: DronePowerTelemetrySnapshot
+    range: DroneRangeTelemetrySnapshot
+    flight: DroneFlightTelemetrySnapshot
+    link: DroneLinkTelemetrySnapshot
+    failsafe: DroneFailsafeTelemetrySnapshot
+    command: DroneCommandTelemetrySnapshot
+    divergences: tuple[DroneTelemetryDivergence, ...]
+    available_blocks: tuple[str, ...]
+    skipped_blocks: tuple[str, ...]
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "DroneTelemetrySnapshot":
+        raw = _require_mapping(payload, field="telemetry")
+        divergences_raw = raw.get("divergences", [])
+        if divergences_raw is None:
+            divergences_raw = []
+        if not isinstance(divergences_raw, list):
+            raise DroneProtocolError("Twinr drone daemon field 'telemetry.divergences' must be a JSON array")
+        return cls(
+            profile=_wire_token(raw, "profile", default="operator"),
+            collected_at=_wire_string(raw, "collected_at", default="", allow_empty=True, max_len=128),
+            healthy=_wire_bool(raw, "healthy", default=False),
+            failures=_wire_string_tuple(raw, "failures"),
+            freshness_by_signal=_wire_float_mapping(raw, "freshness_by_signal"),
+            catalog=DroneTelemetryCatalog.from_payload(raw.get("catalog")),
+            deck=DroneDeckTelemetrySnapshot.from_payload(raw.get("deck")),
+            power=DronePowerTelemetrySnapshot.from_payload(raw.get("power")),
+            range=DroneRangeTelemetrySnapshot.from_payload(raw.get("range")),
+            flight=DroneFlightTelemetrySnapshot.from_payload(raw.get("flight")),
+            link=DroneLinkTelemetrySnapshot.from_payload(raw.get("link")),
+            failsafe=DroneFailsafeTelemetrySnapshot.from_payload(raw.get("failsafe")),
+            command=DroneCommandTelemetrySnapshot.from_payload(raw.get("command")),
+            divergences=tuple(DroneTelemetryDivergence.from_payload(item) for item in divergences_raw),
+            available_blocks=_wire_string_tuple(raw, "available_blocks"),
+            skipped_blocks=_wire_string_tuple(raw, "skipped_blocks"),
+        )
+
+
+def _wire_optional_int(raw: dict[str, object], key: str) -> int | None:
+    """Read one optional integer field from a daemon payload."""
+
+    value = raw.get(key, None)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise DroneProtocolError(f"Twinr drone daemon field '{key}' must be a JSON number or null")
+    return int(value)
+
+
+@dataclass(frozen=True, slots=True)
 class DroneStateSnapshot:
     """Represent one top-level drone-daemon state snapshot."""
 
@@ -716,6 +1104,7 @@ class DroneStateSnapshot:
     radio_ready: bool
     pose: DronePoseSnapshot
     safety: DroneSafetyStatus
+    telemetry: DroneTelemetrySnapshot | None = None
 
     @classmethod
     def from_payload(cls, payload: object) -> "DroneStateSnapshot":
@@ -730,6 +1119,11 @@ class DroneStateSnapshot:
             radio_ready=_wire_bool(raw, "radio_ready", default=False),
             pose=DronePoseSnapshot.from_payload(raw.get("pose")),
             safety=DroneSafetyStatus.from_payload(raw.get("safety")),
+            telemetry=(
+                None
+                if raw.get("telemetry", None) is None
+                else DroneTelemetrySnapshot.from_payload(raw.get("telemetry"))
+            ),
         )
 
 
@@ -995,6 +1389,26 @@ class RemoteDroneServiceClient:
                 capture_intent="hover_test",
                 max_duration_s=max_duration_s,
                 return_policy="return_and_land",
+            )
+        )
+
+    def create_inspect_local_zone_mission(
+        self,
+        *,
+        target_hint: str = "local inspect zone",
+        capture_intent: str = "scene",
+        max_duration_s: float = _DEFAULT_DRONE_MISSION_TIMEOUT_S,
+        return_policy: str = "return_and_land",
+    ) -> DroneMissionStatus:
+        """Create one bounded local inspect mission."""
+
+        return self.create_mission(
+            DroneMissionRequest(
+                mission_type="inspect_local_zone",
+                target_hint=target_hint,
+                capture_intent=capture_intent,
+                max_duration_s=max_duration_s,
+                return_policy=return_policy,
             )
         )
 

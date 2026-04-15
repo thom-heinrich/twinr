@@ -24,6 +24,7 @@ import os
 import time
 from typing import Any, Callable
 
+from twinr.agent.base_agent.conversation.adaptive_timing import AdaptiveListeningWindow
 from twinr.agent.base_agent.contracts import StreamingSpeechToTextProvider
 from twinr.agent.workflows.listen_timeout_diagnostics import (
     diagnostics_as_details,
@@ -39,7 +40,7 @@ class StreamingAudioTurnRequest:
 
     initial_source: str
     follow_up: bool
-    listening_window: object
+    listening_window: AdaptiveListeningWindow
     listen_source: str
     proactive_trigger: str | None
     speech_start_chunks: int | None
@@ -181,6 +182,10 @@ class StreamingCaptureController:
             },
         )
 
+        loop._ensure_live_audio_turn_supported(
+            initial_source=request.initial_source,
+            listen_source=request.listen_source,
+        )
         self._begin_listening(request)
         capture_started = time.monotonic()
 
@@ -318,6 +323,7 @@ class StreamingCaptureController:
                 "listening",
                 detail=request.listen_source,
                 follow_up_allowed=request.follow_up,
+                wait_id=wait_handle.wait_id,
             )
             committed = loop._wait_for_remote_transcript_commit(
                 wait_handle=wait_handle,
@@ -468,34 +474,12 @@ class StreamingCaptureController:
                 self._mark_streaming_success()
                 raise
             self._mark_streaming_failure(exc)
-            loop.emit(f"turn_controller_fallback={type(exc).__name__}")
-            loop._trace_event(
-                "streaming_audio_capture_fallback",
-                kind="branch",
-                level="WARN",
-                details={"error_type": type(exc).__name__, "path": "streaming_stt"},
-            )
-            capture_result, capture_ms = self._capture_with_recorder(
-                request=request,
-                capture_started=capture_started,
-            )
-            transcript = ""
-            stt_ms = -1
+            loop.emit(f"streaming_audio_capture_failed={type(exc).__name__}")
+            raise
         except Exception as exc:
             self._mark_streaming_failure(exc)
-            loop.emit(f"turn_controller_fallback={type(exc).__name__}")
-            loop._trace_event(
-                "streaming_audio_capture_fallback",
-                kind="branch",
-                level="WARN",
-                details={"error_type": type(exc).__name__, "path": "streaming_stt"},
-            )
-            capture_result, capture_ms = self._capture_with_recorder(
-                request=request,
-                capture_started=capture_started,
-            )
-            transcript = ""
-            stt_ms = -1
+            loop.emit(f"streaming_audio_capture_failed={type(exc).__name__}")
+            raise
 
         return capture_result, transcript, capture_ms, stt_ms
 
@@ -524,7 +508,8 @@ class StreamingCaptureController:
         )
         capture_ms = int((time.monotonic() - capture_started) * 1000)
 
-        if deadline is not None and capture_ms >= int(budget.max_turn_s * 1000):
+        max_turn_s = budget.max_turn_s
+        if deadline is not None and max_turn_s is not None and capture_ms >= int(max_turn_s * 1000):
             loop._trace_event(
                 "streaming_audio_capture_budget_reached",
                 kind="warning",

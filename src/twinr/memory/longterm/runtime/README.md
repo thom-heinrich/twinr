@@ -25,7 +25,7 @@ bounded background writers into the APIs used by agent runtime loops.
 - Build one bounded fast-topic provider context for direct/latency-sensitive reply lanes that only need a few current-topic hints before answering, while surfacing specific required remote-read failures separately from broader backend-unavailable state
 - Expose confirmed durable-memory state explicitly in provider/tool context so meta-memory questions can distinguish stored current facts from generic neighbors
 - Rebuild and persist provenance-rich restart-recall packets after durable-memory mutations so fresh runtime roots retain immediate continuity
-- Centralize bounded query-first object selectors reused by discovery, proactive planning, reflection, sensor-memory compilation, and restart-recall refresh so live runtime paths do not hydrate full remote object snapshots or silently widen seeded neighborhood inputs back into broad compile-source unions
+- Centralize bounded query-first object selectors reused by discovery, proactive planning, reflection, sensor-memory compilation, and restart-recall refresh so live runtime paths do not hydrate full remote object snapshots or silently widen seeded neighborhood inputs back into broad compile-source unions; seeded reflection/sensor event and projection lookups must stay on exact-item plus cached/recent catalog-projection reads instead of cold remote catalog scans
 - Route conversation/multimodal persistence and backfill through storage-owned active working sets plus delta commits so required remote writes do not hydrate full object/conflict/archive state or rewrite whole snapshots before consolidation
 - Prefilter remote-primary online retention candidates from current-head catalog projections before exact hydration, so retention no longer starts from a global active-object sweep
 - Persist one deterministic immediate turn-continuity midterm packet before slower extraction/reflection drains so fresh follow-up recall does not block on the full background writer
@@ -46,10 +46,14 @@ bounded background writers into the APIs used by agent runtime loops.
 - Let graph/midterm readiness fall back from a lagging direct fixed-URI head to the small loadable compatibility current-head contract, so fresh runtime roots stay fail-closed without reintroducing whole-snapshot blob reads or duplicate bootstrap writes
 - Reuse successful remote snapshot probes within one bounded readiness pass so watchdog startup does not refetch the same snapshot twice back-to-back
 - Propagate successful external watchdog attestations back into every owned remote-state adapter so stale local cooldown state cannot contradict the Pi's required-remote gate
+- Let watchdog-owned external readiness reprobes clear a process-local remote cooldown exactly long enough to gather a fresh authoritative proof, so external backend recovery can unblock the Pi without weakening fail-closed foreground turn gating
 - Treat successful required snapshot loads as the decisive health proof inside the warm probe instead of re-running per-store backend status checks after bootstrap
+- keep the backend's own `remote_status.ready` bit authoritative for the final fail-closed readiness verdict, and preserve any successful warm-read probe only as diagnostic evidence when the backend still reports itself unready
 - Split remote readiness into a strict bootstrap pass and a no-bootstrap steady-state watchdog pass so live keepalives can reuse warm remote state without reseeding every snapshot on every tick
 - Expose explicit attestation tiers so lighter current-only probes are visible as degraded/current-only instead of looking archive-safe
-- Keep the external required-remote watchdog archive-inclusive even in steady state so a green watchdog sample remains archive-safe and valid for startup/recovery gating
+- Keep the external required-remote watchdog on one explicit proof contract: live Pi `watchdog_artifact` mode defaults to current-only/`token_fast` readiness, while explicit archive-inclusive mode remains available when startup or recovery must prove archive-safe reads
+- treat a deep readiness proof that satisfies the configured contract as authoritative even when the shallow `/instance ready=false` flag lags behind, so runtime gating follows the stronger query/readiness surface instead of re-failing on a weaker status bit
+- Prove the required fast-topic top-k route with a dedicated readiness timeout budget derived from the remote-read/watchdog contract, instead of reusing the shorter answer-turn fast-topic latency budget
 - Fail closed when any required remote snapshot or shard is unreadable
 - Prewarm generic foreground-read paths plus current object/conflict payload caches before live text-channel traffic so the first real remote-only recall turn can hit a warmed remote cache instead of rebuilding selectors and fetching first-hit payloads on demand
 - Reuse remote snapshot/catalog/item reads through TTL-bounded in-process caches so warmed foreground recall stays sub-second on the Pi without changing remote-only truth semantics
@@ -69,7 +73,7 @@ bounded background writers into the APIs used by agent runtime loops.
 | File | Purpose |
 |---|---|
 | `service.py` | Compatibility shim that preserves the historic import surface while delegating to `service_impl/` |
-| `live_object_selectors.py` | Shared bounded query-first selector layer for live-near reserve/proactive/maintenance object reads, with seeded reflection/sensor neighborhoods kept strict instead of widening back to broad compile-source unions |
+| `live_object_selectors.py` | Shared bounded query-first selector layer for live-near reserve/proactive/maintenance object reads, with seeded reflection/sensor neighborhoods kept strict and forced onto no-cold-scan event/projection lookups instead of widening back to broad compile-source unions |
 | `prepared_context.py` | Bounded prepared full-context front that stores completed provider/tool prompt artifacts, coalesces transcript-first speculative builds, and refreshes or invalidates them after durable-memory changes |
 | `provider_answer_front.py` | Runtime manager for remote-backed materialized live provider answer fronts, with transcript-first prewarm coalescing, local hot-cache reuse, and strict live consumption |
 | `context_snapshot.py` | Small runtime dataclass that captures the latest built provider/tool context for operator inspection |

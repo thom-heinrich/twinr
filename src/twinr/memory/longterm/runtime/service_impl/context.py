@@ -35,7 +35,9 @@ from .compat import (
 # April 3, 2026 showed real rewrite latency around 1.1s to 2.8s; the previous
 # 350ms budget systematically missed first-turn graph/subtext personalization.
 _PROVIDER_QUERY_REWRITE_WAIT_S = 3.0
-_PREWARM_QUERY_REWRITE_WAIT_S = 3.0
+# Prewarm is speculative by definition. It must never wait on canonical query
+# rewrite before returning to the foreground voice turn.
+_PREWARM_QUERY_REWRITE_WAIT_S = 0.0
 
 
 class LongTermMemoryServiceContextMixin(ServiceMixinBase):
@@ -413,9 +415,15 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
 
         started_at = time.monotonic()
         try:
-            query = self.query_rewriter.profile(query_text)
+            with workflow_span(
+                name="longterm_service_profile_tool_query",
+                kind="retrieval",
+                details={"query_present": bool(str(query_text or "").strip())},
+            ):
+                query = self.query_rewriter.profile(query_text)
             writer_details = _writer_state_details(getattr(self, "writer", None))
             multimodal_writer_details = _writer_state_details(getattr(self, "multimodal_writer", None))
+            prepared_context_front = getattr(self, "prepared_context_front", None)
             with workflow_span(
                 name="longterm_service_build_tool_provider_context",
                 kind="retrieval",
@@ -434,22 +442,35 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
                         "multimodal_writer": multimodal_writer_details,
                     },
                 )
-                resolution = self._consume_prepared_context(
-                    profile="tool",
-                    query=query,
-                    build_context=lambda: self._build_tool_provider_context_uncached(
+                with workflow_span(
+                    name="longterm_service_resolve_tool_context",
+                    kind="retrieval",
+                    details={
+                        "prepared_front_available": prepared_context_front is not None,
+                        "include_graph_fallback": include_graph_fallback,
+                    },
+                ):
+                    resolution = self._consume_prepared_context(
+                        profile="tool",
                         query=query,
-                        original_query_text=query_text,
-                        include_graph_fallback=include_graph_fallback,
-                    ),
-                )
+                        build_context=lambda: self._build_tool_provider_context_uncached(
+                            query=query,
+                            original_query_text=query_text,
+                            include_graph_fallback=include_graph_fallback,
+                        ),
+                    )
                 tool_context = resolution.context
-                self._remember_context_snapshot(
-                    profile="tool",
-                    query=query,
-                    context=tool_context,
-                    source=resolution.source,
-                )
+                with workflow_span(
+                    name="longterm_service_remember_tool_context_snapshot",
+                    kind="cache",
+                    details={"prepared_source": resolution.source},
+                ):
+                    self._remember_context_snapshot(
+                        profile="tool",
+                        query=query,
+                        context=tool_context,
+                        source=resolution.source,
+                    )
                 workflow_event(
                     kind="retrieval",
                     msg="longterm_tool_provider_context_built",
@@ -463,7 +484,7 @@ class LongTermMemoryServiceContextMixin(ServiceMixinBase):
             raise
         except Exception:
             logger.exception("Failed to build tool-facing long-term provider context.")
-            return LongTermMemoryContext()
+            raise
         finally:
             record_voice_turn_remote_memory_ready(
                 duration_ms=max(0.0, (time.monotonic() - started_at) * 1000.0),

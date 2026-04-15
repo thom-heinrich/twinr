@@ -1,10 +1,10 @@
-"""Capture bounded still photos from local devices, Raspberry Pi camera stacks, AI-Deck streams, or a proxy.
+"""Capture bounded still photos from local devices, Pi camera stacks, AI-Deck streams, or a proxy.
 
-This module wraps ``ffmpeg`` for direct V4L2 capture, supports first-class
-``rpicam-still`` capture for Raspberry Pi libcamera stacks, falls back between
-those paths when appropriate, and can also fetch one bounded still frame from a
-peer HTTP snapshot proxy or a Bitcraze AI-Deck WiFi stream while preserving the
-same upstream ``CapturedPhoto`` contract.
+This module wraps ``ffmpeg`` for direct V4L2 capture, supports explicit
+``rpicam-still`` capture for Raspberry Pi libcamera stacks through
+``rpicam://`` or ``libcamera://`` device URIs, and can also fetch one bounded
+still frame from a peer HTTP snapshot proxy or a Bitcraze AI-Deck WiFi stream
+while preserving the same upstream ``CapturedPhoto`` contract.
 """
 
 from __future__ import annotations
@@ -29,18 +29,21 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 try:  # Optional frontier transport; stdlib fallback remains available.
     import httpx  # type: ignore[import-not-found]
 except Exception:  # pragma: no cover - optional dependency
-    httpx = None
+    httpx = None  # type: ignore[assignment]
 
 from twinr.agent.base_agent.config import TwinrConfig
 
 # CHANGELOG: 2026-03-28
-# BUG-1: Fixed Raspberry Pi libcamera fallback being incorrectly limited to /dev/video0, which broke valid CSI camera nodes on /dev/video1+.
-# BUG-2: Added MJPEG to FFmpeg V4L2 probing and enabled rpicam-still capture when ffmpeg is absent but the Pi camera stack is present.
+# BUG-1: Removed implicit V4L2-to-rpicam backend switching so still capture now
+#        stays on the configured lane and fails closed on lane mismatch.
+# BUG-2: Added MJPEG to FFmpeg V4L2 probing for broader USB/UVC compatibility
+#        without crossing over into the Pi libcamera backend.
 # SEC-1: Bounded HTTP snapshot reads, disabled implicit environment proxies, and disabled redirects for peer snapshot fetches.
 # SEC-2: Validated PNG geometry from remote snapshots before accepting payloads, blocking oversized-image and decompression-bomb style memory abuse.
 # IMP-1: Added a first-class rpicam:// / libcamera:// backend with metadata-rich still capture via rpicam-still.
 # IMP-2: Enriched CapturedPhoto with optional width/height/backend/metadata/timestamp fields while keeping the old constructor call pattern compatible.
 # IMP-3: Prefer /dev/shm for temporary Pi camera files to reduce SD-card I/O and latency.
+# IMP-4: Fail closed early when a configured `/dev/video*` node is really the Pi libcamera/unicam lane, so Twinr surfaces the explicit `rpicam://` contract instead of burning the full ffmpeg timeout.
 
 _DEFAULT_FFMPEG_FORMAT_CANDIDATES = (None, "mjpeg", "yuyv422", "bayer_grbg8")
 _DEFAULT_CAPTURE_TIMEOUT_SECONDS = 10.0
@@ -61,6 +64,8 @@ _LIBCAMERA_DEVICE_SCHEME = "libcamera://"
 _RPICAM_STILL_MIN_TIMEOUT_MS = 1000
 _RPICAM_STILL_MAX_TIMEOUT_MS = 5000
 _UNICAM_IMAGE_MARKER = "unicam-image"
+_UNICAM_DRIVER_MARKER = "driver name   : unicam"
+_V4L2_IDENTITY_TIMEOUT_SECONDS = 1.5
 _HTTP_SNAPSHOT_INPUT_FORMAT = "http-snapshot"
 _HTTP_ALLOWED_SCHEMES = frozenset({"http", "https"})
 _HTTP_LOCAL_HOSTS = frozenset({"localhost"})
@@ -129,9 +134,9 @@ class V4L2StillCamera:
     """Capture one still frame from a local camera device.
 
     The primary path uses bounded ``ffmpeg`` reads from one configured V4L2
-    device. For Raspberry Pi CSI camera nodes backed by the libcamera stack,
-    this adapter can fall back to ``rpicam-still`` when the V4L2 node is busy,
-    missing, or otherwise unsuitable.
+    device. Raspberry Pi libcamera stacks use the dedicated
+    ``RPiCamStillCamera`` path instead of switching backends implicitly from a
+    ``/dev/video*`` node at capture time.
     """
 
     _device_locks: ClassVar[dict[str, threading.Lock]] = {}
@@ -148,8 +153,6 @@ class V4L2StillCamera:
         input_format: str | None = None,
         capture_timeout_seconds: float = _DEFAULT_CAPTURE_TIMEOUT_SECONDS,
         output_root: str | Path | None = None,
-        prefer_rpicam_still: bool | None = None,
-        rpicam_camera_index: int | None = None,
     ) -> None:
         self.device = self._validate_device(device)
         self.width = self._validate_positive_int("width", width)
@@ -161,10 +164,6 @@ class V4L2StillCamera:
             "capture_timeout_seconds", capture_timeout_seconds
         )
         self.output_root = self._normalize_output_root(output_root)
-        self.prefer_rpicam_still = self._normalize_optional_bool("prefer_rpicam_still", prefer_rpicam_still)
-        self.rpicam_camera_index = self._normalize_optional_non_negative_int(
-            "rpicam_camera_index", rpicam_camera_index
-        )
         self._capture_lock = self._get_device_lock(self.device)
 
     @classmethod
@@ -172,7 +171,6 @@ class V4L2StillCamera:
         """Build a still camera from ``TwinrConfig`` values."""
 
         device = getattr(config, "camera_device", None)
-        camera_backend = str(getattr(config, "camera_backend", "") or "").strip().casefold()
         normalized_device = device.strip() if isinstance(device, str) else device
 
         if isinstance(normalized_device, str) and normalized_device.lower().startswith(_AIDECK_DEVICE_SCHEME):
@@ -188,12 +186,10 @@ class V4L2StillCamera:
                 wifi_connection_manager=AIDeckWifiConnectionManager.from_config(config),
             )
 
-        if camera_backend in {"rpicam", "libcamera"} or (
-            isinstance(normalized_device, str) and cls._is_rpicam_device_string(normalized_device)
-        ):
+        if isinstance(normalized_device, str) and cls._is_rpicam_device_string(normalized_device):
             return RPiCamStillCamera(
                 camera_index=cls._parse_rpicam_camera_index(
-                    getattr(config, "camera_rpicam_index", None),
+                    None,
                     device=normalized_device if isinstance(normalized_device, str) else None,
                 ),
                 width=config.camera_width,
@@ -231,8 +227,6 @@ class V4L2StillCamera:
                 config, "camera_capture_timeout_seconds", _DEFAULT_CAPTURE_TIMEOUT_SECONDS
             ),
             output_root=getattr(config, "camera_capture_output_dir", None),
-            prefer_rpicam_still=getattr(config, "camera_prefer_rpicam_still", None),
-            rpicam_camera_index=getattr(config, "camera_rpicam_index", None),
         )
 
     async def capture_photo_async(
@@ -256,46 +250,19 @@ class V4L2StillCamera:
         attempted_formats = tuple(self._candidate_input_formats())
         errors: list[str] = []
         timeout_error: CameraCaptureTimeoutError | None = None
+        self._fail_if_pi_libcamera_v4l2_lane_mismatch()
         ffmpeg_binary = shutil.which(self.ffmpeg_path)
+        if ffmpeg_binary is None:
+            raise CameraConfigurationError(
+                (
+                    f"ffmpeg was not found on PATH: {self.ffmpeg_path}. "
+                    "For Raspberry Pi libcamera cameras, configure an explicit "
+                    "rpicam://<index> or libcamera://<index> camera_device instead of a /dev/video* node."
+                ),
+                user_safe_message="The camera software is not installed correctly.",
+            )
 
         with self._capture_lock:
-            if self.prefer_rpicam_still or ffmpeg_binary is None:
-                if self._can_use_rpicam_backend():
-                    try:
-                        return self._capture_with_rpicam_still(
-                            safe_filename=safe_filename,
-                            output_path=output_path,
-                            source_device=self.device,
-                            prior_errors=(),
-                        )
-                    except CameraCaptureTimeoutError as exc:
-                        timeout_error = exc
-                        errors.append(f"rpicam-still: timeout after {self.capture_timeout_seconds:.1f}s")
-                    except CameraConfigurationError as exc:
-                        if ffmpeg_binary is None:
-                            raise
-                        errors.append(f"rpicam-still: {self._summarize_exception_message(exc)}")
-                    except CameraError as exc:
-                        errors.append(f"rpicam-still: {self._summarize_exception_message(exc)}")
-                elif ffmpeg_binary is None:
-                    raise CameraConfigurationError(
-                        "ffmpeg was not found and the configured device cannot use the Raspberry Pi camera stack.",
-                        user_safe_message="The camera software is not installed correctly.",
-                    )
-
-            if ffmpeg_binary is None:
-                if timeout_error is not None:
-                    raise timeout_error
-                if errors:
-                    raise CameraCaptureFailedError(
-                        f"Camera capture failed for {self.device}: {' | '.join(errors)}",
-                        user_safe_message="The camera could not take a photo right now. Please try again.",
-                    )
-                raise CameraConfigurationError(
-                    f"ffmpeg was not found on PATH: {self.ffmpeg_path}",
-                    user_safe_message="The camera software is not installed correctly.",
-                )
-
             for candidate in attempted_formats:
                 label = candidate or "default"
                 try:
@@ -344,14 +311,6 @@ class V4L2StillCamera:
                 if result.returncode == 0 and result.stdout and not self._is_png_bytes(result.stdout):
                     stderr = "ffmpeg returned non-PNG bytes"
                 errors.append(f"{label}: {stderr}")
-
-            fallback_capture = self._maybe_capture_with_rpicam_still(
-                safe_filename=safe_filename,
-                output_path=output_path,
-                errors=errors,
-            )
-            if fallback_capture is not None:
-                return fallback_capture
             if timeout_error is not None:
                 raise timeout_error
 
@@ -360,6 +319,32 @@ class V4L2StillCamera:
             f"Camera capture failed for {self.device} with formats [{candidates}]: {' | '.join(errors)}",
             user_safe_message="The camera could not take a photo right now. Please try again.",
         )
+
+    def _fail_if_pi_libcamera_v4l2_lane_mismatch(self) -> None:
+        """Reject Pi libcamera/unicam V4L2 nodes that require the explicit rpicam lane."""
+
+        v4l2_binary = shutil.which("v4l2-ctl")
+        if v4l2_binary is None:
+            return
+        try:
+            result = subprocess.run(
+                [v4l2_binary, "-d", self.device, "-D"],
+                check=False,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                timeout=min(self.capture_timeout_seconds, _V4L2_IDENTITY_TIMEOUT_SECONDS),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return
+        probe_text = self._decode_process_output(result.stdout, result.stderr)
+        if result.returncode == 0 and self._looks_like_pi_libcamera_v4l2_identity(probe_text):
+            raise CameraConfigurationError(
+                (
+                    f"Camera device {self.device} is backed by the Raspberry Pi libcamera/unicam stack. "
+                    "Configure an explicit rpicam://<index> or libcamera://<index> camera_device instead of a /dev/video* node."
+                ),
+                user_safe_message="The camera is configured on the wrong lane. Please switch Twinr to the Raspberry Pi camera device.",
+            )
 
     def _candidate_input_formats(self) -> Sequence[str | None]:
         return (self.input_format,) if self.input_format else _DEFAULT_FFMPEG_FORMAT_CANDIDATES
@@ -383,24 +368,20 @@ class V4L2StillCamera:
         command.extend(["-i", self.device, "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"])
         return command
 
-    def _maybe_capture_with_rpicam_still(
-        self,
-        *,
-        safe_filename: str,
-        output_path: str | Path | None,
-        errors: Sequence[str],
-    ) -> CapturedPhoto | None:
-        if not self._should_try_rpicam_still(errors):
-            return None
-        try:
-            return self._capture_with_rpicam_still(
-                safe_filename=safe_filename,
-                output_path=output_path,
-                source_device=self.device,
-                prior_errors=errors,
-            )
-        except CameraConfigurationError:
-            return None
+    @staticmethod
+    def _decode_process_output(stdout: object, stderr: object) -> str:
+        parts: list[str] = []
+        for value in (stdout, stderr):
+            if isinstance(value, bytes):
+                parts.append(value.decode("utf-8", errors="replace"))
+            elif isinstance(value, str):
+                parts.append(value)
+        return "\n".join(part for part in parts if part).lower()
+
+    @staticmethod
+    def _looks_like_pi_libcamera_v4l2_identity(probe_text: str) -> bool:
+        normalized = str(probe_text or "").strip().lower()
+        return _UNICAM_IMAGE_MARKER in normalized or _UNICAM_DRIVER_MARKER in normalized
 
     def _capture_with_rpicam_still(
         self,
@@ -501,48 +482,12 @@ class V4L2StillCamera:
         return command
 
     def _get_rpicam_camera_index(self) -> int | None:
-        return self.rpicam_camera_index
+        return getattr(self, "rpicam_camera_index", None)
 
     def _preferred_temp_dir(self) -> Path:
         if _DEV_SHM_DIR.is_dir() and os.access(_DEV_SHM_DIR, os.W_OK):
             return _DEV_SHM_DIR
         return Path(tempfile.gettempdir())
-
-    def _should_try_rpicam_still(self, errors: Sequence[str]) -> bool:
-        if not errors:
-            return False
-        normalized_errors = tuple(error.casefold() for error in errors)
-        device_sysfs_name = self._device_sysfs_name().casefold()
-        is_unicam = device_sysfs_name == _UNICAM_IMAGE_MARKER
-
-        if any("resource busy" in error or "timeout" in error for error in normalized_errors):
-            return is_unicam
-        if any(
-            "cannot open video device" in error and "no such file or directory" in error
-            for error in normalized_errors
-        ):
-            return self._looks_like_video_device() and (is_unicam or not Path(self.device).exists())
-        if any("invalid argument" in error or "operation not permitted" in error for error in normalized_errors):
-            return is_unicam
-        return False
-
-    def _can_use_rpicam_backend(self) -> bool:
-        return (
-            self.rpicam_camera_index is not None
-            or self._device_sysfs_name().casefold() == _UNICAM_IMAGE_MARKER
-            or (self._looks_like_video_device() and not Path(self.device).exists())
-        )
-
-    def _looks_like_video_device(self) -> bool:
-        path = Path(self.device)
-        return path.is_absolute() and str(path).startswith("/dev/") and path.name.startswith("video")
-
-    def _device_sysfs_name(self) -> str:
-        node_name = Path(self.device).name
-        try:
-            return (Path("/sys/class/video4linux") / node_name / "name").read_text(encoding="utf-8").strip()
-        except OSError:
-            return ""
 
     def _rpicam_still_timeout_ms(self) -> int:
         timeout_ms = int(self.capture_timeout_seconds * 1000.0)
@@ -887,7 +832,6 @@ class RPiCamStillCamera(V4L2StillCamera):
             "capture_timeout_seconds", capture_timeout_seconds
         )
         self.output_root = self._normalize_output_root(output_root)
-        self.prefer_rpicam_still = True
         self.rpicam_camera_index = self.camera_index
         self._capture_lock = self._get_device_lock(self.device)
 
@@ -983,7 +927,10 @@ class SnapshotProxyStillCamera(V4L2StillCamera):
             expected_max_height=self.height,
             max_pixels=self.width * self.height,
         )
-        metadata = {"http_content_type": self._normalize_content_type(raw_content_type), "backend": backend}
+        metadata: dict[str, object] = {
+            "http_content_type": self._normalize_content_type(raw_content_type),
+            "backend": backend,
+        }
         capture = CapturedPhoto(
             data=payload,
             content_type="image/png",

@@ -45,6 +45,14 @@ _DEFAULT_ASYNC_ATTESTATION_POLL_S = 0.05
 _MAX_NAMESPACE_LENGTH = 255
 _MAX_SNAPSHOT_KIND_LENGTH = 255
 _MAX_DOCUMENT_HINTS_BYTES = 262_144
+_EXPLICIT_REMOTE_TRANSIENT_DETAILS = frozenset(
+    {
+        "service warmup in progress",
+        "upstream unavailable or restarting",
+        "warmup_pending",
+        "query_surface_unhealthy: warmup_pending",
+    }
+)
 
 
 def _utcnow_iso() -> str:
@@ -57,6 +65,13 @@ def _normalize_text(value: str | None) -> str:
     """Collapse arbitrary text-like input to normalized single-spaced text."""
 
     return " ".join(str(value or "").split()).strip()
+
+
+def is_explicit_remote_transient_detail(detail: str | None) -> bool:
+    """Return whether one backend detail explicitly reports restart/warmup transit."""
+
+    normalized = _normalize_text(detail).lower()
+    return normalized in _EXPLICIT_REMOTE_TRANSIENT_DETAILS
 
 
 def remote_snapshot_document_hints_path(config: TwinrConfig) -> Path | None:
@@ -141,9 +156,16 @@ def _coerce_float(
 ) -> float:
     """Coerce numeric config to a finite float inside inclusive bounds."""
 
-    try:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
         parsed = float(value)
-    except (TypeError, ValueError):
+    elif isinstance(value, str):
+        try:
+            parsed = float(value)
+        except ValueError:
+            return default
+    else:
         return default
     if not math.isfinite(parsed):
         return default
@@ -241,10 +263,10 @@ def _store_result_failure_detail(result: Mapping[str, object] | None) -> str | N
                     failures.append(f"item[{index}] rejected")
     if failures:
         return "; ".join(failures)
-    detail = _normalize_text(result.get("detail"))
+    detail = _normalize_text(str(result.get("detail") or ""))
     if detail:
         return detail
-    error = _normalize_text(result.get("error"))
+    error = _normalize_text(str(result.get("error") or ""))
     if error:
         return error
     return None
@@ -299,11 +321,18 @@ class LongTermRemoteReadFailedError(LongTermRemoteUnavailableError):
 
 @dataclass(frozen=True, slots=True)
 class LongTermRemoteStatus:
-    """Describe whether the remote snapshot backend is ready for use."""
+    """Describe whether the remote snapshot backend is ready for use.
+
+    `ready=False` can still allow one deeper operational readiness proof when
+    the shallow backend status route responded but withheld its startup-ready
+    bit. That state is surfaced explicitly via `operational_probe_allowed`
+    instead of overloading `ready=True`.
+    """
 
     mode: str
     ready: bool
     detail: str | None = None
+    operational_probe_allowed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -477,5 +506,6 @@ __all__ = [
     "_store_result_failure_detail",
     "_strip_text",
     "_utcnow_iso",
+    "is_explicit_remote_transient_detail",
     "remote_snapshot_document_hints_path",
 ]

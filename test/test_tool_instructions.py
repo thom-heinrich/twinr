@@ -127,6 +127,9 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("manual button path still remains available", instructions)
         self.assertIn("ask one short follow-up question for the quiet duration", instructions)
         self.assertIn("Do not answer a quiet-mode status question from conversational memory", instructions)
+        self.assertIn("review_saved_memories tool", instructions)
+        self.assertIn("previously saved with remember_memory", instructions)
+        self.assertIn("If review_saved_memories returns confirmation_required", instructions)
 
     def test_compact_tool_instructions_cover_portrait_identity_guidance(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -155,6 +158,8 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("manual button path still works", instructions)
         self.assertIn("ask one short follow-up question for the duration", instructions)
         self.assertIn("Do not answer a quiet-mode status question from reassurance", instructions)
+        self.assertIn("use review_saved_memories instead of answering from hidden memory context", instructions)
+        self.assertIn("If review_saved_memories returns confirmation_required", instructions)
 
     def test_discovery_instructions_cover_semantic_intents_and_self_disclosure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

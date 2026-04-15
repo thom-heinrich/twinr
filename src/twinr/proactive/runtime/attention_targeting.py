@@ -384,17 +384,20 @@ class MultimodalAttentionTargetTracker:
                     else "active_visible_speaker"
                 ),
                 speaker_locked=True,
-                confidence=mean_confidence(
-                    (
-                        None if continuous_target is None else continuous_target.confidence,
-                        None if current_speaker_association is None else _coerce_optional_ratio_attr(
-                            current_speaker_association,
-                            "confidence",
-                        ),
-                        _camera_anchor_confidence(camera_policy),
-                    )
-                )
-                or 0.82,
+                confidence=_continuous_backed_confidence(
+                    continuous_target=continuous_target,
+                    fused_confidence=mean_confidence(
+                        (
+                            None if continuous_target is None else continuous_target.confidence,
+                            None if current_speaker_association is None else _coerce_optional_ratio_attr(
+                                current_speaker_association,
+                                "confidence",
+                            ),
+                            _camera_anchor_confidence(camera_policy),
+                        )
+                    ),
+                    fallback=0.82,
+                ),
             )
 
         if current_anchor is not None and showing_intent_active and not _showing_intent_must_yield(
@@ -424,15 +427,18 @@ class MultimodalAttentionTargetTracker:
                 anchor=showing_anchor,
                 state="showing_intent_visible_person",
                 showing_intent_active=True,
-                confidence=mean_confidence(
-                    (
-                        None if continuous_target is None else continuous_target.confidence,
-                        _camera_anchor_confidence(camera_policy),
-                        coerce_optional_ratio(camera_policy.get("visual_attention_score")),
-                        0.82,
-                    )
-                )
-                or 0.82,
+                confidence=_continuous_backed_confidence(
+                    continuous_target=continuous_target,
+                    fused_confidence=mean_confidence(
+                        (
+                            None if continuous_target is None else continuous_target.confidence,
+                            _camera_anchor_confidence(camera_policy),
+                            coerce_optional_ratio(camera_policy.get("visual_attention_score")),
+                            0.82,
+                        )
+                    ),
+                    fallback=0.82,
+                ),
             )
 
         focus_anchor = self._resolve_focus_anchor(
@@ -485,13 +491,16 @@ class MultimodalAttentionTargetTracker:
                     presence_session_id=presence_session_id,
                     anchor=current_anchor,
                     state=continuous_target.state,
-                    confidence=mean_confidence(
-                        (
-                            continuous_target.confidence,
-                            _camera_anchor_confidence(camera_policy),
-                        )
-                    )
-                    or 0.74,
+                    confidence=_continuous_backed_confidence(
+                        continuous_target=continuous_target,
+                        fused_confidence=mean_confidence(
+                            (
+                                continuous_target.confidence,
+                                _camera_anchor_confidence(camera_policy),
+                            )
+                        ),
+                        fallback=0.74,
+                    ),
                     speaker_locked=continuous_target.speaker_locked,
                     showing_intent_active=showing_intent_active,
                 )
@@ -513,14 +522,17 @@ class MultimodalAttentionTargetTracker:
                     anchor=matched_anchor,
                     state="session_focus_visible_person",
                     session_focus_active=True,
-                    confidence=mean_confidence(
-                        (
-                            None if continuous_target is None else continuous_target.confidence,
-                            _camera_anchor_confidence(camera_policy),
-                            _focus_anchor_confidence(identity_fusion, camera_policy),
-                        )
-                    )
-                    or 0.76,
+                    confidence=_continuous_backed_confidence(
+                        continuous_target=continuous_target,
+                        fused_confidence=mean_confidence(
+                            (
+                                None if continuous_target is None else continuous_target.confidence,
+                                _camera_anchor_confidence(camera_policy),
+                                _focus_anchor_confidence(identity_fusion, camera_policy),
+                            )
+                        ),
+                        fallback=0.76,
+                    ),
                 )
             visible_track_count = None if continuous_target is None else continuous_target.visible_track_count
             person_count = coerce_optional_int(camera_policy.get("person_count"))
@@ -543,13 +555,16 @@ class MultimodalAttentionTargetTracker:
                 presence_session_id=presence_session_id,
                 anchor=current_anchor,
                 state="visible_primary_person",
-                confidence=mean_confidence(
-                    (
-                        None if continuous_target is None else continuous_target.confidence,
-                        _camera_anchor_confidence(camera_policy),
-                    )
-                )
-                or 0.7,
+                confidence=_continuous_backed_confidence(
+                    continuous_target=continuous_target,
+                    fused_confidence=mean_confidence(
+                        (
+                            None if continuous_target is None else continuous_target.confidence,
+                            _camera_anchor_confidence(camera_policy),
+                        )
+                    ),
+                    fallback=0.7,
+                ),
             )
 
         if focus_anchor is not None and _allow_focus_hold(camera=camera_policy, runtime_status=normalized_runtime_status):
@@ -737,6 +752,27 @@ def _snapshot_from_anchor(
         showing_intent_active=showing_intent_active,
         confidence=round(max(0.0, min(1.0, confidence)), 4),
     )
+
+
+def _continuous_backed_confidence(
+    *,
+    continuous_target: ContinuousAttentionTargetSnapshot | None,
+    fused_confidence: float | None,
+    fallback: float,
+) -> float:
+    """Keep multimodal confidence from undercutting an already-active visible target.
+
+    The multimodal attention tracker often reuses the anchor that the continuous
+    visible-person tracker already selected as active. Additional speaker/focus
+    evidence can refine that target, but it should not drag the downstream
+    confidence below the base visible-target confidence and make servo/display
+    consumers reject a target that was already chosen as active.
+    """
+
+    resolved_confidence = fallback if fused_confidence is None else float(fused_confidence)
+    if continuous_target is None or continuous_target.active is not True:
+        return resolved_confidence
+    return max(resolved_confidence, float(continuous_target.confidence))
 
 
 def _camera_anchor(
@@ -1018,10 +1054,13 @@ def _normalize_optional_text(value: object | None) -> str | None:
 def _coerce_optional_float(value: object | None) -> float | None:
     if value is None or isinstance(value, bool):
         return None
-    try:
+    if isinstance(value, (int, float)):
         numeric = float(value)
-    except (TypeError, ValueError):
-        return None
+    else:
+        try:
+            numeric = float(str(value))
+        except (TypeError, ValueError):
+            return None
     if not math.isfinite(numeric):
         return None
     return numeric

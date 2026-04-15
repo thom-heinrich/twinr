@@ -5,9 +5,11 @@ from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import stat
+import threading
 from types import SimpleNamespace
 import sys
 import tempfile
+from typing import cast
 import unittest
 from unittest.mock import patch
 
@@ -23,12 +25,14 @@ from twinr.agent.base_agent.runtime.display_grounding import (
     _config_cache_key,
     build_active_display_grounding_instruction_overlay,
 )
+from twinr.agent.base_agent.runtime.flow import TwinrRuntimeFlowMixin
 from twinr.agent.base_agent.state import snapshot as state_snapshot_module
 from twinr.agent.base_agent.runtime.snapshot import TwinrRuntimeSnapshotMixin
 from twinr.agent.base_agent.runtime.runtime import TwinrRuntime
 from twinr.agent.base_agent.state.machine import TwinrStatus
 from twinr.memory.longterm.core.models import LongTermMemoryContext
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
+from twinr.memory.user_discovery_authoritative_profile import UserDiscoveryAuthoritativeProfileReader
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshotStore
 from twinr.display.ambient_impulse_cues import DisplayAmbientImpulseController
 
@@ -36,6 +40,13 @@ from twinr.display.ambient_impulse_cues import DisplayAmbientImpulseController
 class _SnapshotLockProbe(TwinrRuntimeSnapshotMixin):
     def __init__(self, snapshot_store: object) -> None:
         self.snapshot_store = snapshot_store
+
+
+class _BrokenRuntimeFlowHost(TwinrRuntimeFlowMixin):
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "_twinr_runtime_flow_state":
+            raise RuntimeError("attachment refused")
+        object.__setattr__(self, name, value)
 
 
 class RuntimeContextTests(unittest.TestCase):
@@ -798,6 +809,111 @@ class RuntimeContextTests(unittest.TestCase):
             finally:
                 runtime.shutdown(timeout_s=1.0)
 
+    def test_tool_provider_context_discovery_status_does_not_wait_for_memory_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = TwinrRuntime(config=self._config(temp_dir))
+            release_lock = threading.Event()
+            lock_held = threading.Event()
+            holder_error: list[Exception] = []
+            context_error: list[Exception] = []
+            context_result: list[tuple[tuple[str, str], ...]] = []
+            holder: threading.Thread | None = None
+            worker: threading.Thread | None = None
+            try:
+                runtime.long_term_memory = SimpleNamespace(  # type: ignore[assignment]
+                    build_tool_provider_context=lambda query_text, **kwargs: LongTermMemoryContext(),
+                )
+
+                def _hold_memory_lock() -> None:
+                    try:
+                        with runtime._memory_runtime_lock():
+                            lock_held.set()
+                            release_lock.wait(timeout=2.0)
+                    except Exception as exc:  # pragma: no cover - defensive cleanup only
+                        holder_error.append(exc)
+                        lock_held.set()
+
+                def _build_context() -> None:
+                    try:
+                        context_result.append(runtime.tool_provider_conversation_context())
+                    except Exception as exc:  # pragma: no cover - asserted below
+                        context_error.append(exc)
+
+                holder = threading.Thread(target=_hold_memory_lock, name="test-memory-lock-holder")
+                holder.start()
+                self.assertTrue(lock_held.wait(timeout=1.0))
+
+                worker = threading.Thread(target=_build_context, name="test-tool-context-builder")
+                worker.start()
+                worker.join(timeout=0.5)
+
+                self.assertFalse(worker.is_alive(), "tool provider context blocked on discovery status")
+                self.assertFalse(holder_error)
+                self.assertFalse(context_error)
+                self.assertTrue(context_result)
+                system_messages = [content for role, content in context_result[0] if role == "system"]
+                self.assertTrue(
+                    any("Guided user-discovery is available for this turn." in message for message in system_messages)
+                )
+            finally:
+                release_lock.set()
+                if worker is not None:
+                    worker.join(timeout=1.0)
+                if holder is not None:
+                    holder.join(timeout=1.0)
+                runtime.shutdown(timeout_s=1.0)
+
+    def test_tool_provider_context_discovery_status_does_not_wait_for_authoritative_profile_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = TwinrRuntime(config=self._config(temp_dir))
+            release_reader = threading.Event()
+            reader_called = threading.Event()
+            context_error: list[Exception] = []
+            context_result: list[tuple[tuple[str, str], ...]] = []
+            worker: threading.Thread | None = None
+            try:
+                runtime.long_term_memory = SimpleNamespace(  # type: ignore[assignment]
+                    build_tool_provider_context=lambda query_text, **kwargs: LongTermMemoryContext(),
+                )
+                service = runtime._user_discovery_service()
+
+                def _blocking_authoritative_load() -> object:
+                    reader_called.set()
+                    release_reader.wait(timeout=2.0)
+                    return SimpleNamespace(covers=lambda _topic_id: False)
+
+                service.authoritative_profile_reader = cast(
+                    UserDiscoveryAuthoritativeProfileReader,
+                    SimpleNamespace(load=_blocking_authoritative_load),
+                )
+
+                def _build_context() -> None:
+                    try:
+                        context_result.append(runtime.tool_provider_conversation_context())
+                    except Exception as exc:  # pragma: no cover - asserted below
+                        context_error.append(exc)
+
+                worker = threading.Thread(target=_build_context, name="test-tool-context-authoritative-reader")
+                worker.start()
+                worker.join(timeout=0.5)
+
+                self.assertFalse(worker.is_alive(), "tool provider context blocked on discovery authoritative profile")
+                self.assertFalse(context_error)
+                self.assertTrue(context_result)
+                self.assertFalse(
+                    reader_called.is_set(),
+                    "runtime context status unexpectedly triggered authoritative discovery reads",
+                )
+                system_messages = [content for role, content in context_result[0] if role == "system"]
+                self.assertTrue(
+                    any("Guided user-discovery is available for this turn." in message for message in system_messages)
+                )
+            finally:
+                release_reader.set()
+                if worker is not None:
+                    worker.join(timeout=1.0)
+                runtime.shutdown(timeout_s=1.0)
+
     def test_tiny_recent_tool_context_skips_remote_lookup_and_keeps_bounded_guidance(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             runtime = TwinrRuntime(config=self._config(temp_dir))
@@ -852,6 +968,82 @@ class RuntimeContextTests(unittest.TestCase):
                     "search_provider_conversation_context",
                 )
                 self.assertTrue(payload["details"]["summary"]["present"])
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
+    def test_follow_up_carryover_trace_failures_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = TwinrRuntime(config=self._config(temp_dir))
+            runtime._trace_event = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom"))  # type: ignore[attr-defined]
+            try:
+                remember_pending_conversation_follow_up_hint(
+                    runtime,
+                    summary="Recent turns: user=wie spaet ist es in New York; assistant=In New York ist es gerade 10:53 Uhr.",
+                )
+                with pending_conversation_follow_up_hint_scope(runtime, active=True):
+                    with self.assertRaisesRegex(RuntimeError, "boom"):
+                        runtime.search_provider_conversation_context()
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
+    def test_tool_provider_context_emits_stage_metrics_and_long_term_plan_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = TwinrRuntime(config=self._config(temp_dir))
+            traces: list[tuple[str, dict[str, object]]] = []
+            decisions: list[tuple[str, dict[str, object]]] = []
+            runtime._trace_event = lambda msg, **kwargs: traces.append((msg, kwargs))  # type: ignore[attr-defined]
+            runtime._trace_decision = lambda msg, **kwargs: decisions.append((msg, kwargs))  # type: ignore[attr-defined]
+            runtime._trace_span = lambda **_kwargs: nullcontext()  # type: ignore[attr-defined]
+            calls: list[dict[str, object]] = []
+            try:
+                runtime.last_transcript = "Was weisst du ueber Janina?"
+
+                class _TracingLongTermMemory:
+                    def build_provider_context(self, query_text):
+                        raise AssertionError("provider context should not be used in this tool-context test")
+
+                    def build_tool_provider_context(self, query_text, **kwargs):
+                        calls.append({"query_text": query_text, "kwargs": dict(kwargs)})
+                        return LongTermMemoryContext(durable_context="Tool durable memory")
+
+                runtime.long_term_memory = _TracingLongTermMemory()
+
+                context = runtime.tool_provider_conversation_context()
+
+                self.assertTrue(any("Tool durable memory" in content for role, content in context if role == "system"))
+                self.assertEqual(
+                    calls,
+                    [
+                        {
+                            "query_text": "Was weisst du ueber Janina?",
+                            "kwargs": {"include_graph_fallback": False},
+                        }
+                    ],
+                )
+                stage_records = [
+                    payload["details"]
+                    for message, payload in traces
+                    if message == "provider_context_stage_complete"
+                ]
+                stages = {str(record["stage"]) for record in stage_records}
+                self.assertTrue(
+                    {
+                        "lock_snapshot",
+                        "voice_guidance",
+                        "retrieval_query",
+                        "conversation_context",
+                        "discovery_guidance",
+                        "long_term_context_load",
+                        "message_assembly",
+                    }.issubset(stages)
+                )
+                long_term_stage = next(record for record in stage_records if record["stage"] == "long_term_context_load")
+                self.assertEqual(long_term_stage["context_builder"], "tool_provider_conversation_context")
+                self.assertEqual(long_term_stage["messages"], 1)
+                self.assertTrue(decisions)
+                decision_message, decision_payload = decisions[-1]
+                self.assertEqual(decision_message, "provider_context_long_term_plan")
+                self.assertEqual(decision_payload["selected"]["id"], "load_remote_context")
             finally:
                 runtime.shutdown(timeout_s=1.0)
 
@@ -989,9 +1181,16 @@ class RuntimeContextTests(unittest.TestCase):
             finally:
                 runtime.shutdown(timeout_s=1.0)
 
-    def test_runtime_startup_degrades_when_remote_long_term_bootstrap_fails(self) -> None:
+    def test_runtime_startup_enters_error_when_remote_long_term_bootstrap_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            config = self._config(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=False,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                runtime_state_path=str(Path(temp_dir) / "state" / "runtime-state.json"),
+            )
 
             class _FailingLongTermMemory:
                 def ensure_remote_ready(self):
@@ -1007,7 +1206,36 @@ class RuntimeContextTests(unittest.TestCase):
                 runtime = TwinrRuntime(config=config)
             try:
                 self.assertIsNotNone(runtime.ops_events)
-                self.assertEqual(runtime.status.value, "waiting")
+                self.assertEqual(runtime.status.value, "error")
+                self.assertEqual(runtime.lifecycle_phase.value, "failed")
+                self.assertEqual(runtime.startup_failed_reason, "remote unavailable at startup")
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
+    def test_runtime_flow_state_attachment_failure_raises(self) -> None:
+        host = _BrokenRuntimeFlowHost()
+
+        with self.assertRaises(RuntimeError) as raised:
+            host._runtime_flow_state()
+
+        self.assertEqual(
+            str(raised.exception),
+            "Twinr runtime flow state could not be attached to the runtime instance.",
+        )
+
+    def test_voice_quiet_state_raises_on_malformed_persisted_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = TwinrRuntime(config=self._config(temp_dir))
+            try:
+                runtime._voice_quiet_until_utc = (
+                    datetime.now(timezone.utc) + timedelta(minutes=5)
+                ).isoformat().replace("+00:00", "Z")
+                runtime._voice_quiet_reason = "tv\nnews"
+
+                with self.assertRaises(ValueError) as raised:
+                    runtime.voice_quiet_state()
+
+                self.assertEqual(str(raised.exception), "voice quiet reason is malformed")
             finally:
                 runtime.shutdown(timeout_s=1.0)
 

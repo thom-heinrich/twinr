@@ -248,6 +248,42 @@ class TwinrRuntimeDiscoveryMixin:
             delete_durable_memory=lambda entry_id: self.delete_durable_memory_entry(entry_id=entry_id),
         )
 
+    def runtime_context_user_discovery_status(
+        self,
+        *,
+        topic_id: str | None = None,
+        now: datetime | None = None,
+    ) -> UserDiscoveryResult:
+        """Load one prompt-safe guided-discovery status snapshot for live context assembly."""
+
+        effective_now = _coerce_now(now)
+        service = self._user_discovery_service()
+        started_at = perf_counter()
+        with _discovery_span() as span:
+            if span is not None:  # pragma: no branch - optional dependency
+                span.set_attribute("twinr.user_discovery.action", "runtime_context_status")
+                if topic_id is not None:
+                    span.set_attribute("twinr.user_discovery.topic_id", topic_id)
+            try:
+                return service.load_runtime_context_status(topic_id=topic_id, now=effective_now)
+            except Exception as exc:
+                if span is not None:  # pragma: no branch - optional dependency
+                    span.record_exception(exc)
+                _LOGGER.exception(
+                    "Twinr user discovery runtime-context status failed topic_id=%s",
+                    topic_id,
+                )
+                raise
+            finally:
+                duration_ms = (perf_counter() - started_at) * 1000.0
+                if span is not None:  # pragma: no branch - optional dependency
+                    span.set_attribute("twinr.user_discovery.duration_ms", duration_ms)
+                _LOGGER.debug(
+                    "Twinr user discovery action=runtime_context_status duration_ms=%.2f topic_id=%s",
+                    duration_ms,
+                    topic_id,
+                )
+
     def manage_user_discovery(
         self,
         *,
@@ -303,16 +339,11 @@ class TwinrRuntimeDiscoveryMixin:
                     span.set_attribute("twinr.user_discovery.topic_id", normalized_topic_id)
 
             try:
-                with self._memory_runtime_lock():
-                    if feedback_status is not None:
-                        try:
-                            pending_invite = service.build_invitation(now=effective_now)
-                        except Exception:
-                            _LOGGER.warning(
-                                "Twinr user discovery invite snapshot failed; continuing without feedback.",
-                                exc_info=True,
-                            )
-
+                if normalized_action == "status":
+                    # Provider-context prompt assembly reads discovery status on
+                    # the live voice critical path. Keep that read-only status
+                    # probe off the global memory lock so an unrelated memory
+                    # mutation cannot wedge the final lane into a timeout.
                     result = service.manage(
                         action=normalized_action,
                         topic_id=normalized_topic_id,
@@ -325,6 +356,29 @@ class TwinrRuntimeDiscoveryMixin:
                         callbacks=callbacks,
                         now=effective_now,
                     )
+                else:
+                    with self._memory_runtime_lock():
+                        if feedback_status is not None:
+                            try:
+                                pending_invite = service.build_invitation(now=effective_now)
+                            except Exception:
+                                _LOGGER.warning(
+                                    "Twinr user discovery invite snapshot failed; continuing without feedback.",
+                                    exc_info=True,
+                                )
+
+                        result = service.manage(
+                            action=normalized_action,
+                            topic_id=normalized_topic_id,
+                            learned_facts=safe_learned_facts,
+                            memory_routes=safe_memory_routes,
+                            fact_id=safe_fact_id,
+                            topic_complete=topic_complete,
+                            permission_granted=permission_granted,
+                            snooze_days=safe_snooze_days,
+                            callbacks=callbacks,
+                            now=effective_now,
+                        )
             except Exception as exc:
                 if span is not None:  # pragma: no branch - optional dependency
                     span.record_exception(exc)

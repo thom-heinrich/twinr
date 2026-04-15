@@ -10,6 +10,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.ops.pi_runtime_deploy_remote import (
+    _OPS_ARTIFACT_PERMISSION_SPECS,
     _parse_remote_retention_canary_stdout,
     _summarize_retention_canary_failure_payload,
     RetentionCanaryProbeError,
@@ -19,6 +20,10 @@ from twinr.ops.pi_runtime_deploy_remote import (
 
 
 class PiRuntimeDeployRemoteTests(unittest.TestCase):
+    def test_ops_artifact_permissions_include_usage_sqlite_sidecars(self) -> None:
+        self.assertIn(("usage.jsonl.sqlite3", "600"), _OPS_ARTIFACT_PERMISSION_SPECS)
+        self.assertIn(("usage.jsonl.sqlite3.lock", "600"), _OPS_ARTIFACT_PERMISSION_SPECS)
+
     def test_summarize_retention_canary_failure_payload_prefers_scope_and_stage_details(self) -> None:
         summary = _summarize_retention_canary_failure_payload(
             {
@@ -187,6 +192,34 @@ class PiRuntimeDeployRemoteTests(unittest.TestCase):
         self.assertTrue(payload["ready"])
         self.assertEqual(timeouts, [900.0])
 
+    def test_run_retention_canary_probe_executes_from_remote_root_with_runtime_pythonpath(self) -> None:
+        scripts: list[str] = []
+
+        class _FakeRemote:
+            timeout_s = 180.0
+
+            def run_ssh(self, script: str, *, timeout_s: float | None = None):
+                del timeout_s
+                scripts.append(script)
+                return subprocess.CompletedProcess(
+                    args=["ssh"],
+                    returncode=0,
+                    stdout='{"status": "ok", "ready": true, "probe_id": "p"}\n',
+                    stderr="",
+                )
+
+        payload = run_retention_canary_probe(
+            remote=cast(Any, _FakeRemote()),
+            remote_root="/twinr",
+            env_path=".env",
+            probe_id="p",
+        )
+
+        self.assertTrue(payload["ready"])
+        self.assertEqual(len(scripts), 1)
+        self.assertIn("cd /twinr", scripts[0])
+        self.assertIn('export PYTHONPATH=/twinr/src:${PYTHONPATH:-""}', scripts[0])
+
     def test_run_retention_canary_probe_attaches_failed_payload_to_exception(self) -> None:
         failed_payload = {
             "status": "failed",
@@ -220,6 +253,57 @@ class PiRuntimeDeployRemoteTests(unittest.TestCase):
             )
 
         self.assertEqual(exc_info.exception.payload, failed_payload)
+
+    def test_run_retention_canary_probe_recovers_failed_pi_report_when_inline_stdout_is_malformed(self) -> None:
+        probe_id = "deploy_retention_canary_malformed_stdout_probe"
+        failed_payload = {
+            "probe_id": probe_id,
+            "status": "failed",
+            "ready": False,
+            "failure_stage": "writer_ensure_remote_ready",
+            "error_message": "LongTermRemoteUnavailableError: ChonkyDB health check failed (ChonkyDBError).",
+        }
+
+        class _FakeRemote:
+            timeout_s = 180.0
+
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def run_ssh(self, script: str, *, timeout_s: float | None = None):
+                del timeout_s
+                self.calls.append(script)
+                if "twinr.memory.longterm.evaluation.live_retention_canary" in script:
+                    return subprocess.CompletedProcess(
+                        args=["ssh"],
+                        returncode=0,
+                        stdout="__TWINR_RETENTION_EXIT_STATUS__=1\nWARNING: noisy preface before JSON\n",
+                        stderr="",
+                    )
+                return subprocess.CompletedProcess(
+                    args=["ssh"],
+                    returncode=0,
+                    stdout=json.dumps(failed_payload) + "\n",
+                    stderr="",
+                )
+
+        remote = cast(Any, _FakeRemote())
+        with self.assertRaisesRegex(
+            RetentionCanaryProbeError,
+            "retention canary emitted non-JSON inline output but produced a Pi report: .*writer_ensure_remote_ready",
+        ) as exc_info:
+            run_retention_canary_probe(
+                remote=remote,
+                remote_root="/twinr",
+                env_path="/twinr/.env",
+                probe_id=probe_id,
+            )
+
+        self.assertEqual(exc_info.exception.payload, failed_payload)
+        self.assertTrue(
+            any(f"/retention_live_canary/{probe_id}.json" in script for script in remote.calls),
+            remote.calls,
+        )
 
     def test_wait_for_remote_watchdog_ready_uses_freshness_gate_and_timeout_budget(self) -> None:
         payload = {

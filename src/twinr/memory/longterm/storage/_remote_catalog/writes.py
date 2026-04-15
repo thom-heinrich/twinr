@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import json
 import time
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from twinr.memory.chonkydb.client import ChonkyDBError
@@ -51,6 +51,7 @@ from .shared import (
     _RemoteCollectionDefinition,
     _SEGMENT_VERSION,
     _iter_known_item_envelopes,
+    _segment_ref_supports_uri_only_contract,
     _run_timed_workflow_step,
 )
 
@@ -59,7 +60,6 @@ _SYNC_LARGE_GRAPH_CURRENT_HEAD_WRITE_MAX_BYTES = 131_072
 _GRAPH_PROJECTION_SEGMENT_REQUEST_MAX_BYTES = 16_384
 _GRAPH_SEGMENT_BULK_REQUEST_MAX_BYTES = 131_072
 _SYNC_SMALL_SEGMENT_WRITE_MAX_BYTES = 36_864
-_ASYNC_JOB_BACKPRESSURE_FINE_GRAINED_WAIT_TIMEOUT_S = 15.0
 _EXTENDED_ASYNC_CURRENT_HEAD_RETRY_ATTEMPTS = 9
 _EXTENDED_ASYNC_CURRENT_HEAD_MAX_BACKOFF_S = 20.0
 _EXTENDED_ASYNC_POST_SYNC_RESCUE_RETRY_ATTEMPTS = 9
@@ -109,6 +109,7 @@ _ASYNC_JOB_BACKPRESSURE_FINE_GRAINED_SNAPSHOT_KINDS = frozenset(
         "archive",
     }
 )
+_ASYNC_JOB_BACKPRESSURE_SEGMENT_SNAPSHOT_KINDS = _SYNC_DEFERRED_ID_SEGMENT_SNAPSHOT_KINDS
 _PROJECTION_ONLY_CATALOG_SNAPSHOT_KINDS = frozenset(
     {
         "graph_edges",
@@ -286,6 +287,25 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
             )
         return repaired_payload
 
+    def _catalog_payload_has_unreadable_segments(
+        self,
+        *,
+        snapshot_kind: str,
+        payload: Mapping[str, object] | None,
+    ) -> bool:
+        """Return whether one current head exists but its segment refs cannot hydrate."""
+
+        if not self.is_catalog_payload(snapshot_kind=snapshot_kind, payload=payload):
+            return False
+        try:
+            self.load_catalog_entries(
+                snapshot_kind=snapshot_kind,
+                payload=dict(cast(Mapping[str, object], payload)),
+            )
+        except LongTermRemoteUnavailableError:
+            return True
+        return False
+
     def build_catalog_payload(
         self,
         *,
@@ -316,8 +336,11 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
         except LongTermRemoteUnavailableError:
             if not replace_invalid_current_head:
                 raise
-            head_status, _payload = self.probe_catalog_payload_result(snapshot_kind=snapshot_kind)
-            if head_status != "invalid":
+            head_status, head_payload = self.probe_catalog_payload_result(snapshot_kind=snapshot_kind)
+            if head_status != "invalid" and not self._catalog_payload_has_unreadable_segments(
+                snapshot_kind=snapshot_kind,
+                payload=head_payload,
+            ):
                 raise
             existing_entries = {}
         record_items: list[ChonkyDBRecordItem] = []
@@ -665,6 +688,7 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
         *,
         definition: _RemoteCollectionDefinition,
         payload: Mapping[str, object],
+        include_selection_projection: bool = True,
     ) -> tuple[LongTermRemoteCatalogEntry, ...]:
         items = payload.get("items")
         assert isinstance(items, list)
@@ -678,14 +702,17 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                 continue
             metadata = raw_entry.get("metadata")
             entries.append(
-                LongTermRemoteCatalogEntry(
-                    snapshot_kind=definition.snapshot_kind,
-                    item_id=item_id,
-                    document_id=self._normalize_text(raw_entry.get("document_id")),
-                    uri=uri,
-                    metadata=self._catalog_entry_metadata_from_mapping(metadata if isinstance(metadata, Mapping) else {}),
+                    LongTermRemoteCatalogEntry(
+                        snapshot_kind=definition.snapshot_kind,
+                        item_id=item_id,
+                        document_id=self._normalize_text(raw_entry.get("document_id")),
+                        uri=uri,
+                        metadata=self._catalog_entry_metadata_from_mapping(
+                            metadata if isinstance(metadata, Mapping) else {},
+                            include_selection_projection=include_selection_projection,
+                        ),
+                    )
                 )
-            )
         return tuple(entries)
 
     def _load_segmented_catalog_entries(
@@ -693,6 +720,8 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
         *,
         definition: _RemoteCollectionDefinition,
         payload: Mapping[str, object],
+        fast_fail: bool = False,
+        include_selection_projection: bool = True,
     ) -> tuple[LongTermRemoteCatalogEntry, ...]:
         segments = payload.get("segments")
         assert isinstance(segments, list)
@@ -707,11 +736,30 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
             if document_id is None and uri is None:
                 continue
             segment_requests.append((segment_index, document_id, uri))
-        for envelope in self._load_catalog_segment_payloads(
+        segment_payloads = self._load_catalog_segment_payloads(
             definition=definition,
             segment_requests=tuple(segment_requests),
-        ):
-            entries.extend(self._extract_segment_entries(definition=definition, payload=envelope))
+            fast_fail=fast_fail,
+        )
+        extracted_entries = _run_timed_workflow_step(
+            name="longterm_remote_catalog_extract_segment_entries",
+            kind="retrieval",
+            details={
+                "snapshot_kind": definition.snapshot_kind,
+                "segment_count": len(segment_payloads),
+                "include_selection_projection": include_selection_projection,
+            },
+            operation=lambda: tuple(
+                entry
+                for envelope in segment_payloads
+                for entry in self._extract_segment_entries(
+                    definition=definition,
+                    payload=envelope,
+                    include_selection_projection=include_selection_projection,
+                )
+            ),
+        )
+        entries.extend(extracted_entries)
         return tuple(entries)
 
     def _load_catalog_segment_payloads(
@@ -719,6 +767,7 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
         *,
         definition: _RemoteCollectionDefinition,
         segment_requests: tuple[tuple[int | None, str | None, str | None], ...],
+        fast_fail: bool = False,
     ) -> tuple[Mapping[str, object], ...]:
         """Load segmented catalog documents with bounded parallel reads."""
 
@@ -737,6 +786,7 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                     segment_index=segment_index,
                     document_id=document_id,
                     uri=uri,
+                    fast_fail=fast_fail,
                 ),
             )
 
@@ -746,6 +796,7 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
             definition=definition,
             read_client=read_client,
             segment_requests=segment_requests,
+            fast_fail=fast_fail,
         )
 
         def load_one(request: tuple[int | None, str | None, str | None]) -> Mapping[str, object]:
@@ -760,6 +811,7 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                 segment_index=segment_index,
                 document_id=document_id,
                 uri=uri,
+                fast_fail=fast_fail,
             )
 
         remaining_requests = tuple(
@@ -800,6 +852,7 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
         definition: _RemoteCollectionDefinition,
         read_client: object,
         segment_requests: tuple[tuple[int | None, str | None, str | None], ...],
+        fast_fail: bool = False,
     ) -> dict[str, Mapping[str, object]]:
         """Load docid-backed catalog segments through the retrieve/topk batch path.
 
@@ -816,8 +869,8 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
         )
         if not document_ids:
             return {}
-        retry_attempts = self._remote_retry_attempts()
-        retry_backoff_s = self._remote_retry_backoff_s()
+        retry_attempts = 1 if fast_fail else self._remote_retry_attempts()
+        retry_backoff_s = 0.0 if fast_fail else self._remote_retry_backoff_s()
         loaded: dict[str, Mapping[str, object]] = {}
         for batch in self._split_retrieve_doc_id_batches(tuple(dict.fromkeys(document_ids))):
             last_error: Exception | None = None
@@ -827,6 +880,7 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                         snapshot_kind=definition.snapshot_kind,
                         read_client=read_client,
                         batch=batch,
+                        fast_fail=fast_fail,
                     )
                 except Exception as exc:
                     last_error = exc
@@ -852,7 +906,9 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                 last_error = None
                 break
             if last_error is not None:
-                break
+                raise LongTermRemoteUnavailableError(
+                    f"Failed to query remote long-term {definition.snapshot_kind!r} catalog segments."
+                ) from last_error
         return loaded
 
     def _load_catalog_segment_batch_candidates(
@@ -861,6 +917,7 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
         snapshot_kind: str,
         read_client: Any,
         batch: tuple[str, ...],
+        fast_fail: bool = False,
     ) -> tuple[Mapping[str, object], ...]:
         """Load segment docs through content-bearing query batches, not documents/full."""
 
@@ -929,6 +986,8 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                     started_monotonic=started_monotonic,
                     outcome="fallback",
                 )
+                if fast_fail:
+                    raise
 
         started_monotonic = time.monotonic()
         try:
@@ -1055,6 +1114,7 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
         segment_index: int | None,
         document_id: str | None,
         uri: str | None,
+        fast_fail: bool = False,
     ) -> Mapping[str, object]:
         remote_state = self._require_remote_state()
         read_client = self._require_client(getattr(remote_state, "read_client", None), operation="read")
@@ -1062,8 +1122,8 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
             snapshot_kind=definition.snapshot_kind,
             segment_index=segment_index or 0,
         )
-        retry_attempts = self._remote_retry_attempts()
-        retry_backoff_s = self._remote_retry_backoff_s()
+        retry_attempts = 1 if fast_fail else self._remote_retry_attempts()
+        retry_backoff_s = 0.0 if fast_fail else self._remote_retry_backoff_s()
         context = LongTermRemoteReadContext(
             snapshot_kind=definition.snapshot_kind,
             operation="fetch_catalog_segment",
@@ -1082,6 +1142,7 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                     read_client,
                     document_id=document_id,
                     fallback_uri=fallback_uri,
+                    fast_fail=fast_fail,
                 )
                 record_remote_read_observation(
                     remote_state=remote_state,
@@ -1113,7 +1174,7 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                 attempt_count=retry_attempts,
                 retry_attempts_configured=retry_attempts,
                 retry_backoff_s=retry_backoff_s,
-                retry_mode="document_id_then_uri",
+                retry_mode="single_probe" if fast_fail else "document_id_then_uri",
             ),
             exc=last_error,
             started_monotonic=started_monotonic,
@@ -1129,6 +1190,7 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
         *,
         document_id: str | None,
         fallback_uri: str,
+        fast_fail: bool = False,
     ) -> Mapping[str, object]:
         """Read one segment by exact document id, then by the canonical segment URI."""
 
@@ -1139,8 +1201,10 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                 include_content=True,
                 max_content_chars=self._max_content_chars(),
             )
-        except Exception:
+        except Exception as exc:
             if not document_id:
+                raise
+            if fast_fail and self._status_code_from_exception(exc) != 404:
                 raise
         return read_client.fetch_full_document(
             origin_uri=fallback_uri,
@@ -1153,6 +1217,7 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
         *,
         definition: _RemoteCollectionDefinition,
         payload: Mapping[str, object],
+        include_selection_projection: bool = True,
     ) -> tuple[LongTermRemoteCatalogEntry, ...]:
         entries: list[LongTermRemoteCatalogEntry] = []
         for candidate in self._iter_record_candidates(payload):
@@ -1177,7 +1242,10 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                         item_id=item_id,
                         document_id=self._normalize_text(raw_entry.get("document_id")),
                         uri=self.item_uri(snapshot_kind=definition.snapshot_kind, item_id=item_id),
-                        metadata=self._catalog_entry_metadata_from_mapping(raw_entry),
+                        metadata=self._catalog_entry_metadata_from_mapping(
+                            raw_entry,
+                            include_selection_projection=include_selection_projection,
+                        ),
                     )
                 )
             break
@@ -1579,9 +1647,26 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                     readback_required = False
                     resolved_document_ids = extracted_document_ids
                 elif all(isinstance(value, str) and value for value in extracted_document_ids):
-                    attestation_mode = "exact_document_ids"
-                    readback_required = False
-                    resolved_document_ids = extracted_document_ids
+                    if self._exact_document_ids_require_readback(
+                        snapshot_kind=snapshot_kind,
+                        batch=batch,
+                        request_payload_kind=request_payload_kind,
+                    ):
+                        attestation_mode = "exact_document_ids_readback"
+                        readback_required = True
+                        readback_started = time.monotonic()
+                        try:
+                            resolved_document_ids = self._attest_record_batch_readback(
+                                snapshot_kind=snapshot_kind,
+                                record_items=batch,
+                                document_ids=extracted_document_ids,
+                            )
+                        finally:
+                            readback_attestation_ms = max(0.0, (time.monotonic() - readback_started) * 1000.0)
+                    else:
+                        attestation_mode = "exact_document_ids"
+                        readback_required = False
+                        resolved_document_ids = extracted_document_ids
                 elif projection_complete_catalog_attestation_optional or fine_grained_readback_optional:
                     # Projection-complete writers serve fresh readers from the
                     # later segment/current-head contract, not from the
@@ -2392,6 +2477,25 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
             return True
         return snapshot_kind == "midterm" and skip_async_document_id_wait
 
+    def _exact_document_ids_require_readback(
+        self,
+        *,
+        snapshot_kind: str,
+        batch: tuple[ChonkyDBRecordItem, ...],
+        request_payload_kind: str,
+    ) -> bool:
+        """Return whether exact ids still need document-body visibility proof.
+
+        Immutable `catalog/segment` records are immediately referenced by the
+        subsequent `catalog/current` publish. A jobs-endpoint `document_id`
+        alone is therefore not enough: fresh readers must be able to hydrate
+        the segment body itself before Twinr advertises that ref as current.
+        """
+
+        del snapshot_kind
+        del batch
+        return request_payload_kind == "catalog_segment_record_batch"
+
     def _can_skip_async_job_document_id_wait(
         self,
         *,
@@ -2429,12 +2533,13 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
     ) -> bool:
         """Return whether one accepted async batch should wait for job completion.
 
-        Live graph current-view seeding can enqueue several projection-complete
-        segment writes back-to-back. ChonkyDB may accept the early segment jobs
-        and then reject the next equally shaped one with `429 queue_saturated`
-        because the queue is still draining the previously accepted work.
-        Graph segment batches therefore use the jobs endpoint as bounded
-        back-pressure before Twinr submits the next segment write.
+        Live projection-complete segment publishes can enqueue several accepted
+        versioned `catalog/segment` jobs back-to-back. ChonkyDB may expose the
+        first tokenized segment URI before the async queue has drained enough
+        for the next equally shaped batch, so same-URI readback alone is not a
+        strong enough backpressure proof there. Deferred-id segment writers
+        therefore keep the jobs endpoint as the authoritative queue-drain
+        contract before Twinr submits the next segment write.
 
         Large structured snapshot publishes (`objects/conflicts/archive`) can
         self-induce the same queue flood: `write_snapshot(...)` emits many
@@ -2447,7 +2552,7 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
 
         request_payload_kind = self._record_batch_payload_kind(batch=batch)
         if (
-            snapshot_kind in _PROJECTION_ONLY_CATALOG_SNAPSHOT_KINDS
+            snapshot_kind in _ASYNC_JOB_BACKPRESSURE_SEGMENT_SNAPSHOT_KINDS
             and request_payload_kind == "catalog_segment_record_batch"
         ):
             return True
@@ -2657,15 +2762,15 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
 
         Versioned catalog-segment URI visibility only proves that one accepted
         payload became readable. It does not prove that the async jobs queue
-        drained enough for the next graph segment write. Completion-required
-        graph segment batches therefore keep polling the jobs lane instead of
-        short-circuiting to URI attestation on the first transport hiccup.
+        drained enough for the next dependent segment write. Completion-
+        required segment batches therefore keep polling the jobs lane instead
+        of short-circuiting to URI attestation on the first transport hiccup.
         """
 
         if request_payload_kind == "catalog_segment_record_batch":
             if require_job_completion:
                 return False
-            return snapshot_kind in _SYNC_DEFERRED_ID_CURRENT_HEAD_SNAPSHOT_KINDS
+            return snapshot_kind in _SYNC_DEFERRED_ID_SEGMENT_SNAPSHOT_KINDS
         return (
             not require_job_completion
             and request_payload_kind == "catalog_current_head_record_batch"
@@ -2709,9 +2814,9 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
     ) -> float:
         """Return the per-call HTTP timeout for one jobs-endpoint poll.
 
-        Completion-required graph segment writes still need bounded polling, but
-        the old 1s speculative timeout only made sense when Twinr was willing
-        to abandon jobs polling immediately and trust same-URI visibility. Once
+        Completion-required segment writes still need bounded polling, but the
+        old speculative timeout only made sense when Twinr was willing to
+        abandon jobs polling immediately and trust same-URI visibility. Once
         completion is the actual backpressure surface, use the normal remote
         read timeout as the per-poll cap instead.
         """
@@ -2732,7 +2837,7 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
         if (
             require_job_completion
             and request_payload_kind == "catalog_segment_record_batch"
-            and snapshot_kind in _PROJECTION_ONLY_CATALOG_SNAPSHOT_KINDS
+            and snapshot_kind in _ASYNC_JOB_BACKPRESSURE_SEGMENT_SNAPSHOT_KINDS
         ):
             return read_timeout_cap_s
         if not self._can_fallback_job_status_error_to_uri_attestation(
@@ -2752,22 +2857,18 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
     ) -> float:
         """Return the total jobs-wait budget for one accepted async write.
 
-        Projection-complete `objects/conflicts/archive` fine-grained batches
-        only wait on jobs for backpressure, not because later item doc ids are
-        authoritative. Burning the full visibility timeout there can add
-        minutes of dead time per batch and still end in
-        `skipped_projection_complete`. Keep that specific backpressure lane on
-        a much shorter completion budget while leaving the broader visibility
-        window intact for segment/current-head and exact-id attestation paths.
+        Completion-required writes need a real queue-drain proof before Twinr
+        submits the next dependent control-plane record. Live retention-canary
+        runs proved that the old 15 s cap on structured fine-grained batches
+        could let `objects` item jobs keep draining in the background while
+        Twinr already moved on to the next `catalog/segment` write, which then
+        failed with `429 queue_saturated` or `503 payload_sync_bulk_busy`.
+        Use the full bounded visibility window whenever completion itself is
+        the backpressure contract, even if later item-document ids are not the
+        authoritative read surface.
         """
 
         total_timeout_s = self._async_job_visibility_timeout_s(snapshot_kind=snapshot_kind)
-        if (
-            require_job_completion
-            and request_payload_kind == "fine_grained_record_batch"
-            and snapshot_kind in _ASYNC_JOB_BACKPRESSURE_FINE_GRAINED_SNAPSHOT_KINDS
-        ):
-            return min(total_timeout_s, _ASYNC_JOB_BACKPRESSURE_FINE_GRAINED_WAIT_TIMEOUT_S)
         return total_timeout_s
 
     def _attest_record_readback(
@@ -2828,11 +2929,11 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
                     matched_document_id = self._normalize_text(matched_record.document_id)
                     if matched_document_id or not require_document_id:
                         return matched_document_id
-                    # Structured catalog segments are later read through exact-id
-                    # batch queries from the current head. Publishing a head that
-                    # references one visible-but-anonymous segment forces fresh
-                    # readers back onto weaker origin lookups and can leave the
-                    # new segment permanently unreadable under load.
+                    # Unversioned segment refs still need a stable document id,
+                    # but tokenized `.../catalog/segment/<index>/<token>` URIs
+                    # are already immutable same-record selectors. Those may
+                    # stay URI-only when ChonkyDB omits `document_id` on
+                    # same-URI readback envelopes.
                     last_detail = "Remote write attestation observed the accepted payload without a stable document id."
                     continue
                 last_detail = "Remote write attestation read back a different same-uri document."
@@ -2901,14 +3002,11 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
     ) -> bool:
         """Return whether one attested record must surface a stable document id.
 
-        Structured `objects/conflicts/archive/midterm` catalog segments are
-        later hydrated through exact-id batch queries from the current head.
-        If readback matches only on URI but the backend still omits
-        `document_id`, publishing that segment ref leaves fresh readers with a
-        weaker same-URI fallback that can permanently 404 on live ChonkyDB.
-        Graph projection segments intentionally keep their existing URI-first
-        contract because their current heads already serve the projection data
-        directly.
+        Unversioned structured segment refs still require a stable
+        `document_id`, but tokenized `.../catalog/segment/<index>/<token>`
+        URIs are immutable selectors and remain safe to publish even when the
+        backend omits `document_id` on `documents/full?origin_uri=...`.
+        Graph projection segments keep their historical URI-first contract.
         """
 
         metadata = getattr(record_item, "metadata", None)
@@ -2917,7 +3015,11 @@ class RemoteCatalogWriteMixin(RemoteCatalogMixinBase):
         if metadata.get("twinr_catalog_segment_token") is None:
             return False
         snapshot_kind = self._normalize_text(metadata.get("twinr_snapshot_kind"))
-        return snapshot_kind not in _PROJECTION_ONLY_CATALOG_SNAPSHOT_KINDS
+        resolved_uri = self._normalize_text(getattr(record_item, "uri", None))
+        return not _segment_ref_supports_uri_only_contract(
+            snapshot_kind=snapshot_kind,
+            uri=resolved_uri,
+        )
 
     def _attestation_probe_targets(
         self,

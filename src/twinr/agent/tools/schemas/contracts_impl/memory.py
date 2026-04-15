@@ -42,6 +42,40 @@ def build_remember_memory_schema(_context: SchemaBuildContext) -> dict[str, Any]
     }
 
 
+def build_review_saved_memories_schema(_context: SchemaBuildContext) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "name": "review_saved_memories",
+        "description": (
+            "Inspect explicit durable memories previously saved with remember_memory. "
+            "Use this when the user asks what Twinr remembered, asks for an exact previously saved free-form fact, "
+            "or when answering from hidden memory context would be unreliable. "
+            "If the tool returns confirmation_required, ask that exact confirmation question and call it again "
+            "with confirmed=true only after the user clearly says yes."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "kind": string_property(
+                    "Optional exact durable-memory kind such as fact, appointment, task, or preference.",
+                    min_length=1,
+                ),
+                "limit": number_property(
+                    "Optional maximum number of saved memories to inspect.",
+                    minimum=1,
+                    maximum=32,
+                    integer=True,
+                ),
+                "confirmed": boolean_property(
+                    "Set true only after the user clearly confirmed this saved-memory inspection."
+                ),
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    }
+
+
 def build_remember_contact_schema(_context: SchemaBuildContext) -> dict[str, Any]:
     return {
         "type": "function",
@@ -472,6 +506,7 @@ def build_manage_user_discovery_schema(_context: SchemaBuildContext) -> dict[str
 
 TOOL_BUILDERS = (
     ("remember_memory", build_remember_memory_schema),
+    ("review_saved_memories", build_review_saved_memories_schema),
     ("remember_contact", build_remember_contact_schema),
     ("lookup_contact", build_lookup_contact_schema),
     ("send_whatsapp_message", build_send_whatsapp_message_schema),

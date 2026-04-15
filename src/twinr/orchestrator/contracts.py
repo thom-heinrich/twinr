@@ -697,11 +697,18 @@ class OrchestratorTurnRequest:
     prompt: str
     conversation: tuple[tuple[str, str], ...] = ()
     supervisor_conversation: tuple[tuple[str, str], ...] = ()
+    prefetched_supervisor_decision: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "prompt", _coerce_text(self.prompt, strip=False, max_chars=_MAX_TEXT_CHARS))
         object.__setattr__(self, "conversation", _coerce_conversation(self.conversation))
         object.__setattr__(self, "supervisor_conversation", _coerce_conversation(self.supervisor_conversation))
+        prefetched = self.prefetched_supervisor_decision
+        object.__setattr__(
+            self,
+            "prefetched_supervisor_decision",
+            _coerce_dict(prefetched) if isinstance(prefetched, Mapping) else None,
+        )
 
     def to_payload(self) -> dict[str, Any]:
         """Serialize the turn request into a websocket payload."""
@@ -712,6 +719,7 @@ class OrchestratorTurnRequest:
             "prompt": self.prompt,
             "conversation": [list(item) for item in self.conversation],
             "supervisor_conversation": [list(item) for item in self.supervisor_conversation],
+            "prefetched_supervisor_decision": dict(self.prefetched_supervisor_decision or {}),
         }
 
     def to_json_bytes(self) -> bytes:
@@ -729,6 +737,11 @@ class OrchestratorTurnRequest:
             prompt=_coerce_text(payload_dict.get("prompt"), strip=False, max_chars=_MAX_TEXT_CHARS),
             conversation=_coerce_conversation(payload_dict.get("conversation")),
             supervisor_conversation=_coerce_conversation(payload_dict.get("supervisor_conversation")),
+            prefetched_supervisor_decision=(
+                _coerce_dict(payload_dict.get("prefetched_supervisor_decision"))
+                if isinstance(payload_dict.get("prefetched_supervisor_decision"), Mapping)
+                else None
+            ),
         )
 
 

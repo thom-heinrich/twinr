@@ -4,6 +4,7 @@
 # BUG-3: Fix crash-on-observability-failure paths so snapshot/event-store write errors (for example on full/read-only SD cards) no longer kill the watchdog loop.
 # BUG-4: Add a first-success startup timeout budget so cold-start remote probes do not false-fail before the first healthy sample lands.
 # BUG-5: Persist monotonic freshness and PID attestation fields in watchdog snapshots so supervisor startup gating survives Pi wall-clock jumps without false restart blocks.
+# BUG-6: Honor the configured required-remote proof contract instead of hard-coding archive-inclusive green samples, so live `watchdog_artifact` Pi runtimes can stay on the backend's `token_fast/current_only` serving lane.
 # SEC-1: Redact secret-bearing and content-bearing fields from probe payloads / remote_write_context before persisting to logs or ops artifacts.
 # IMP-1: Add optional systemd sd_notify integration (READY/STATUS/WATCHDOG/STOPPING) for Raspberry Pi deployments managed by systemd.
 # IMP-2: Add adaptive exponential backoff with jitter after failures/degradation to avoid synchronized probe storms against the remote backend.
@@ -12,10 +13,10 @@
 """Continuously probe required remote ChonkyDB readiness.
 
 This module runs a dedicated watchdog loop outside the GPIO and conversation
-runtime. It reuses ``LongTermMemoryService.ensure_remote_ready()`` as the
-canonical fail-closed readiness check, writes one rolling JSON snapshot under
-Twinr's ops store, emits transition events into the local ops event log, and
-prints one JSON line per sample for journald/systemd.
+runtime. It reuses ``LongTermMemoryService``'s explicit readiness surfaces as
+the canonical fail-closed required-remote truth, writes one rolling JSON
+snapshot under Twinr's ops store, emits transition events into the local ops
+event log, and prints one JSON line per sample for journald/systemd.
 
 2026 upgrade notes:
 - Shutdown is now cooperative and race-safe with active probe threads.
@@ -44,6 +45,10 @@ from twinr.memory.longterm.runtime.service import LongTermMemoryService
 from twinr.memory.longterm.storage.remote_read_diagnostics import extract_remote_write_context
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.ops.events import TwinrOpsEventStore, compact_text
+from twinr.ops.remote_chonkydb_repair import (
+    extract_backend_problem_detail,
+    is_explicit_service_warmup_detail,
+)
 from twinr.ops.remote_memory_watchdog_state import (
     DEFAULT_HISTORY_LIMIT as _DEFAULT_HISTORY_LIMIT,
     DEFAULT_WATCHDOG_INTERVAL_S as _DEFAULT_WATCHDOG_INTERVAL_S,
@@ -80,10 +85,17 @@ _RECENT_SUCCESS_TIMEOUT_MIN_HEADROOM_S = 2.0
 _RECENT_SUCCESS_TIMEOUT_MAX_HEADROOM_S = 10.0
 _DEFAULT_HEARTBEAT_WHILE_PROBE_INFLIGHT_S = 1.0
 _DEFAULT_CLOSE_JOIN_TIMEOUT_S = 2.0
+_WARMUP_REPROBE_HEARTBEAT_MULTIPLIER = 5.0
+_INSTANCE_NOT_READY_DETAIL = "chonkydb instance responded but is not ready."
+_LOCAL_COOLDOWN_DETAIL = "remote long-term memory is temporarily cooling down after recent failures."
+_SHALLOW_STATUS_READY_OVERRIDE_DETAIL = "query_surface_ready_despite_instance_flag_false"
 _MAX_DETAIL_LENGTH = 240
 _MAX_DIAGNOSTIC_DEPTH = 4
 _MAX_DIAGNOSTIC_ITEMS = 24
 _MAX_DIAGNOSTIC_STRING_LENGTH = 256
+_WATCHDOG_PROBE_MODE_AUTO = "auto"
+_WATCHDOG_PROBE_MODE_CURRENT_ONLY = "current_only"
+_WATCHDOG_PROBE_MODE_ARCHIVE_INCLUSIVE = "archive_inclusive"
 
 _REDACTED = "[REDACTED]"
 _TRUNCATED = "[TRUNCATED]"
@@ -139,9 +151,16 @@ def _copy_object_dict(value: object) -> dict[str, object] | None:
 def _coerce_positive_float(value: object, *, default: float, minimum: float | None = None) -> float:
     """Coerce one config value to a positive float."""
 
-    try:
+    if isinstance(value, bool):
+        resolved = default
+    elif isinstance(value, (int, float)):
         resolved = float(value)
-    except (TypeError, ValueError):
+    elif isinstance(value, str):
+        try:
+            resolved = float(value)
+        except ValueError:
+            resolved = default
+    else:
         resolved = default
     if minimum is not None:
         resolved = max(minimum, resolved)
@@ -184,6 +203,20 @@ def _default_startup_probe_timeout_s(config: TwinrConfig, *, probe_timeout_s: fl
         _DEFAULT_STARTUP_PROBE_TIMEOUT_FLOOR_S,
         min(_DEFAULT_PROBE_TIMEOUT_CAP_S, estimated_timeout_s),
     )
+
+
+def _normalize_watchdog_probe_mode(value: object, *, runtime_check_mode: object) -> str:
+    """Resolve one configured watchdog proof mode to a supported value."""
+
+    normalized = str(value or "").strip().lower()
+    if normalized in {"archive", "archive_inclusive", "full"}:
+        return _WATCHDOG_PROBE_MODE_ARCHIVE_INCLUSIVE
+    if normalized in {"current", "current_only", "token_fast"}:
+        return _WATCHDOG_PROBE_MODE_CURRENT_ONLY
+    normalized_runtime_mode = str(runtime_check_mode or "").strip().lower()
+    if normalized_runtime_mode == "watchdog_artifact":
+        return _WATCHDOG_PROBE_MODE_CURRENT_ONLY
+    return _WATCHDOG_PROBE_MODE_ARCHIVE_INCLUSIVE
 
 
 def _looks_sensitive_key(name: str) -> bool:
@@ -367,6 +400,10 @@ class RemoteMemoryWatchdog:
             getattr(config, "long_term_memory_remote_watchdog_interval_s", _DEFAULT_WATCHDOG_INTERVAL_S),
             default=_DEFAULT_WATCHDOG_INTERVAL_S,
         )
+        self.required_probe_mode = _normalize_watchdog_probe_mode(
+            getattr(config, "long_term_memory_remote_watchdog_probe_mode", _WATCHDOG_PROBE_MODE_AUTO),
+            runtime_check_mode=getattr(config, "long_term_memory_remote_runtime_check_mode", "direct"),
+        )
         self.history_limit = _coerce_history_limit(
             getattr(config, "long_term_memory_remote_watchdog_history_limit", _DEFAULT_HISTORY_LIMIT),
             default=_DEFAULT_HISTORY_LIMIT,
@@ -547,12 +584,22 @@ class RemoteMemoryWatchdog:
                 required = bool(service.remote_required())
                 remote_status = service.remote_status()
                 mode = str(getattr(remote_status, "mode", "unknown") or "unknown")
+                remote_status_ready = bool(getattr(remote_status, "ready", False))
+                operational_probe_allowed = bool(
+                    getattr(remote_status, "operational_probe_allowed", remote_status_ready)
+                )
                 status_detail = self._normalize_detail(getattr(remote_status, "detail", None))
+                probe_remote_ready = getattr(service, "probe_remote_ready", None)
+                external_attestation_probe = bool(
+                    callable(probe_remote_ready)
+                    and self._is_local_cooldown_detail(status_detail)
+                    and not operational_probe_allowed
+                )
                 if not required:
                     status = "disabled"
                     ready = False
                     detail = status_detail or "Remote-primary long-term memory is not required."
-                elif not bool(getattr(remote_status, "ready", False)):
+                elif not operational_probe_allowed and not external_attestation_probe:
                     # Keep the same service instance alive so the remote-state
                     # circuit breaker can cool down after transient backend
                     # outages instead of being reset on every watchdog tick.
@@ -560,30 +607,56 @@ class RemoteMemoryWatchdog:
                     ready = False
                     detail = status_detail or "Required remote long-term memory is unavailable."
                 else:
-                    probe_remote_ready = getattr(service, "probe_remote_ready", None)
                     if callable(probe_remote_ready):
                         bootstrap_probe = self._should_run_bootstrap_probe()
+                        include_archive = self.required_probe_mode == _WATCHDOG_PROBE_MODE_ARCHIVE_INCLUSIVE
                         probe_result = self._call_probe_remote_ready(
                             probe_remote_ready=probe_remote_ready,
                             bootstrap=bootstrap_probe,
-                            include_archive=True,
+                            include_archive=include_archive,
+                            external_attestation_probe=external_attestation_probe,
                         )
                         probe_payload = self._probe_result_to_payload(probe_result)
                         raw_ready = bool(getattr(probe_result, "ready", False))
-                        archive_safe = self._probe_result_archive_safe(
+                        contract_satisfied = self._probe_result_satisfies_required_probe_mode(
                             probe_result=probe_result,
-                            include_archive=True,
+                            required_probe_mode=self.required_probe_mode,
                         )
-                        ready = bool(raw_ready and archive_safe)
-                        if raw_ready and not archive_safe:
-                            status = "degraded"
+                        probe_remote_status = getattr(probe_result, "remote_status", None)
+                        probe_remote_status_ready = getattr(probe_remote_status, "ready", None)
+                        deep_ready_override = self._probe_result_allows_shallow_status_override(
+                            probe_result=probe_result,
+                            required_probe_mode=self.required_probe_mode,
+                        )
+                        ready = bool(
+                            raw_ready
+                            and contract_satisfied
+                            and (probe_remote_status_ready is not False or deep_ready_override)
+                        )
+                        if probe_remote_status_ready is False and not deep_ready_override:
+                            status = "fail"
                             detail = (
-                                self._normalize_detail(getattr(probe_result, "detail", None))
-                                or "Remote readiness probe stayed current-only and is not archive-safe."
+                                self._normalize_detail(getattr(probe_remote_status, "detail", None))
+                                or self._normalize_detail(getattr(probe_result, "detail", None))
+                                or status_detail
+                                or "Required remote long-term memory is unavailable."
+                            )
+                        elif raw_ready and not contract_satisfied:
+                            status = "degraded"
+                            detail = self._probe_contract_mismatch_detail(
+                                probe_result=probe_result,
+                                required_probe_mode=self.required_probe_mode,
                             )
                         else:
                             status = "ok" if ready else "fail"
-                            detail = self._normalize_detail(getattr(probe_result, "detail", None)) or status_detail
+                            detail = (
+                                self._normalize_detail(getattr(probe_result, "detail", None))
+                                or (
+                                    self._shallow_status_ready_override_detail(probe_remote_status)
+                                    if deep_ready_override
+                                    else status_detail
+                                )
+                            )
                         mode = str(
                             getattr(
                                 getattr(probe_result, "remote_status", None),
@@ -600,7 +673,7 @@ class RemoteMemoryWatchdog:
             except LongTermRemoteUnavailableError as exc:
                 status = "fail"
                 ready = False
-                detail = self._normalize_detail(str(exc))
+                detail = extract_backend_problem_detail(exc) or self._normalize_detail(str(exc))
                 probe_payload = self._merge_remote_write_context(
                     probe_payload,
                     extract_remote_write_context(exc),
@@ -817,6 +890,24 @@ class RemoteMemoryWatchdog:
             return self.interval_s
         if last_sample.status == "ok":
             return self._deep_probe_idle_gap_s(last_sample=last_sample)
+        normalized_detail = str(last_sample.detail or "").strip().lower()
+        if normalized_detail == _LOCAL_COOLDOWN_DETAIL:
+            # The local remote-state circuit breaker already suppresses deep
+            # backend reads here; keep sampling at the base interval so the
+            # watchdog artifact stays fresh and the supervisor can unblock as
+            # soon as the cooldown expires.
+            return self.interval_s
+        if (
+            is_explicit_service_warmup_detail(last_sample.detail)
+            or normalized_detail == _INSTANCE_NOT_READY_DETAIL
+        ):
+            return max(
+                self.interval_s,
+                min(
+                    self.probe_timeout_s,
+                    self.heartbeat_while_probe_inflight_s * _WARMUP_REPROBE_HEARTBEAT_MULTIPLIER,
+                ),
+            )
         failure_streak = max(1, int(last_sample.consecutive_fail or 1))
         base_delay = self.interval_s * (self.failure_backoff_base_multiplier ** max(0, failure_streak - 1))
         capped_delay = min(self.failure_backoff_cap_s, max(self.interval_s, base_delay))
@@ -866,7 +957,13 @@ class RemoteMemoryWatchdog:
         return last_sample is None or last_sample.status != "ok"
 
     @staticmethod
-    def _call_probe_remote_ready(*, probe_remote_ready, bootstrap: bool, include_archive: bool):
+    def _call_probe_remote_ready(
+        *,
+        probe_remote_ready,
+        bootstrap: bool,
+        include_archive: bool,
+        external_attestation_probe: bool,
+    ):
         """Call probe helpers compatibly across older and newer service surfaces."""
 
         try:
@@ -880,14 +977,22 @@ class RemoteMemoryWatchdog:
             kwargs["bootstrap"] = bootstrap
         if supports_kwargs or "include_archive" in signature.parameters:
             kwargs["include_archive"] = include_archive
+        if supports_kwargs or "external_attestation_probe" in signature.parameters:
+            kwargs["external_attestation_probe"] = external_attestation_probe
         return probe_remote_ready(**kwargs)
 
     @staticmethod
-    def _probe_result_archive_safe(*, probe_result, include_archive: bool) -> bool:
+    def _is_local_cooldown_detail(detail: str | None) -> bool:
+        """Return whether one detail string is the local remote-state cooldown."""
+
+        return str(detail or "").strip().lower() == _LOCAL_COOLDOWN_DETAIL
+
+    @staticmethod
+    def _probe_result_archive_safe(*, probe_result) -> bool | None:
         """Return whether one structured readiness result proves archive safety."""
 
         if probe_result is None:
-            return False
+            return None
         warm_result = getattr(probe_result, "warm_result", None)
         archive_safe = getattr(warm_result, "archive_safe", None)
         if archive_safe is not None:
@@ -901,7 +1006,83 @@ class RemoteMemoryWatchdog:
             warm_payload = probe_payload.get("warm_result")
             if isinstance(warm_payload, dict) and "archive_safe" in warm_payload:
                 return bool(warm_payload.get("archive_safe"))
-        return bool(getattr(probe_result, "ready", False) and include_archive)
+        return None
+
+    @staticmethod
+    def _probe_result_health_tier(probe_result) -> str | None:
+        """Return one normalized readiness tier from a structured probe result."""
+
+        if probe_result is None:
+            return None
+        warm_result = getattr(probe_result, "warm_result", None)
+        health_tier = getattr(warm_result, "health_tier", None)
+        if health_tier is None:
+            try:
+                payload = getattr(probe_result, "to_dict", lambda: None)()
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                warm_payload = payload.get("warm_result")
+                if isinstance(warm_payload, dict):
+                    health_tier = warm_payload.get("health_tier")
+        normalized = str(health_tier or "").strip().lower()
+        return normalized or None
+
+    @staticmethod
+    def _probe_result_satisfies_required_probe_mode(*, probe_result, required_probe_mode: str) -> bool:
+        """Return whether one structured probe satisfies the configured contract."""
+
+        if not bool(getattr(probe_result, "ready", False)):
+            return False
+        health_tier = RemoteMemoryWatchdog._probe_result_health_tier(probe_result)
+        archive_safe = RemoteMemoryWatchdog._probe_result_archive_safe(probe_result=probe_result)
+        if required_probe_mode == _WATCHDOG_PROBE_MODE_ARCHIVE_INCLUSIVE:
+            if archive_safe is False:
+                return False
+            return health_tier is None or health_tier == "ready"
+        if archive_safe:
+            return health_tier is None or health_tier == "ready"
+        return health_tier is None or health_tier in {"ready", "degraded"}
+
+    @staticmethod
+    def _probe_result_allows_shallow_status_override(*, probe_result, required_probe_mode: str) -> bool:
+        """Return whether deep readiness outweighs a stale shallow status flag."""
+
+        if not RemoteMemoryWatchdog._probe_result_satisfies_required_probe_mode(
+            probe_result=probe_result,
+            required_probe_mode=required_probe_mode,
+        ):
+            return False
+        warm_result = getattr(probe_result, "warm_result", None)
+        if warm_result is not None and getattr(warm_result, "ready", None) is False:
+            return False
+        health_tier = RemoteMemoryWatchdog._probe_result_health_tier(probe_result)
+        if required_probe_mode == _WATCHDOG_PROBE_MODE_ARCHIVE_INCLUSIVE:
+            return (
+                RemoteMemoryWatchdog._probe_result_archive_safe(probe_result=probe_result) is True
+                and (health_tier is None or health_tier == "ready")
+            )
+        return health_tier is None or health_tier in {"ready", "degraded"}
+
+    @staticmethod
+    def _probe_contract_mismatch_detail(*, probe_result, required_probe_mode: str) -> str:
+        """Describe why one ready probe still missed the configured proof contract."""
+
+        detail = RemoteMemoryWatchdog._normalize_detail(getattr(probe_result, "detail", None))
+        if detail:
+            return detail
+        if required_probe_mode == _WATCHDOG_PROBE_MODE_ARCHIVE_INCLUSIVE:
+            return "Remote readiness probe stayed current-only and is not archive-safe."
+        return "Remote readiness probe did not satisfy the configured current-only contract."
+
+    @staticmethod
+    def _shallow_status_ready_override_detail(remote_status: object) -> str:
+        """Summarize when deep readiness beats a shallow `ready=false` flag."""
+
+        detail = compact_text(str(getattr(remote_status, "detail", "") or "").strip(), limit=_MAX_DETAIL_LENGTH)
+        if detail:
+            return f"{_SHALLOW_STATUS_READY_OVERRIDE_DETAIL}: {detail}"
+        return _SHALLOW_STATUS_READY_OVERRIDE_DETAIL
 
     @staticmethod
     def _normalize_detail(value: object) -> str | None:
@@ -1348,7 +1529,7 @@ class RemoteMemoryWatchdog:
     ) -> None:
         """Emit one internal watchdog error without raising."""
 
-        payload = {
+        payload: dict[str, object] = {
             "event": event,
             "error": self._normalize_detail(f"{type(exc).__name__}: {exc}"),
         }

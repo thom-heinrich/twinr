@@ -447,24 +447,25 @@ def handle_print_receipt(owner: Any, arguments: dict[str, object]) -> dict[str, 
     if print_job is not None and _normalize_optional_text(print_job):
         # AUDIT-FIX(#4): Emit job identifiers through the sanitized event channel.
         _emit_kv_safe(owner, "print_job", print_job)
-    # AUDIT-FIX(#5): Long-term evidence capture is non-critical and must not retroactively fail a completed print.
-    _call_best_effort(
-        owner,
-        lambda: owner.runtime.long_term_memory.enqueue_multimodal_evidence(
-            event_name="print_completed",
-            modality="printer",
-            source="tool_print",
-            message="Printed Twinr output was delivered from a tool call.",
-            data={
-                "request_source": "tool",
-                "job": _normalize_optional_text(print_job),
-                "focus_hint": focus_hint,
-            },
-        ),
-        event_name="print_memory_store_failed",
-        message="Printed output evidence could not be persisted.",
-        default=None,
-    )
+    if bool(getattr(owner, "_persist_multimodal_evidence", True)):
+        # AUDIT-FIX(#5): Long-term evidence capture is non-critical and must not retroactively fail a completed print.
+        _call_best_effort(
+            owner,
+            lambda: owner.runtime.long_term_memory.enqueue_multimodal_evidence(
+                event_name="print_completed",
+                modality="printer",
+                source="tool_print",
+                message="Printed Twinr output was delivered from a tool call.",
+                data={
+                    "request_source": "tool",
+                    "job": _normalize_optional_text(print_job),
+                    "focus_hint": focus_hint,
+                },
+            ),
+            event_name="print_memory_store_failed",
+            message="Printed output evidence could not be persisted.",
+            default=None,
+        )
     return {
         "status": "printed",
         "text": composed_text,

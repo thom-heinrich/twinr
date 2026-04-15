@@ -103,6 +103,28 @@ def _query_match_terms(query_terms: set[str]) -> set[str]:
     return informative or query_terms
 
 
+def _has_exact_contact_identity(
+    *,
+    exact_contact_match: bool,
+    requested_contact_label: str,
+    normalized_labels: set[str],
+    full_label: str,
+    candidate_label: str,
+) -> bool:
+    """Return whether one candidate has exact identity evidence.
+
+    A matching family name alone is not strong enough to bypass other
+    disambiguators like the requested role. Exact identity requires either the
+    same concrete contact value or an exact person-label match.
+    """
+
+    if exact_contact_match:
+        return True
+    if requested_contact_label and requested_contact_label in normalized_labels:
+        return True
+    return bool(full_label and full_label.lower() == candidate_label.lower())
+
+
 def _has_query_overlap(*, query_terms: set[str], document_terms: set[str]) -> bool:
     """Return whether document terms overlap one query through exact or compound matches."""
 
@@ -518,6 +540,7 @@ class TwinrPersonalGraphStore:
                 unique = self._resolve_contact_candidate(
                     document=document,
                     candidates=candidates,
+                    given_name=clean_given,
                     family_name=clean_family,
                     role=match_role,
                     contact_label=None,
@@ -665,6 +688,7 @@ class TwinrPersonalGraphStore:
         person = self._resolve_contact_candidate(
             document=document,
             candidates=candidates,
+            given_name=clean_name,
             family_name=clean_family,
             role=clean_role,
             contact_label=clean_contact_label,
@@ -1501,7 +1525,13 @@ class TwinrPersonalGraphStore:
                 (phone and phone in option.phones)
                 or (email and email in option.emails)
             )
-            exact_identity = bool(exact_contact_match or requested_contact_label or family_name)
+            exact_identity = _has_exact_contact_identity(
+                exact_contact_match=exact_contact_match,
+                requested_contact_label=requested_contact_label,
+                normalized_labels=normalized_labels,
+                full_label=full_label,
+                candidate_label=node.label,
+            )
             if requested_contact_label and requested_contact_label not in normalized_labels:
                 continue
             if family_name:
@@ -1543,6 +1573,7 @@ class TwinrPersonalGraphStore:
         *,
         document: TwinrGraphDocumentV1,
         candidates: list[TwinrGraphNodeV1],
+        given_name: str,
         family_name: str | None,
         role: str | None,
         contact_label: str | None,
@@ -1554,18 +1585,25 @@ class TwinrPersonalGraphStore:
         if len(candidates) == 1:
             option = self._contact_option(document, candidates[0])
             candidate = candidates[0]
+            full_label = self._merge_person_label("", given_name, family_name)
             requested_contact_label = (contact_label or "").strip().lower()
             exact_contact_match = bool(
                 (phone and phone in option.phones)
                 or (email and email in option.emails)
             )
-            exact_identity = bool(exact_contact_match or requested_contact_label or family_name)
+            normalized_labels = {
+                label.lower()
+                for label in {candidate.label, *candidate.aliases}
+                if label
+            }
+            exact_identity = _has_exact_contact_identity(
+                exact_contact_match=exact_contact_match,
+                requested_contact_label=requested_contact_label,
+                normalized_labels=normalized_labels,
+                full_label=full_label,
+                candidate_label=candidate.label,
+            )
             if requested_contact_label:
-                normalized_labels = {
-                    label.lower()
-                    for label in {candidate.label, *candidate.aliases}
-                    if label
-                }
                 if requested_contact_label not in normalized_labels:
                     return None
             if family_name:
@@ -1580,9 +1618,10 @@ class TwinrPersonalGraphStore:
                     return None
             if role and option.role and role.lower() not in option.role.lower() and not exact_identity:
                 return None
-            if (phone and option.phones and phone not in option.phones) or (
-                email and option.emails and email not in option.emails
-            ):
+            if (
+                (phone and option.phones and phone not in option.phones)
+                or (email and option.emails and email not in option.emails)
+            ) and not exact_identity:
                 return None
             return candidate
         if family_name or role or phone or email:

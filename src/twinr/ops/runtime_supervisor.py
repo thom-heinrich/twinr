@@ -1,3 +1,7 @@
+# CHANGELOG: 2026-04-11
+# BUG-1: Start the authoritative display loop as its own supervisor child on
+# BUG-1: productive Pi runtimes so required-remote gate blocks keep the Twinr
+# BUG-1: screen visible instead of falling back to the desktop.
 # CHANGELOG: 2026-03-30
 # BUG-1: Handle SIGTERM/SIGINT so the supervisor reaches finally and does not orphan productive child processes on normal service stop/restart.
 # BUG-2: Add bounded exponential backoff for crash loops and spawn failures; the previous loop could thrash CPU/I/O on a Raspberry Pi after repeated child exits.
@@ -12,11 +16,11 @@
 The productive Raspberry Pi runtime should not depend on three unrelated
 `systemd` units or on opportunistic companion spawning inside the conversation
 process. This module owns one top-level supervisor loop that starts the remote
-memory watchdog and the streaming loop as child processes, delays streaming
-startup briefly while the watchdog comes up, and restarts the streaming child
-when core voice/runtime health or runtime-snapshot freshness disappears.
-Display degradation stays visible through ops health, but it must not tear down
-the speech path.
+memory watchdog, the authoritative display loop, and the streaming loop as
+child processes, keeps streaming fail-closed until the required-remote watchdog
+reports ready, and restarts the streaming child when core voice/runtime health
+or runtime-snapshot freshness disappears. Display degradation stays visible
+without tearing down the speech path.
 """
 
 from __future__ import annotations
@@ -62,9 +66,13 @@ from twinr.ops.runtime_supervisor_process import (
     prepend_pythonpath as _prepend_pythonpath,
     python_executable_for_runtime as _python_executable_for_runtime,
 )
+from twinr.runtime_host import (
+    RUNTIME_SUPERVISOR_ENV_KEY,
+    env_flag as _env_flag,
+    should_enable_display_surface,
+)
 
 
-RUNTIME_SUPERVISOR_ENV_KEY = "TWINR_RUNTIME_SUPERVISOR_ACTIVE"
 EXTERNAL_WATCHDOG_ENV_KEY = "TWINR_REMOTE_MEMORY_WATCHDOG_MANAGED_EXTERNALLY"
 _SYSTEMD_NOTIFY_SOCKET_ENV_KEY = "NOTIFY_SOCKET"
 _SYSTEMD_WATCHDOG_USEC_ENV_KEY = "WATCHDOG_USEC"
@@ -110,15 +118,6 @@ def _default_emit(line: str) -> None:
     """Print one bounded supervisor line for journald/systemd capture."""
 
     print(line, flush=True)
-
-
-def _env_flag(name: str) -> bool:
-    """Interpret one conventional environment flag as a boolean."""
-
-    value = str(os.environ.get(name, "") or "").strip().lower()
-    return value in {"1", "true", "yes", "on"}
-
-
 def _default_external_watchdog_starter(
     config: TwinrConfig,
     env_file: str,
@@ -137,13 +136,13 @@ def _default_external_watchdog_starter(
 
 
 class TwinrRuntimeSupervisor:
-    """Own the productive streaming loop plus remote watchdog.
+    """Own the productive display loop, streaming loop, and remote watchdog.
 
     The supervisor starts both productive child processes from the canonical
-    Twinr project root. It prefers to let the watchdog artifact become ready
-    before considering startup healthy, but after a short grace period it will
-    also start the streaming loop so the display companion can continue to
-    surface runtime failure state to the user.
+    Twinr project root. The streaming child stays blocked until the required
+    remote-memory watchdog artifact reports ready. The watchdog startup grace
+    still applies to watchdog-stall recovery so a fresh owner can bootstrap
+    before the supervisor treats startup itself as unhealthy.
 
     Args:
         config: Runtime configuration rooted in the productive project tree.
@@ -158,8 +157,8 @@ class TwinrRuntimeSupervisor:
         sleep: Optional sleep primitive override.
         utcnow: Optional UTC wall-clock override.
         poll_interval_s: Main supervisor loop interval.
-        watchdog_startup_grace_s: How long to wait before starting streaming
-            without a ready watchdog snapshot.
+        watchdog_startup_grace_s: How long to tolerate a fresh watchdog owner
+            before treating its startup as stalled.
         watchdog_startup_timeout_s: Maximum time the watchdog may stay in
             pre-sample startup before the supervisor treats watchdog startup
             itself as stalled.
@@ -242,14 +241,24 @@ class TwinrRuntimeSupervisor:
         )
         self.external_watchdog_starter = external_watchdog_starter
         self.project_root = Path(config.project_root).expanduser().resolve()
+        self._display_enabled = should_enable_display_surface(config, self.env_file)
         self.remote_watchdog_store = RemoteMemoryWatchdogStore.from_config(config)
         self._watchdog = _ManagedChild(
             key="remote-memory-watchdog",
             label="remote memory watchdog",
         )
+        self._display = _ManagedChild(
+            key="display-loop",
+            label="display loop",
+        )
         self._streaming = _ManagedChild(
             key="streaming-loop",
             label="streaming loop",
+        )
+        self._managed_children = (
+            self._watchdog,
+            self._display,
+            self._streaming,
         )
         self._last_streaming_gate_reason: str | None = None
         self._run_started_at_monotonic: float = -1.0
@@ -259,32 +268,25 @@ class TwinrRuntimeSupervisor:
         self._shutdown_signal: int | None = None
         self._previous_signal_handlers: dict[int, object] = {}
         self._child_next_start_at_monotonic: dict[str, float] = {
-            self._watchdog.key: -1.0,
-            self._streaming.key: -1.0,
+            child.key: -1.0 for child in self._managed_children
         }
         self._child_failure_streak: dict[str, int] = {
-            self._watchdog.key: 0,
-            self._streaming.key: 0,
+            child.key: 0 for child in self._managed_children
         }
         self._child_last_start_defer_reason: dict[str, str | None] = {
-            self._watchdog.key: None,
-            self._streaming.key: None,
+            child.key: None for child in self._managed_children
         }
         self._child_pidfds: dict[str, int | None] = {
-            self._watchdog.key: None,
-            self._streaming.key: None,
+            child.key: None for child in self._managed_children
         }
         self._child_start_ticks: dict[str, int | None] = {
-            self._watchdog.key: None,
-            self._streaming.key: None,
+            child.key: None for child in self._managed_children
         }
         self._child_process_group_ids: dict[str, int | None] = {
-            self._watchdog.key: None,
-            self._streaming.key: None,
+            child.key: None for child in self._managed_children
         }
         self._child_isolated_process_group: dict[str, bool] = {
-            self._watchdog.key: False,
-            self._streaming.key: False,
+            child.key: False for child in self._managed_children
         }
         self._systemd_ready = False
         self._systemd_restart_counter_reset = False
@@ -304,6 +306,7 @@ class TwinrRuntimeSupervisor:
             "runtime_supervisor_started",
             env_file=self.env_file,
             manage_watchdog=self.manage_watchdog,
+            display_enabled=self._display_enabled,
             poll_interval_s=self.poll_interval_s,
             watchdog_startup_grace_s=self.watchdog_startup_grace_s,
             watchdog_startup_timeout_s=self.watchdog_startup_timeout_s,
@@ -345,6 +348,7 @@ class TwinrRuntimeSupervisor:
                         assessment=assessment,
                     )
 
+                self._ensure_display_running(now_monotonic=now_monotonic)
                 self._ensure_streaming_running(
                     now_monotonic=now_monotonic,
                     assessment=assessment,
@@ -356,6 +360,7 @@ class TwinrRuntimeSupervisor:
                     snapshot=snapshot,
                 )
                 self._maybe_reset_child_failure_streak(self._watchdog, now_monotonic)
+                self._maybe_reset_child_failure_streak(self._display, now_monotonic)
                 self._maybe_reset_child_failure_streak(self._streaming, now_monotonic)
                 self._maybe_notify_systemd_state(
                     now_monotonic=now_monotonic,
@@ -375,6 +380,7 @@ class TwinrRuntimeSupervisor:
         finally:
             self._notify_systemd("STOPPING=1", "STATUS=Stopping Twinr runtime supervisor.")
             self._stop_child(self._streaming, reason="supervisor_stop")
+            self._stop_child(self._display, reason="supervisor_stop")
             if self.manage_watchdog:
                 self._stop_child(self._watchdog, reason="supervisor_stop")
             self._emit_payload("runtime_supervisor_stopped", signal=self._shutdown_signal)
@@ -382,6 +388,7 @@ class TwinrRuntimeSupervisor:
                 event="runtime_supervisor_stopped",
                 message="Twinr runtime supervisor stopped.",
                 data={
+                    "display_restarts": self._display.restart_count,
                     "streaming_restarts": self._streaming.restart_count,
                     "watchdog_restarts": self._watchdog.restart_count,
                     "signal": self._shutdown_signal,
@@ -404,6 +411,20 @@ class TwinrRuntimeSupervisor:
         ):
             return True
         return self._ensure_child_running(self._watchdog, now_monotonic, reason="startup")
+
+    def _ensure_display_running(
+        self,
+        *,
+        now_monotonic: float,
+    ) -> None:
+        if not self._display_enabled:
+            return
+        self._clear_dead_child(self._display, now_monotonic=now_monotonic)
+        if self._display.is_running():
+            return
+        if self._maybe_adopt_existing_display_owner(now_monotonic=now_monotonic):
+            return
+        self._ensure_child_running(self._display, now_monotonic, reason="startup")
 
     def _ensure_streaming_running(
         self,
@@ -430,8 +451,25 @@ class TwinrRuntimeSupervisor:
             return
 
         self._last_streaming_gate_reason = None
-        start_reason = "watchdog_ready" if assessment.ready else "watchdog_startup_grace_elapsed"
-        self._ensure_child_running(self._streaming, now_monotonic, reason=start_reason)
+        self._ensure_child_running(self._streaming, now_monotonic, reason="watchdog_ready")
+
+    def _maybe_adopt_existing_display_owner(self, *, now_monotonic: float) -> bool:
+        """Adopt one already-running display owner after supervisor restarts."""
+
+        if not self._display_enabled:
+            return False
+        if self._display.process is not None:
+            return False
+        owner_pid = self.loop_owner(self.config, "display-loop")
+        if owner_pid is None or owner_pid <= 0:
+            return False
+        return self._maybe_adopt_existing_child_owner(
+            child=self._display,
+            owner_pid=owner_pid,
+            now_monotonic=now_monotonic,
+            expected_flag="--run-display-loop",
+            reason="existing_display_owner",
+        )
 
     def _maybe_adopt_existing_streaming_owner(self, *, now_monotonic: float) -> bool:
         """Adopt one already-running streaming owner after supervisor restarts."""
@@ -587,9 +625,8 @@ class TwinrRuntimeSupervisor:
         now_monotonic: float,
         assessment: RequiredRemoteWatchdogAssessment,
     ) -> str | None:
+        del now_monotonic
         if assessment.ready:
-            return None
-        if self._watchdog_startup_age_s(now_monotonic) >= self.watchdog_startup_grace_s:
             return None
         return compact_text(
             assessment.detail or "Waiting for remote memory watchdog startup.",
@@ -1224,6 +1261,16 @@ class TwinrRuntimeSupervisor:
                 "--env-file",
                 self.env_file,
                 "--watch-remote-memory",
+            )
+        if key == "display-loop":
+            return (
+                python_executable,
+                "-u",
+                "-m",
+                "twinr",
+                "--env-file",
+                self.env_file,
+                "--run-display-loop",
             )
         if key == "streaming-loop":
             return (

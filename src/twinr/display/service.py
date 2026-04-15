@@ -2,6 +2,10 @@
 # BUG-1: Detect stale active runtime snapshots and stop silently presenting old listening/processing/answering states as current truth.
 # BUG-2: Force a repaint after display reopen/tick recovery; the previous loop could reopen a fresh backend and then skip rendering forever.
 # BUG-3: Let debug-log layouts repaint immediately on semantic changes while still allowing periodic refreshes for identical content.
+# BUG-4: Fail closed for hdmi_wayland operator/background overlay lanes (ReSpeaker HCI, debug pills, ambient reserve cards)
+#        because Pi evidence showed those non-essential changes still retrigger QRasterWindow fullscreen renders and drive
+#        anonymous RSS growth even after face-cue TTL churn and proactive attention face publishing were removed.
+# BUG-5: Correlate snapshot.updated_at with opt-in hdmi_wayland render subphase traces and persist the backend present monotonic timestamp so Pi probes can separate display-loop pickup from the internal Qt path.
 # SEC-1: Sanitize emitted presentation telemetry tokens so file-backed cue payloads cannot forge key=value operator logs.
 # IMP-1: Move internet and health sampling off the hot render path with bounded async workers and cached fallback values.
 # IMP-2: Add adaptive idle polling, optional systemd sd_notify status/watchdog integration, and periodic maintenance refresh for unchanged Waveshare frames.
@@ -20,7 +24,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import inspect
 import logging
@@ -45,6 +49,7 @@ from twinr.display.factory import create_display_adapter
 from twinr.display.heartbeat import DisplayHeartbeatStore, save_display_heartbeat
 from twinr.display.news_ticker import DisplayNewsTickerRuntime
 from twinr.display.presentation_cues import DisplayPresentationCue, DisplayPresentationStore
+from twinr.display.companion_signals import register_display_process_wakeup_listener
 from twinr.display.render_state import DisplayRenderStateStore
 from twinr.display.reserve_bus import resolve_display_reserve_bus
 from twinr.display.respeaker_hci import DisplayReSpeakerHciStore
@@ -55,6 +60,7 @@ from twinr.display.status_forensics import (
     build_display_status_forensics,
     build_system_status_decision,
 )
+from twinr.display.wake_cues import DisplayWakeCue, DisplayWakeCueStore
 from twinr.ops.events import TwinrOpsEventStore
 from twinr.ops.health import (
     TwinrSystemHealth,
@@ -86,8 +92,12 @@ _IDLE_POLL_MAX_S = 1.0
 _ACTIVE_STATUS_SNAPSHOT_STALE_AFTER_S = 20.0
 _WAVESHARE_MAINTENANCE_REFRESH_S = 23 * 60 * 60
 _TELEMETRY_TOKEN_MAX_LEN = 48
-_SYSTEM_STATUS_WARN_RECOVERY_HOLD_S = 5 * 60.0
-_SYSTEM_STATUS_ERROR_RECOVERY_HOLD_S = 10 * 60.0
+# Hold recoveries long enough to require continuous stability, but not so long
+# that a brief backend hiccup leaves the panel looking stuck.
+_SYSTEM_STATUS_WARN_RECOVERY_HOLD_S = 30.0
+_SYSTEM_STATUS_ERROR_RECOVERY_HOLD_S = 60.0
+_RECENT_ERROR_RECOVERY_REASON_CODES = ("recent_error_recovering",)
+_RECENT_ERROR_RECOVERY_REASON_DETAIL = "Recent error cleared and is stabilizing."
 _UNSET = object()
 
 _LOGGER = logging.getLogger(__name__)
@@ -132,6 +142,58 @@ def _never_stop() -> bool:
     return False
 
 
+def _uses_builtin_sleep(sleep_fn: Callable[[float], object]) -> bool:
+    """Return whether the loop still uses the default blocking ``time.sleep``."""
+
+    return (
+        sleep_fn is time.sleep
+        or (
+            getattr(sleep_fn, "__module__", "") == "time"
+            and getattr(sleep_fn, "__name__", "") == "sleep"
+        )
+    )
+
+
+def _display_process_wakeup_quantum_s(config: TwinrConfig) -> float:
+    """Choose a bounded wait quantum for process-level display wake signals."""
+
+    raw_interval = getattr(config, "display_poll_interval_s", _MIN_DISPLAY_POLL_INTERVAL_S)
+    try:
+        interval_s = float(raw_interval)
+    except (TypeError, ValueError):
+        interval_s = _MIN_DISPLAY_POLL_INTERVAL_S
+    if not math.isfinite(interval_s) or interval_s <= 0.0:
+        interval_s = _MIN_DISPLAY_POLL_INTERVAL_S
+    return max(0.01, min(0.05, interval_s))
+
+
+def _interruptible_process_wakeup_sleep(
+    *,
+    wake_event,
+    duration_s: float,
+    quantum_s: float,
+) -> None:
+    """Sleep until timeout or one direct display wake signal arrives."""
+
+    try:
+        remaining = float(duration_s)
+    except (TypeError, ValueError):
+        remaining = 0.0
+    if not math.isfinite(remaining):
+        remaining = 0.0
+    if remaining <= 0.0:
+        return
+
+    deadline = time.monotonic() + remaining
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return
+        if wake_event.wait(timeout=min(quantum_s, remaining)):
+            wake_event.clear()
+            return
+
+
 @dataclass(slots=True)
 class TwinrStatusDisplayLoop:
     """Drive the status panel from runtime snapshots and health signals."""
@@ -148,6 +210,7 @@ class TwinrStatusDisplayLoop:
     debug_log_builder: TwinrDisplayDebugLogBuilder | None = None
     heartbeat_store: DisplayHeartbeatStore | None = None
     face_cue_store: DisplayFaceCueStore | None = None
+    wake_cue_store: DisplayWakeCueStore | None = None
     emoji_cue_store: DisplayEmojiCueStore | None = None
     ambient_impulse_cue_store: DisplayAmbientImpulseCueStore | None = None
     service_connect_cue_store: DisplayServiceConnectCueStore | None = None
@@ -186,6 +249,7 @@ class TwinrStatusDisplayLoop:
     _last_status_forensics: DisplayStatusForensics | None = field(default=None, init=False, repr=False)
     _visible_system_status_decision: DisplaySystemStatusDecision | None = field(default=None, init=False, repr=False)
     _pending_system_recovery_from_status: str | None = field(default=None, init=False, repr=False)
+    _pending_system_recovery_target_signature: tuple[object, ...] | None = field(default=None, init=False, repr=False)
     _pending_system_recovery_since_monotonic_s: float = field(default=0.0, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -210,6 +274,7 @@ class TwinrStatusDisplayLoop:
             debug_log_builder=TwinrDisplayDebugLogBuilder.from_config(config),
             heartbeat_store=DisplayHeartbeatStore.from_config(config),
             face_cue_store=DisplayFaceCueStore.from_config(config),
+            wake_cue_store=DisplayWakeCueStore.from_config(config),
             emoji_cue_store=DisplayEmojiCueStore.from_config(config),
             ambient_impulse_cue_store=DisplayAmbientImpulseCueStore.from_config(config),
             service_connect_cue_store=DisplayServiceConnectCueStore.from_config(config),
@@ -226,83 +291,65 @@ class TwinrStatusDisplayLoop:
         started_at = time.monotonic()
         last_signature: tuple[object, ...] | None = None
         cycles = 0
+        original_sleep = self.sleep
         self._systemd_notify_status("starting", phase="starting", detail="display_loop_starting")
         try:
-            while True:
-                if self.stop_requested():
-                    return 0
-                if duration_s is not None and (time.monotonic() - started_at) >= duration_s:
-                    return 0
-                if max_cycles is not None and cycles >= max_cycles:
-                    return 0
+            with register_display_process_wakeup_listener() as wake_event:
+                if _uses_builtin_sleep(original_sleep):
+                    quantum_s = _display_process_wakeup_quantum_s(self.config)
+                    self.sleep = lambda duration_s: _interruptible_process_wakeup_sleep(
+                        wake_event=wake_event,
+                        duration_s=duration_s,
+                        quantum_s=quantum_s,
+                    )
+                while True:
+                    if self.stop_requested():
+                        return 0
+                    if duration_s is not None and (time.monotonic() - started_at) >= duration_s:
+                        return 0
+                    if max_cycles is not None and cycles >= max_cycles:
+                        return 0
 
-                snapshot, snapshot_stale = self._load_snapshot()
-                status = self._effective_runtime_status(snapshot, stale=snapshot_stale)
-                health = self._current_health(snapshot)
-                internet_ok = self._internet_ok()
-                system_decision = self._system_status_decision(snapshot, health)
-                headline, details = self._build_status_content(
-                    snapshot,
-                    status=status,
-                    stale=snapshot_stale,
-                    health=health,
-                    internet_ok=internet_ok,
-                    system_decision=system_decision,
-                )
-                state_fields = self._build_state_fields(
-                    snapshot,
-                    status=status,
-                    stale=snapshot_stale,
-                    health=health,
-                    internet_ok=internet_ok,
-                    system_decision=system_decision,
-                )
-                log_sections = self._build_log_sections(
-                    snapshot,
-                    status=status,
-                    stale=snapshot_stale,
-                    health=health,
-                    internet_ok=internet_ok,
-                    system_decision=system_decision,
-                )
-                frame = self._display_animation_frame(status)
-                face_cue = self._active_face_cue(snapshot=snapshot)
-                emoji_cue = self._active_emoji_cue()
-                ambient_impulse_cue = self._active_ambient_impulse_cue()
-                service_connect_cue = self._active_service_connect_cue()
-                presentation_cue = self._active_presentation_cue()
-                debug_signals = self._active_debug_signals()
-                ticker_text = self._ticker_text()
-                signature = self._render_signature(
-                    status=status,
-                    headline=headline,
-                    ticker_text=ticker_text,
-                    details=details,
-                    state_fields=state_fields,
-                    log_sections=log_sections,
-                    animation_frame=frame,
-                    face_cue=face_cue,
-                    emoji_cue=emoji_cue,
-                    ambient_impulse_cue=ambient_impulse_cue,
-                    service_connect_cue=service_connect_cue,
-                    presentation_cue=presentation_cue,
-                    debug_signals=debug_signals,
-                )
-                status_forensics = self._status_forensics_from_fields(
-                    snapshot=snapshot,
-                    health=health,
-                    status=status,
-                    headline=headline,
-                    state_fields=state_fields,
-                    snapshot_stale=snapshot_stale,
-                    system_decision=system_decision,
-                )
-
-                if self._should_render_signature(status=status, signature=signature, last_signature=last_signature):
-                    self._last_render_started_at = datetime.now(timezone.utc)
-                    self._write_heartbeat(status, phase="rendering", force=True)
-                    if self._show_status(
-                        status,
+                    snapshot, snapshot_stale = self._load_snapshot()
+                    status = self._effective_runtime_status(snapshot, stale=snapshot_stale)
+                    health = self._current_health(snapshot)
+                    internet_ok = self._internet_ok()
+                    system_decision = self._system_status_decision(snapshot, health)
+                    headline, details = self._build_status_content(
+                        snapshot,
+                        status=status,
+                        stale=snapshot_stale,
+                        health=health,
+                        internet_ok=internet_ok,
+                        system_decision=system_decision,
+                    )
+                    state_fields = self._build_state_fields(
+                        snapshot,
+                        status=status,
+                        stale=snapshot_stale,
+                        health=health,
+                        internet_ok=internet_ok,
+                        system_decision=system_decision,
+                    )
+                    log_sections = self._build_log_sections(
+                        snapshot,
+                        status=status,
+                        stale=snapshot_stale,
+                        health=health,
+                        internet_ok=internet_ok,
+                        system_decision=system_decision,
+                    )
+                    frame = self._display_animation_frame(status)
+                    face_cue = self._active_face_cue(snapshot=snapshot)
+                    wake_cue = self._active_wake_cue()
+                    emoji_cue = self._active_emoji_cue()
+                    ambient_impulse_cue = self._active_ambient_impulse_cue()
+                    service_connect_cue = self._active_service_connect_cue()
+                    presentation_cue = self._active_presentation_cue()
+                    debug_signals = self._active_debug_signals()
+                    ticker_text = self._ticker_text()
+                    signature = self._render_signature(
+                        status=status,
                         headline=headline,
                         ticker_text=ticker_text,
                         details=details,
@@ -310,47 +357,91 @@ class TwinrStatusDisplayLoop:
                         log_sections=log_sections,
                         animation_frame=frame,
                         face_cue=face_cue,
+                        wake_cue=wake_cue,
                         emoji_cue=emoji_cue,
                         ambient_impulse_cue=ambient_impulse_cue,
                         service_connect_cue=service_connect_cue,
                         presentation_cue=presentation_cue,
                         debug_signals=debug_signals,
-                    ):
-                        self._emit_display_status(status=status, presentation_cue=presentation_cue)
-                        last_signature = signature
-                        self._last_render_completed_at = datetime.now(timezone.utc)
-                        self._last_render_status = status
-                        self._last_render_monotonic_s = time.monotonic()
-                        self._force_render_next_cycle = False
-                        self._save_render_state(
-                            status=status,
+                    )
+                    status_forensics = self._status_forensics_from_fields(
+                        snapshot=snapshot,
+                        health=health,
+                        status=status,
+                        headline=headline,
+                        state_fields=state_fields,
+                        snapshot_stale=snapshot_stale,
+                        system_decision=system_decision,
+                    )
+
+                    if self._should_render_signature(status=status, signature=signature, last_signature=last_signature):
+                        self._last_render_started_at = datetime.now(timezone.utc)
+                        self._write_heartbeat(status, phase="rendering", force=True)
+                        if self._show_status(
+                            status,
                             headline=headline,
+                            ticker_text=ticker_text,
                             details=details,
                             state_fields=state_fields,
-                            snapshot=snapshot,
-                            snapshot_stale=snapshot_stale,
-                            health=health,
-                            status_forensics=status_forensics,
-                        )
-                        self._emit_status_forensics_transition(status_forensics)
-                        self._write_heartbeat(status, phase="idle", force=True)
-                        if not self._systemd_ready_sent:
-                            self._systemd_notify("READY=1")
-                            self._systemd_ready_sent = True
+                            log_sections=log_sections,
+                            animation_frame=frame,
+                            face_cue=face_cue,
+                            wake_cue=wake_cue,
+                            emoji_cue=emoji_cue,
+                            ambient_impulse_cue=ambient_impulse_cue,
+                            service_connect_cue=service_connect_cue,
+                            presentation_cue=presentation_cue,
+                            debug_signals=debug_signals,
+                        ):
+                            render_trace = self._consume_display_runtime_trace()
+                            self._emit_display_status(
+                                status=status,
+                                presentation_cue=presentation_cue,
+                                wake_cue=wake_cue,
+                            )
+                            last_signature = signature
+                            self._last_render_completed_at = datetime.now(timezone.utc)
+                            self._last_render_status = status
+                            self._last_render_monotonic_s = time.monotonic()
+                            self._force_render_next_cycle = False
+                            self._save_render_state(
+                                status=status,
+                                headline=headline,
+                                details=details,
+                                state_fields=state_fields,
+                                snapshot=snapshot,
+                                snapshot_stale=snapshot_stale,
+                                health=health,
+                                status_forensics=status_forensics,
+                                presented_monotonic_ns=self._render_trace_presented_monotonic_ns(render_trace),
+                            )
+                            self._emit_display_render_trace(
+                                status=status,
+                                snapshot=snapshot,
+                                render_trace=render_trace,
+                            )
+                            self._emit_status_forensics_transition(status_forensics)
+                            self._write_heartbeat(status, phase="idle", force=True)
+                            if not self._systemd_ready_sent:
+                                self._systemd_notify("READY=1")
+                                self._systemd_ready_sent = True
+                        else:
+                            self._write_heartbeat(status, phase="error", detail="display_show_failed", force=True)
                     else:
-                        self._write_heartbeat(status, phase="error", detail="display_show_failed", force=True)
-                else:
-                    self._write_heartbeat(status, phase="idle")
+                        self._write_heartbeat(status, phase="idle")
+                        self._emit_status_forensics_transition(status_forensics)
 
-                self._tick_display()
-                self._maybe_systemd_watchdog(status=status, phase="idle")
-                cycles += 1
-                self._sleep_once(
-                    status=status,
-                    ticker_text=ticker_text,
-                    presentation_cue=presentation_cue,
-                )
+                    self._tick_display()
+                    self._maybe_systemd_watchdog(status=status, phase="idle")
+                    cycles += 1
+                    self._sleep_once(
+                        status=status,
+                        ticker_text=ticker_text,
+                        presentation_cue=presentation_cue,
+                        wake_cue=wake_cue,
+                    )
         finally:
+            self.sleep = original_sleep
             status = self._effective_runtime_status(
                 self._last_snapshot,
                 stale=self._snapshot_is_stale(self._last_snapshot),
@@ -477,6 +568,8 @@ class TwinrStatusDisplayLoop:
 
     def _respeaker_state_fields(self) -> list[tuple[str, str]]:
         """Return calm operator-visible ReSpeaker HCI fields when relevant."""
+        if self._suppress_hdmi_wayland_non_camera_overlay_churn():
+            return []
         store = self.respeaker_hci_store
         if store is None:
             return []
@@ -765,19 +858,33 @@ class TwinrStatusDisplayLoop:
             self._clear_pending_system_recovery()
             return raw_decision
 
+        if visible_decision.status == "error":
+            if raw_decision.status == "ok":
+                recovery_warn = self._recent_error_recovery_decision(raw_decision)
+                self._visible_system_status_decision = recovery_warn
+                self._start_pending_system_recovery(
+                    from_status=recovery_warn.status,
+                    target_signature=raw_decision.stability_signature(),
+                )
+                return recovery_warn
+            self._visible_system_status_decision = raw_decision
+            self._clear_pending_system_recovery()
+            return raw_decision
+
         hold_s = self._system_status_recovery_hold_s(visible_decision.status)
         if hold_s <= 0.0:
             self._visible_system_status_decision = raw_decision
             self._clear_pending_system_recovery()
             return raw_decision
 
-        now_monotonic = time.monotonic()
-        if self._pending_system_recovery_from_status != visible_decision.status:
-            self._pending_system_recovery_from_status = visible_decision.status
-            self._pending_system_recovery_since_monotonic_s = now_monotonic
+        target_signature = raw_decision.stability_signature()
+        if self._start_pending_system_recovery(
+            from_status=visible_decision.status,
+            target_signature=target_signature,
+        ):
             return visible_decision
 
-        recovery_age_s = now_monotonic - self._pending_system_recovery_since_monotonic_s
+        recovery_age_s = time.monotonic() - self._pending_system_recovery_since_monotonic_s
         if recovery_age_s < hold_s:
             return visible_decision
 
@@ -785,8 +892,37 @@ class TwinrStatusDisplayLoop:
         self._clear_pending_system_recovery()
         return raw_decision
 
+    def _recent_error_recovery_decision(
+        self,
+        raw_decision: DisplaySystemStatusDecision,
+    ) -> DisplaySystemStatusDecision:
+        return replace(
+            raw_decision,
+            status="warn",
+            label="Achtung",
+            reason_codes=_RECENT_ERROR_RECOVERY_REASON_CODES,
+            reason_detail=_RECENT_ERROR_RECOVERY_REASON_DETAIL,
+        )
+
+    def _start_pending_system_recovery(
+        self,
+        *,
+        from_status: str,
+        target_signature: tuple[object, ...],
+    ) -> bool:
+        if (
+            self._pending_system_recovery_from_status == from_status
+            and self._pending_system_recovery_target_signature == target_signature
+        ):
+            return False
+        self._pending_system_recovery_from_status = from_status
+        self._pending_system_recovery_target_signature = target_signature
+        self._pending_system_recovery_since_monotonic_s = time.monotonic()
+        return True
+
     def _clear_pending_system_recovery(self) -> None:
         self._pending_system_recovery_from_status = None
+        self._pending_system_recovery_target_signature = None
         self._pending_system_recovery_since_monotonic_s = 0.0
 
     def _system_status_severity(self, status: str | None) -> int:
@@ -853,6 +989,7 @@ class TwinrStatusDisplayLoop:
         snapshot_stale: bool,
         health: TwinrSystemHealth | None,
         status_forensics: DisplayStatusForensics | None,
+        presented_monotonic_ns: int | None = None,
     ) -> None:
         store = self.render_state_store
         if store is None:
@@ -872,9 +1009,107 @@ class TwinrStatusDisplayLoop:
                 operator_status=None if status_forensics is None else status_forensics.operator_status,
                 operator_reason_codes=() if status_forensics is None else status_forensics.reason_codes,
                 operator_reason_detail=None if status_forensics is None else status_forensics.reason_detail,
+                presented_monotonic_ns=presented_monotonic_ns,
             )
         except Exception as exc:
             self._emit_error("display_render_state_save_failed", exc)
+
+    def _consume_display_runtime_trace(self) -> dict[str, object] | None:
+        consume = getattr(self.display, "consume_runtime_trace", None)
+        if not callable(consume):
+            return None
+        try:
+            payload = consume()  # pylint: disable=not-callable
+        except Exception as exc:
+            self._emit_error("display_runtime_trace_consume_failed", exc)
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    def _render_trace_presented_monotonic_ns(self, render_trace: dict[str, object] | None) -> int | None:
+        if not isinstance(render_trace, dict):
+            return None
+        return self._coerce_trace_int(render_trace.get("backend_presented_monotonic_ns"))
+
+    def _emit_display_render_trace(
+        self,
+        *,
+        status: str,
+        snapshot: RuntimeSnapshot | None,
+        render_trace: dict[str, object] | None,
+    ) -> None:
+        if not self._display_runtime_trace_enabled():
+            return
+        if not isinstance(render_trace, dict):
+            return
+        snapshot_to_show_status_ms = self._snapshot_to_show_status_ms(snapshot)
+        show_status_ms = self._trace_duration_ms(
+            render_trace,
+            start_key="show_status_started_monotonic_ns",
+            end_key="show_status_completed_monotonic_ns",
+        )
+        render_status_image_ms = self._trace_duration_ms(
+            render_trace,
+            start_key="render_status_image_started_monotonic_ns",
+            end_key="render_status_image_completed_monotonic_ns",
+        )
+        show_image_ms = self._trace_duration_ms(
+            render_trace,
+            start_key="show_image_started_monotonic_ns",
+            end_key="show_image_completed_monotonic_ns",
+        )
+        process_events_ms = self._trace_duration_ms(
+            render_trace,
+            start_key="process_events_started_monotonic_ns",
+            end_key="process_events_completed_monotonic_ns",
+        )
+        internal_present_ms = self._trace_duration_ms(
+            render_trace,
+            start_key="show_status_started_monotonic_ns",
+            end_key="backend_presented_monotonic_ns",
+        )
+        summary_parts = [
+            "display_trace=render_path",
+            f"status={self._telemetry_token(status, fallback='status')}",
+        ]
+        for key, value in (
+            ("snap_ms", snapshot_to_show_status_ms),
+            ("show_ms", show_status_ms),
+            ("render_ms", render_status_image_ms),
+            ("image_ms", show_image_ms),
+            ("qt_ms", process_events_ms),
+            ("present_ms", internal_present_ms),
+        ):
+            if value is not None:
+                summary_parts.append(f"{key}={value:.1f}")
+        self._safe_emit(" ".join(summary_parts))
+        store = self.event_store
+        if store is None:
+            return
+        try:
+            store.append(
+                event="display_render_trace",
+                message="Recorded one bounded display render-path trace.",
+                data={
+                    "driver": self._compact_text(render_trace.get("driver"), max_len=_STATUS_TEXT_MAX_LEN).lower()
+                    or self._display_driver(),
+                    "layout": self._display_layout(),
+                    "status": self._compact_text(status, max_len=_STATUS_TEXT_MAX_LEN).lower() or "status",
+                    "snapshot_status": self._snapshot_status(snapshot) if snapshot is not None else None,
+                    "snapshot_revision": None if snapshot is None else int(getattr(snapshot, "revision", 0) or 0),
+                    "snapshot_updated_at": None if snapshot is None else getattr(snapshot, "updated_at", None),
+                    "snapshot_to_show_status_ms": snapshot_to_show_status_ms,
+                    "show_status_ms": show_status_ms,
+                    "render_status_image_ms": render_status_image_ms,
+                    "show_image_ms": show_image_ms,
+                    "process_events_ms": process_events_ms,
+                    "internal_present_ms": internal_present_ms,
+                    "render_trace": render_trace,
+                },
+            )
+        except Exception as exc:
+            self._emit_error("display_render_trace_append_failed", exc)
 
     def _load_snapshot(self) -> tuple[RuntimeSnapshot | None, bool]:
         try:
@@ -901,6 +1136,7 @@ class TwinrStatusDisplayLoop:
         log_sections: LogSections,
         animation_frame: int,
         face_cue: DisplayFaceCue | None,
+        wake_cue: DisplayWakeCue | None = None,
         emoji_cue: DisplayEmojiCue | None,
         ambient_impulse_cue: DisplayAmbientImpulseCue | None,
         service_connect_cue: DisplayServiceConnectCue | None,
@@ -917,6 +1153,7 @@ class TwinrStatusDisplayLoop:
                 log_sections=log_sections,
                 animation_frame=animation_frame,
                 face_cue=face_cue,
+                wake_cue=wake_cue,
                 emoji_cue=emoji_cue,
                 ambient_impulse_cue=ambient_impulse_cue,
                 service_connect_cue=service_connect_cue,
@@ -938,6 +1175,7 @@ class TwinrStatusDisplayLoop:
                     log_sections=log_sections,
                     animation_frame=animation_frame,
                     face_cue=face_cue,
+                    wake_cue=wake_cue,
                     emoji_cue=emoji_cue,
                     ambient_impulse_cue=ambient_impulse_cue,
                     service_connect_cue=service_connect_cue,
@@ -1054,11 +1292,13 @@ class TwinrStatusDisplayLoop:
         status: str,
         ticker_text: str | None,
         presentation_cue: DisplayPresentationCue | None,
+        wake_cue: DisplayWakeCue | None = None,
     ) -> None:
         poll_interval_s = self._effective_poll_interval_s(
             status=status,
             ticker_text=ticker_text,
             presentation_cue=presentation_cue,
+            wake_cue=wake_cue,
         )
         self._pause(poll_interval_s)
 
@@ -1075,12 +1315,15 @@ class TwinrStatusDisplayLoop:
         status: str,
         ticker_text: str | None,
         presentation_cue: DisplayPresentationCue | None,
+        wake_cue: DisplayWakeCue | None = None,
     ) -> float:
         base_interval = self._poll_interval_s()
         if self._display_layout() != "default":
             return max(base_interval, 0.25)
         normalized_status = self._compact_text(status).lower()
         if normalized_status in _ACTIVE_RUNTIME_STATES:
+            return base_interval
+        if wake_cue is not None:
             return base_interval
         if presentation_cue is not None:
             return base_interval
@@ -1204,6 +1447,7 @@ class TwinrStatusDisplayLoop:
         log_sections: LogSections,
         animation_frame: int,
         face_cue: DisplayFaceCue | None,
+        wake_cue: DisplayWakeCue | None = None,
         emoji_cue: DisplayEmojiCue | None,
         ambient_impulse_cue: DisplayAmbientImpulseCue | None,
         service_connect_cue: DisplayServiceConnectCue | None,
@@ -1214,6 +1458,7 @@ class TwinrStatusDisplayLoop:
         if layout_mode == "debug_log":
             return (layout_mode, status, headline, log_sections)
         cue_signature = face_cue.signature() if face_cue is not None else None
+        wake_signature = wake_cue.visual_signature() if wake_cue is not None else None
         reserve_signature = resolve_display_reserve_bus(
             service_connect_cue=service_connect_cue,
             emoji_cue=emoji_cue,
@@ -1232,6 +1477,7 @@ class TwinrStatusDisplayLoop:
             log_sections,
             animation_frame,
             cue_signature,
+            wake_signature,
             reserve_signature,
             presentation_signature,
             presentation_bucket,
@@ -1281,13 +1527,37 @@ class TwinrStatusDisplayLoop:
     def _display_layout(self) -> str:
         return self._compact_text(getattr(self.config, "display_layout", "default")).lower() or "default"
 
+    def _display_driver(self) -> str:
+        return self._compact_text(getattr(self.config, "display_driver", None)).lower()
+
+    def _display_runtime_trace_enabled(self) -> bool:
+        return bool(getattr(self.config, "display_runtime_trace_enabled", False))
+
+    def _suppress_hdmi_wayland_non_camera_overlay_churn(self) -> bool:
+        """Return whether non-camera operator overlays must fail closed on Wayland.
+
+        On the real Pi, low-priority operator overlays such as ReSpeaker stale
+        badges or ambient reserve cards can still retrigger fullscreen Wayland
+        renders without helping the senior-facing interaction surface. Keep
+        those non-camera overlays suppressed on hdmi_wayland default layout.
+        Camera debug pills are handled separately because they are the explicit
+        operator truth surface for live camera/servo state.
+        """
+
+        return self._display_layout() == "default" and self._display_driver() == "hdmi_wayland"
+
     def _emit_display_status(
         self,
         *,
         status: str,
         presentation_cue: DisplayPresentationCue | None,
+        wake_cue: DisplayWakeCue | None = None,
     ) -> None:
-        signature = self._display_telemetry_signature(status=status, presentation_cue=presentation_cue)
+        signature = self._display_telemetry_signature(
+            status=status,
+            presentation_cue=presentation_cue,
+            wake_cue=wake_cue,
+        )
         if signature == self._last_display_telemetry_signature:
             return
         self._last_display_telemetry_signature = signature
@@ -1312,6 +1582,11 @@ class TwinrStatusDisplayLoop:
                 queued_count = len(presentation_cue.queued_cards())
                 if queued_count > 0:
                     parts.append(f"presentation_queue={queued_count}")
+        if wake_cue is not None:
+            parts.append(
+                "wake="
+                f"{self._telemetry_token(wake_cue.telemetry_signature(), fallback='speculative')}"
+            )
         self._safe_emit(" ".join(parts))
 
     def _telemetry_token(
@@ -1336,10 +1611,12 @@ class TwinrStatusDisplayLoop:
         *,
         status: str,
         presentation_cue: DisplayPresentationCue | None,
+        wake_cue: DisplayWakeCue | None,
     ) -> tuple[object, ...]:
         layout_mode = self._display_layout()
         presentation_signature = presentation_cue.telemetry_signature() if presentation_cue is not None else None
-        return (layout_mode, status, presentation_signature)
+        wake_signature = wake_cue.telemetry_signature() if wake_cue is not None else None
+        return (layout_mode, status, presentation_signature, wake_signature)
 
     def _status_forensics_from_fields(
         self,
@@ -1403,6 +1680,18 @@ class TwinrStatusDisplayLoop:
             self._emit_error("display_face_cue_load_failed", exc)
             return None
 
+    def _active_wake_cue(self) -> DisplayWakeCue | None:
+        if self._display_layout() != "default":
+            return None
+        store = self.wake_cue_store
+        if store is None:
+            return None
+        try:
+            return store.load_active()
+        except Exception as exc:
+            self._emit_error("display_wake_cue_load_failed", exc)
+            return None
+
     def _active_emoji_cue(self) -> DisplayEmojiCue | None:
         if self._display_layout() != "default":
             return None
@@ -1441,6 +1730,8 @@ class TwinrStatusDisplayLoop:
 
     def _active_ambient_impulse_cue(self) -> DisplayAmbientImpulseCue | None:
         if self._display_layout() != "default":
+            return None
+        if self._suppress_hdmi_wayland_non_camera_overlay_churn():
             return None
         store = self.ambient_impulse_cue_store
         if store is None:
@@ -1502,6 +1793,35 @@ class TwinrStatusDisplayLoop:
         if parsed.tzinfo is None:
             return parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
+
+    def _snapshot_to_show_status_ms(self, snapshot: RuntimeSnapshot | None) -> float | None:
+        started_at = self._last_render_started_at
+        updated_at = self._snapshot_updated_at_utc(snapshot)
+        if started_at is None or updated_at is None:
+            return None
+        return max(0.0, (started_at - updated_at).total_seconds() * 1000.0)
+
+    def _trace_duration_ms(
+        self,
+        render_trace: dict[str, object],
+        *,
+        start_key: str,
+        end_key: str,
+    ) -> float | None:
+        start_ns = self._coerce_trace_int(render_trace.get(start_key))
+        end_ns = self._coerce_trace_int(render_trace.get(end_key))
+        if start_ns is None or end_ns is None or end_ns < start_ns:
+            return None
+        return (end_ns - start_ns) / 1_000_000.0
+
+    def _coerce_trace_int(self, value: object | None) -> int | None:
+        if value is None or value == "":
+            return None
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError):
+            return None
+        return numeric if numeric >= 0 else None
 
     def _snapshot_is_stale(self, snapshot: RuntimeSnapshot | None) -> bool:
         if snapshot is None:

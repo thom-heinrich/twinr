@@ -3,6 +3,12 @@
 # BUG-2: Fixed center/dropout stabilization losing soft local head-turn cues (e.g. gaze_x=±1) during rehydration.
 # BUG-3: Fixed runtime crashes from invalid numeric config values in hold/refresh timing paths.
 # BUG-4: Reduced producer-stomp race by re-checking cue ownership immediately before mutating the shared store.
+# BUG-5: Disabled continuous hdmi_wayland face-cue publishing because sustained live Wayland rerenders still
+#        drive Pi runtime RSS into memory-pressure territory even after TTL-only cue refresh churn was removed.
+# BUG-6: Disabled the entire hdmi_wayland attention-refresh lane because Pi evidence showed the hidden
+#        camera/servo path still pushes the streaming runtime into memory-pressure territory there.
+# BUG-7: Restored the hdmi_wayland attention-refresh fail-close after a regression drifted the hidden
+#        camera/servo lane back into the transcript-first voice runtime and reintroduced Pi backpressure.
 # SEC-1: Hardened shared-store reads by bounding persisted cue axes/head offsets before reuse, limiting malformed or tampered cue payload impact.
 # IMP-1: Added low-latency adaptive 1€ smoothing for camera / attention-target coordinates in the publisher path (Pi 4 friendly, no extra dependency).
 # IMP-2: Added optional freshness/confidence gating for sensor facts to ignore stale or weak anchors instead of rendering outdated attention.
@@ -792,6 +798,29 @@ def resolve_display_attention_refresh_interval(config: TwinrConfig) -> float | N
     return max(_MIN_REFRESH_INTERVAL_S, interval_s)
 
 
+def display_attention_refresh_backend_supported(
+    *,
+    config: TwinrConfig,
+) -> bool:
+    """Return whether the current display backend may run the attention-refresh lane.
+
+    `hdmi_wayland` stays fail-closed here. The transcript-first voice runtime
+    shares one streaming PID with live voice transport, and fresh Pi evidence
+    on 2026-04-13 showed that re-opening the hidden IMX500/servo lane there
+    still reproduces the old memory-pressure and backpressure signature.
+    Continuous face publication stays gated separately below, but the cheaper
+    hidden lane is not treated as safe on Wayland until new isolated Pi proof
+    says otherwise.
+    """
+
+    if resolve_display_attention_refresh_interval(config) is None:
+        return False
+    display_driver = str(getattr(config, "display_driver", "") or "").strip().lower()
+    if not display_driver.startswith("hdmi"):
+        return False
+    return display_driver != "hdmi_wayland"
+
+
 def display_attention_refresh_supported(
     *,
     config: TwinrConfig,
@@ -799,12 +828,25 @@ def display_attention_refresh_supported(
 ) -> bool:
     """Return whether a bounded fast attention-refresh path is safe to run."""
 
-    if resolve_display_attention_refresh_interval(config) is None:
-        return False
-    display_driver = str(getattr(config, "display_driver", "") or "").strip().lower()
-    if not display_driver.startswith("hdmi"):
+    if not display_attention_refresh_backend_supported(config=config):
         return False
     return getattr(vision_observer, "supports_attention_refresh", False) is True
+
+
+def display_attention_face_publish_supported(
+    *,
+    config: TwinrConfig,
+) -> bool:
+    """Return whether the current HDMI backend may accept live face-follow cue writes.
+
+    `hdmi_wayland` still stays fail-closed for continuous face publication.
+    The hidden camera/servo fast path is now separately cleared there, but
+    fullscreen Wayland face rerenders remain an independent risk surface that
+    still requires dedicated display-side proof before re-enabling.
+    """
+
+    display_driver = str(getattr(config, "display_driver", "") or "").strip().lower()
+    return display_driver != "hdmi_wayland"
 
 
 def _gaze_from_attention_target(
@@ -1555,6 +1597,8 @@ __all__ = [
     "DisplayAttentionCueDecision",
     "DisplayAttentionCuePublishResult",
     "DisplayAttentionCuePublisher",
+    "display_attention_face_publish_supported",
+    "display_attention_refresh_backend_supported",
     "display_attention_refresh_supported",
     "derive_display_attention_cue",
     "resolve_display_attention_refresh_interval",

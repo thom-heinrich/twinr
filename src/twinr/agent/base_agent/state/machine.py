@@ -6,6 +6,10 @@
 #        transition(..., error=...) now preserves diagnostic context.
 # BUG-3: Added epoch-gated stale-event suppression for async callbacks so late
 #        worker completions after RESET / state changes do not derail runtime.
+# BUG-4: Accept delayed follow-up reopen events from `waiting` as well as
+#        `answering`, so the runtime can stop claiming `speaking` immediately
+#        after audio drains while still allowing a later gated reopen to
+#        `listening`.
 # SEC-1: Normalized and size-capped error/source payloads to reduce practical
 #        log-injection / terminal-control / resource-exhaustion risk on edge
 #        deployments.
@@ -100,12 +104,12 @@ _PRINT_START_EVENTS = frozenset({TwinrEvent.YELLOW_BUTTON_PRESSED, TwinrEvent.PR
 # Async events that are produced by workers watching a specific source state.
 # If they arrive after the machine has already moved on, they are safely
 # ignored instead of raising and destabilizing runtime recovery.
-_ASYNC_SOURCE_STATES: dict[TwinrEvent, TwinrStatus] = {
-    TwinrEvent.SPEECH_PAUSE_DETECTED: TwinrStatus.LISTENING,
-    TwinrEvent.RESPONSE_READY: TwinrStatus.PROCESSING,
-    TwinrEvent.PROCESSING_RESUMED: TwinrStatus.ANSWERING,
-    TwinrEvent.FOLLOW_UP_ARMED: TwinrStatus.ANSWERING,
-    TwinrEvent.TTS_FINISHED: TwinrStatus.ANSWERING,
+_ASYNC_SOURCE_STATES: dict[TwinrEvent, frozenset[TwinrStatus]] = {
+    TwinrEvent.SPEECH_PAUSE_DETECTED: frozenset({TwinrStatus.LISTENING}),
+    TwinrEvent.RESPONSE_READY: frozenset({TwinrStatus.PROCESSING}),
+    TwinrEvent.PROCESSING_RESUMED: frozenset({TwinrStatus.ANSWERING}),
+    TwinrEvent.FOLLOW_UP_ARMED: frozenset({TwinrStatus.ANSWERING, TwinrStatus.WAITING}),
+    TwinrEvent.TTS_FINISHED: frozenset({TwinrStatus.ANSWERING}),
 }
 
 # Base transitions for the primary status axis. Printing is handled as an
@@ -113,6 +117,7 @@ _ASYNC_SOURCE_STATES: dict[TwinrEvent, TwinrStatus] = {
 _BASE_TRANSITIONS: dict[TwinrStatus, dict[TwinrEvent, TwinrStatus]] = {
     TwinrStatus.WAITING: {
         TwinrEvent.GREEN_BUTTON_PRESSED: TwinrStatus.LISTENING,
+        TwinrEvent.FOLLOW_UP_ARMED: TwinrStatus.LISTENING,
         TwinrEvent.PROACTIVE_PROMPT_READY: TwinrStatus.ANSWERING,
     },
     TwinrStatus.LISTENING: {
@@ -804,9 +809,12 @@ class TwinrStateMachine:
                 raise _IgnoredEvent("ignored print completion without an active print job")
             return
 
-        expected_source = _ASYNC_SOURCE_STATES.get(event)
-        if expected_source is not None and current_status is not expected_source:
-            raise _IgnoredEvent(f"ignored late {event.value} while in {current_status.value}")
+        expected_sources = _ASYNC_SOURCE_STATES.get(event)
+        if expected_sources is not None and current_status not in expected_sources:
+            allowed_states = ", ".join(status.value for status in expected_sources)
+            raise _IgnoredEvent(
+                f"ignored late {event.value} while in {current_status.value}; expected one of {allowed_states}"
+            )
 
     def _resolve_next_status_locked(
         self,

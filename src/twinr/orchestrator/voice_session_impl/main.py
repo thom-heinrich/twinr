@@ -35,7 +35,12 @@ from twinr.orchestrator.voice_forensics import VoiceFrameTelemetryBucket
 from twinr.orchestrator.voice_runtime_intent import VoiceRuntimeIntentContext
 from twinr.orchestrator.voice_transcript_debug_stream import VoiceTranscriptDebugStream
 
-from ..voice_contracts import OrchestratorVoiceAudioFrame, OrchestratorVoiceRuntimeStateEvent
+from ..voice_contracts import (
+    OrchestratorVoiceAudioFrame,
+    OrchestratorVoiceTranscriptCommittedEvent,
+    OrchestratorVoiceRuntimeStateEvent,
+    OrchestratorVoiceWakeConfirmedEvent,
+)
 from .builders import build_transcript_backend, build_wake_phrase_spotter
 from .observability import VoiceSessionObservabilityMixin
 from .runtime_state import VoiceSessionRuntimeStateMixin
@@ -64,6 +69,8 @@ class EdgeOrchestratorVoiceSessionImpl(
     _REMOTE_ASR_SPEECH_CONTINUE_RATIO = 0.35
     _STRONG_SPEAKER_STAGE1_WINDOW_BONUS_MS = 250
     _STRONG_SPEAKER_MIN_WAKE_DURATION_RELIEF_MS = 50
+    _WAKE_SPECULATIVE_MIN_TTL_MS = 1200
+    _WAKE_SPECULATIVE_MAX_TTL_MS = 6000
 
     _PCM_SAMPLE_WIDTH_BYTES = 2
     _DEFAULT_MAX_FRAME_MS = 500
@@ -193,7 +200,6 @@ class EdgeOrchestratorVoiceSessionImpl(
             0.25,
             float(getattr(config, "voice_orchestrator_candidate_cooldown_s", 0.9) or 0.9),
         )
-        self._wake_candidate_cooldown_s = self.chunk_ms / 1000.0
         self.speech_threshold = max(0, int(config.audio_speech_threshold))
         self._monotonic = monotonic_fn
         self._history: deque[_RecentFrame] = deque(
@@ -241,7 +247,6 @@ class EdgeOrchestratorVoiceSessionImpl(
             config,
             backend=self.backend,
             phrases=contextual_bias_voice_activation_phrases(activation_phrases),
-            allow_twi_head_variant_recovery=True,
         )
         self._audio_debug_store = VoiceAudioDebugArtifactStore.from_config(config)
         self._transcript_debug_stream = VoiceTranscriptDebugStream.from_config(config)
@@ -276,6 +281,10 @@ class EdgeOrchestratorVoiceSessionImpl(
     def handle_audio_frame(self, frame: OrchestratorVoiceAudioFrame) -> list[dict[str, Any]]:
         """Process one streamed PCM frame and emit any server-side decisions."""
 
+        try:
+            frame.validate()
+        except Exception as exc:
+            return [self._voice_error_payload(str(exc))]
         events = self._drain_timeouts()
 
         runtime_state = frame.runtime_state
@@ -290,14 +299,19 @@ class EdgeOrchestratorVoiceSessionImpl(
         pcm_bytes = self._coerce_pcm_bytes(frame.pcm_bytes)
         if not pcm_bytes:
             return events
+        if frame.speech_probability is None:
+            return [
+                self._voice_error_payload(
+                    "voice_audio_frame.speech_probability is required for non-empty PCM frames"
+                )
+            ]
 
         sequence = self._coerce_sequence(frame.sequence)
-        speech_probability = frame.speech_probability
         for part_index, chunk in enumerate(self._iter_bounded_pcm_chunks(pcm_bytes)):
             chunk_events, should_stop = self._process_pcm_chunk(
                 sequence=self._sequence_for_subchunk(sequence, part_index),
                 pcm_bytes=chunk,
-                speech_probability=speech_probability,
+                speech_probability=frame.speech_probability,
             )
             events.extend(chunk_events)
             if should_stop:
@@ -313,10 +327,13 @@ class EdgeOrchestratorVoiceSessionImpl(
     ) -> tuple[list[dict[str, Any]], bool]:
         events: list[dict[str, Any]] = []
 
-        self._received_frame_bucket.add_frame(sequence=sequence, pcm_bytes=pcm_bytes)
+        self._received_frame_bucket.add_frame(
+            sequence=sequence,
+            pcm_bytes=pcm_bytes,
+            speech_confidence=speech_probability,
+        )
         if self._received_frame_bucket.should_flush():
             self._flush_received_frame_bucket()
-
         self._remember_frame(pcm_bytes, speech_probability=speech_probability)
 
         if self._state == "speaking" and not self._barge_in_sent:
@@ -328,10 +345,20 @@ class EdgeOrchestratorVoiceSessionImpl(
                 return events, True
 
         if self._should_use_streaming_utterance_path():
-            utterance_event = self._advance_remote_asr_utterance()
-            if utterance_event is not None:
-                events.append(utterance_event.to_payload())
-                return events, True
+            utterance_events = self._advance_remote_asr_utterance()
+            if utterance_events:
+                events.extend(event.to_payload() for event in utterance_events)
+                should_stop = any(
+                    isinstance(
+                        event,
+                        (
+                            OrchestratorVoiceWakeConfirmedEvent,
+                            OrchestratorVoiceTranscriptCommittedEvent,
+                        ),
+                    )
+                    for event in utterance_events
+                )
+                return events, should_stop
 
         return events, False
 
@@ -353,16 +380,29 @@ class EdgeOrchestratorVoiceSessionImpl(
 
         return state_owns_streaming_utterances
 
+    def _wake_speculative_ttl_ms(self) -> int:
+        """Hold speculative wake visuals long enough to bridge same-stream confirmation."""
+
+        ttl_ms = max(
+            self.history_ms,
+            self.wake_candidate_window_ms + self.wake_tail_max_ms + self.wake_tail_endpoint_silence_ms,
+        )
+        ttl_ms = max(self._WAKE_SPECULATIVE_MIN_TTL_MS, ttl_ms)
+        ttl_ms = min(self._WAKE_SPECULATIVE_MAX_TTL_MS, ttl_ms)
+        return int(ttl_ms)
+
     def _reset_transient_state(self, *, new_trace_id: bool) -> None:
         if new_trace_id or not getattr(self, "_trace_id", ""):
             self._trace_id = uuid4().hex
-        self._next_wake_candidate_check_at = 0.0
         self._next_barge_in_candidate_check_at = 0.0
+        self._wake_speculative_active = False
         self._barge_in_sent = False
         self._session_id = ""
         self._state = "waiting"
         self._follow_up_allowed = False
         self._runtime_state_attested = False
+        self._active_remote_wait_id: str | None = None
+        self._active_remote_wait_state: str | None = None
         self._last_waiting_visible_at: float | None = None
         self._pending_transcript_utterance: _PendingTranscriptUtterance | None = None
         self._follow_up_deadline_at: float | None = None

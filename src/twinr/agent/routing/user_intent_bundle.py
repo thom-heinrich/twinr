@@ -9,6 +9,8 @@
 # IMP-3: Expose validated model IO metadata, embedding_dim, artifact digests, and integrity status to downstream code.
 # BUG-4: Allow trusted live-runtime callers to defer heavyweight ORT session validation until first use so
 #        Pi idle startup does not retain a giant validation session before the semantic router is needed.
+# BUG-5: Defer heavyweight tokenizer validation together with ORT validation for trusted lazy-runtime
+#        callers so Pi idle startup does not retain the tokenizer's large native heap before first use.
 
 """Load and validate versioned user-intent bundles for the first router stage."""
 
@@ -1092,7 +1094,11 @@ def load_user_intent_bundle(
         description="tokenizer artifact",
         max_bytes=64 * 1024 * 1024,
     )
-    _validate_tokenizer(tokenizer_path, metadata=metadata)
+    # Defer heavyweight tokenizer parsing for live Pi startup when the caller
+    # explicitly requested lazy runtime validation. First real encoder use still
+    # loads the tokenizer from disk and will fail fast if the artifact is bad.
+    if eager_runtime_validation:
+        _validate_tokenizer(tokenizer_path, metadata=metadata)
 
     centroids_path: Path | None = None
     weights_path: Path | None = None

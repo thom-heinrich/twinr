@@ -7,13 +7,14 @@ can be inspected after the temporary run directory is cleaned up.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sized
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 import json
 from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory, mkdtemp
-from typing import Mapping
+from typing import Mapping, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from twinr.agent.base_agent.config import TwinrConfig
@@ -28,7 +29,7 @@ from twinr.memory.longterm.core.models import (
     LongTermMultimodalEvidence,
 )
 from twinr.memory.longterm.runtime.service import LongTermMemoryService
-from twinr.memory.query_normalization import LongTermQueryProfile
+from twinr.memory.query_normalization import LongTermQueryProfile, LongTermQueryRewriter
 
 
 _FIXED_SEED_TARGET = 500
@@ -67,6 +68,7 @@ class MultimodalEvalCaseResult:
     present_forbidden_durable: tuple[str, ...]
     present_forbidden_episodic: tuple[str, ...]
     error: str | None = None  # AUDIT-FIX(#3): Preserve per-case retrieval failures without aborting the full evaluation run.
+    diagnostics: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,8 +279,9 @@ def _run_multimodal_longterm_eval_in_root(
                 f"Expected {case_target} multimodal eval cases, got {len(cases)}."
             )
 
-        service.query_rewriter = _StaticQueryRewriter(
-            {case.query_text: case.canonical_query_text for case in cases}
+        service.query_rewriter = cast(
+            LongTermQueryRewriter,
+            _StaticQueryRewriter({case.query_text: case.canonical_query_text for case in cases}),
         )
         case_results = tuple(_run_case(service, case) for case in cases)
         summary = _summarize(case_results)
@@ -620,14 +623,11 @@ def _fixture_datetime(
 def _count_loaded_items(items: object) -> int:
     """Count objects loaded from stores that may return multiple container types."""
 
-    try:
-        return len(items)  # type: ignore[arg-type]
-    except TypeError:
-        try:
-            iterator = iter(items)  # type: ignore[arg-type]
-        except TypeError as exc:
-            raise TypeError("Loaded store items must be sized or iterable.") from exc
-        return sum(1 for _ in iterator)
+    if isinstance(items, Sized):
+        return len(items)
+    if isinstance(items, Iterable):
+        return sum(1 for _ in items)
+    raise TypeError("Loaded store items must be sized or iterable.")
 
 
 def _targeted_episodes(
@@ -854,6 +854,11 @@ def _run_case(service: LongTermMemoryService, case: MultimodalEvalCase) -> Multi
             present_forbidden_durable=(),
             present_forbidden_episodic=(),
             error=f"{type(exc).__name__}: {exc}",
+            diagnostics=_case_failure_diagnostics(
+                service=service,
+                case=case,
+                phase="build_provider_context_failed",
+            ),
         )
 
     durable_text = _normalized_context_text(context, "durable_context")
@@ -884,6 +889,21 @@ def _run_case(service: LongTermMemoryService, case: MultimodalEvalCase) -> Multi
     if case.expect_episodic_context is not None:
         passed = passed and (episodic_present == case.expect_episodic_context)
 
+    diagnostics = {
+        "durable_chars": len(durable_text),
+        "episodic_chars": len(episodic_text),
+        "durable_excerpt": durable_text[:320],
+        "episodic_excerpt": episodic_text[:320],
+    }
+    if not passed:
+        diagnostics.update(
+            _case_failure_diagnostics(
+                service=service,
+                case=case,
+                phase="assertion_failed",
+            )
+        )
+
     return MultimodalEvalCaseResult(
         case_id=case.case_id,
         category=case.category,
@@ -894,7 +914,101 @@ def _run_case(service: LongTermMemoryService, case: MultimodalEvalCase) -> Multi
         missing_episodic=missing_episodic,
         present_forbidden_durable=forbidden_durable,
         present_forbidden_episodic=forbidden_episodic,
+        diagnostics=diagnostics,
     )
+
+
+def _case_failure_diagnostics(
+    *,
+    service: LongTermMemoryService,
+    case: MultimodalEvalCase,
+    phase: str,
+) -> dict[str, object]:
+    """Capture bounded selector evidence for failed multimodal cases only."""
+
+    diagnostics: dict[str, object] = {"phase": phase}
+    try:
+        query_profile = service.query_rewriter.profile(case.query_text, wait_for_rewrite_s=0.0)
+        query_variants = query_profile.retrieval_variants()
+        limit = max(1, int(getattr(service.config, "long_term_memory_recall_limit", 6) or 6))
+        selector_variants: list[dict[str, object]] = []
+        for query_variant in query_variants:
+            episodic_objects, durable_objects = service.object_store.select_relevant_context_objects(
+                query_text=query_variant,
+                episodic_limit=limit,
+                durable_limit=limit,
+            )
+            selector_variants.append(
+                {
+                    "query_text": query_variant,
+                    "episodic_ids": [item.memory_id for item in episodic_objects[:limit]],
+                    "durable_ids": [item.memory_id for item in durable_objects[:limit]],
+                }
+            )
+        diagnostics.update(
+            {
+                "query_original_text": query_profile.original_text,
+                "query_canonical_english_text": query_profile.canonical_english_text,
+                "query_retrieval_text": query_profile.retrieval_text,
+                "query_variants": list(query_variants),
+                "selector_variants": selector_variants,
+            }
+        )
+        retriever = service.retriever
+        retrieval_query_texts = retriever._query_text_variants(query_profile)
+        episodic_entries, unified_durable_objects = retriever._select_context_object_sections(
+            retrieval_query_texts
+        )
+        conflict_selection = retriever._select_conflict_queue_selection_for_texts(retrieval_query_texts)
+        midterm_packets = retriever._select_midterm_packets(retrieval_query_texts)
+        graph_selection = retriever._select_graph_context_selection(
+            retriever._combine_query_texts(retrieval_query_texts)
+        )
+        unified = retriever._build_unified_selection(
+            query_texts=retrieval_query_texts,
+            episodic_entries=episodic_entries,
+            durable_objects=unified_durable_objects,
+            conflict_selection=conflict_selection,
+            midterm_packets=midterm_packets,
+            graph_selection=graph_selection,
+        )
+        pruning_payload = unified.query_plan.get("pruning")
+        pruning = pruning_payload if isinstance(pruning_payload, Mapping) else {}
+        selected_payload = unified.query_plan.get("selected")
+        selected = selected_payload if isinstance(selected_payload, Mapping) else {}
+        dropped_payload = unified.query_plan.get("dropped_candidates")
+        dropped_candidates = (
+            tuple(candidate for candidate in dropped_payload if isinstance(candidate, Mapping))
+            if isinstance(dropped_payload, list)
+            else ()
+        )
+        dropped_durable = [
+            {
+                "id": candidate.get("id"),
+                "drop_reason": candidate.get("drop_reason"),
+                "query_score": candidate.get("query_score"),
+                "matched_query_terms": candidate.get("matched_query_terms"),
+            }
+            for candidate in dropped_candidates
+            if candidate.get("source") == "durable"
+        ]
+        diagnostics["unified_selection"] = {
+            "query_texts": list(retrieval_query_texts),
+            "mode": pruning.get("mode"),
+            "focus_anchors": pruning.get("focus_anchors"),
+            "provisional_focus_anchors": pruning.get("provisional_focus_anchors"),
+            "continuity_only_focus_anchors": pruning.get("continuity_only_focus_anchors"),
+            "anchorless_practical_focus_rescue_ids": pruning.get(
+                "anchorless_practical_focus_rescue_ids",
+                [],
+            ),
+            "selected_durable_ids": selected.get("durable_memory_ids"),
+            "selected_episodic_ids": selected.get("episodic_entry_ids"),
+            "dropped_durable": dropped_durable[:8],
+        }
+    except Exception as exc:
+        diagnostics["instrumentation_error"] = f"{type(exc).__name__}: {exc}"
+    return diagnostics
 
 
 def _normalized_context_text(context: LongTermMemoryContext, attribute_name: str) -> str:

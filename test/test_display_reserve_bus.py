@@ -11,6 +11,62 @@ from twinr.display.service_connect_cues import DisplayServiceConnectCue
 
 
 class DisplayReserveBusTests(unittest.TestCase):
+    def test_signature_ignores_reserve_cue_lifetime_refresh(self) -> None:
+        cases = (
+            (
+                "service_connect",
+                lambda updated_at, expires_at: resolve_display_reserve_bus(
+                    service_connect_cue=DisplayServiceConnectCue(
+                        source="service_connect",
+                        updated_at=updated_at,
+                        expires_at=expires_at,
+                        service_id="whatsapp",
+                        service_label="WhatsApp",
+                        phase="qr",
+                        summary="Scan QR",
+                        detail="Use WhatsApp Linked Devices.",
+                    ),
+                    emoji_cue=None,
+                    ambient_impulse_cue=None,
+                ),
+            ),
+            (
+                "emoji",
+                lambda updated_at, expires_at: resolve_display_reserve_bus(
+                    service_connect_cue=None,
+                    emoji_cue=DisplayEmojiCue(
+                        source="gesture_ack",
+                        updated_at=updated_at,
+                        expires_at=expires_at,
+                        symbol="thumbs_up",
+                        accent="success",
+                    ),
+                    ambient_impulse_cue=None,
+                ),
+            ),
+            (
+                "ambient_impulse",
+                lambda updated_at, expires_at: resolve_display_reserve_bus(
+                    service_connect_cue=None,
+                    emoji_cue=None,
+                    ambient_impulse_cue=DisplayAmbientImpulseCue(
+                        source="ambient",
+                        updated_at=updated_at,
+                        expires_at=expires_at,
+                        topic_key="world politics",
+                        headline="Weltpolitik",
+                        body="Da lohnt sich heute ein kurzer Blick.",
+                    ),
+                ),
+            ),
+        )
+
+        for owner, builder in cases:
+            with self.subTest(owner=owner):
+                first = builder("2026-04-07T08:00:00+00:00", "2026-04-07T08:00:04+00:00")
+                refreshed = builder("2026-04-07T08:00:03+00:00", "2026-04-07T08:00:07+00:00")
+                self.assertEqual(first.signature(), refreshed.signature())
+
     def test_resolve_prefers_service_connect_over_other_cues(self) -> None:
         state = resolve_display_reserve_bus(
             service_connect_cue=DisplayServiceConnectCue(

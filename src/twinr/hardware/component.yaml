@@ -3,7 +3,7 @@ name: hardware
 path: src/twinr/hardware
 kind: python-package
 visibility: internal
-summary: Provide bounded audio, GPIO, servo, camera, printer, voice-profile, remote drone-mission client, and local household-identity adapters for Twinr runtime paths.
+summary: Provide bounded audio, GPIO, servo, camera, printer, Crazyflie runtime telemetry, voice-profile, remote drone-mission client, and local household-identity adapters for Twinr runtime paths.
 owned_concerns:
   - Capture and play bounded audio for conversation, ambient sensing, and activation flows
   - Lift under-driven PCM16 activation-ack playback before it reaches the Pi speaker path so mixer-maxed devices still answer audibly
@@ -14,7 +14,9 @@ owned_concerns:
   - Keep ALSA child-process env independent from borrowed Wayland/user-session sockets when the Pi runtime runs under a different UID than the visible desktop session
   - Monitor GPIO buttons and PIR motion across supported Pi backends
   - Drive one bounded body-orientation servo from an already-derived normalized attention target, including calibrated center/invert controls, soft end-stop margins, calm idle release near neutral, and a dedicated open-loop continuous-rotation mode with bounded virtual-heading estimation for 360-degree servos
-  - Capture still photos via ffmpeg-backed V4L2 integration, a bounded Bitcraze AI-Deck WiFi stream adapter with temporary AP handover and WiFi restore on single-radio hosts, a bounded Pi libcamera fallback for busy unicam-image nodes, or a bounded peer-Pi HTTP snapshot proxy when the main host has no local still camera
+  - Capture still photos via ffmpeg-backed V4L2 integration, a bounded Bitcraze AI-Deck WiFi stream adapter with temporary AP handover and WiFi restore on single-radio hosts, an explicit Pi libcamera lane through `rpicam://` or `libcamera://` device URIs, or a bounded peer-Pi HTTP snapshot proxy when the main host has no local still camera
+  - Own one profile-driven Crazyflie runtime-telemetry lane that converts bounded cflib logs, param snapshots, link statistics, and `twinrFs` status into typed runtime state and divergence signals
+  - Own one deterministic Crazyflie hover-replay lane plus a strict CrazySim adapter so bounded hover bugs become replayable and sim-testable before the next live flight
   - Reach one bounded external drone daemon over HTTP so Twinr can queue inspect missions, read state, cancel work, and preserve a strict mission-only boundary above the future primitive executor
   - Persist local portrait identities with multiple reference images per user
   - Perform bounded local portrait matching against enrolled identities using still-camera captures, on-device embeddings, and temporal evidence fusion
@@ -123,7 +125,7 @@ files:
   - path: aideck_wifi.py
     role: Focused `nmcli` handover helper that temporarily joins the AI-Deck AP and restores the previous WiFi connection after one bounded capture
   - path: drone_service.py
-    role: Strict mission-level client for the external bounded drone daemon, including inspect requests and normalized state, pose, and safety snapshots
+    role: Strict mission-level client for the external bounded drone daemon, including inspect requests and normalized state, pose, safety, and bounded telemetry snapshots
     exports:
       - DroneMissionRequest
       - DroneMissionStatus
@@ -131,7 +133,44 @@ files:
       - DroneSafetyStatus
       - DroneServiceConfig
       - DroneStateSnapshot
+      - DroneTelemetrySnapshot
       - RemoteDroneServiceClient
+  - path: crazyflie_telemetry.py
+    role: Canonical Crazyflie runtime-telemetry lane that owns profile-driven log blocks, param snapshots, `twinrFs` status ingestion, link statistics, typed snapshots, and command-vs-observed divergence detection
+    exports:
+      - CompositeTraceWriter
+      - CrazyflieTelemetryRuntime
+      - CrazyflieTelemetrySample
+      - CrazyflieTelemetrySummary
+      - TelemetryDivergenceEvent
+      - TelemetryProfile
+      - TelemetrySnapshot
+      - profile_log_blocks
+      - profile_param_groups
+      - snapshot_to_payload
+      - summarize_crazyflie_telemetry
+  - path: crazyflie_hover_replay.py
+    role: Deterministic hover replay lane that loads stored hover reports and phase traces, replays telemetry against a fake monotonic clock, and records synthetic commander outputs for the real hover primitive
+    exports:
+      - CrazyflieTelemetryReplayRuntime
+      - HoverReplayArtifact
+      - HoverReplayClock
+      - HoverReplayCommander
+      - HoverReplayCommanderCommand
+      - HoverReplayPhaseEvent
+      - HoverReplayTraceWriter
+      - load_hover_replay_artifact
+      - load_hover_telemetry_jsonl
+      - load_hover_trace_events
+  - path: crazysim_adapter.py
+    role: Strict adapter around an operator-managed CrazySim checkout so Twinr can validate workspace layout and launch one bounded single-agent SITL process without guessing
+    exports:
+      - CrazySimAdapterError
+      - CrazySimCheckout
+      - CrazySimSingleAgentConfig
+      - CrazySimSingleAgentLauncher
+      - build_crazysim_single_agent_command
+      - resolve_crazysim_checkout
   - path: hand_landmarks.py
     role: Bounded MediaPipe hand-landmark ROI worker for the Pi-side camera path
     exports:
@@ -343,9 +382,17 @@ public_api:
   module: twinr.hardware
   exports:
     - CapturedPhoto
+    - DroneMissionRequest
+    - DroneMissionStatus
+    - DronePoseSnapshot
+    - DroneSafetyStatus
+    - DroneServiceConfig
+    - DroneStateSnapshot
+    - DroneTelemetrySnapshot
     - GpioPirMonitor
     - PirBinding
     - PirMotionEvent
+    - RemoteDroneServiceClient
     - V4L2StillCamera
     - VoiceAssessment
     - VoiceProfileMonitor
@@ -356,6 +403,9 @@ public_api:
     - configured_pir_monitor
     - voice_profile_store_path
 primary_callers:
+  - path: hardware/bitcraze/run_hover_test.py
+  - path: hardware/bitcraze/run_local_inspect_mission.py
+  - path: hardware/ops/drone_daemon.py
   - path: src/twinr/ops/checks.py
   - path: src/twinr/ops/devices.py
   - path: src/twinr/agent/workflows/realtime_runner.py
@@ -366,6 +416,10 @@ primary_callers:
   - path: src/twinr/web/viewmodels_voice.py
   - path: src/twinr/ops/self_test.py
 tests:
+  - path: test/test_crazyflie_telemetry.py
+  - path: test/test_drone_service.py
+  - path: test/test_bitcraze_hover_test.py
+  - path: test/test_drone_local_inspect.py
   - path: test/test_ai_camera.py
   - path: test/test_ai_camera_adapter_refactor_parity.py
   - path: test/test_audio.py

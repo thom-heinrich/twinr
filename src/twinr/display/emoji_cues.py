@@ -13,6 +13,8 @@
 #         pinning the senior-facing HDMI surface indefinitely after producer bugs or bad payloads.
 # IMP-2: producer ergonomics upgraded with alias normalization ("thumbsup", "wave", glyphs, etc.) while
 #         the persisted contract stays canonical and backward compatible.
+# BUG-4: signature() now excludes updated_at/expires_at so cue lifetime refreshes do not
+#         force semantically identical HDMI reserve rerenders on hdmi_wayland.
 
 """Persist and normalize optional HDMI emoji cues.
 
@@ -325,8 +327,6 @@ class DisplayEmojiCue:
 
         return (
             self.source,
-            self.updated_at,
-            self.expires_at,
             self.symbol,
             self.accent,
         )

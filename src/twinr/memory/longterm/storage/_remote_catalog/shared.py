@@ -36,6 +36,7 @@ _CATALOG_ENTRY_TEXT_FIELDS = (
     "kind",
     "status",
     "summary",
+    "search_text",
     "slot_key",
     "value_key",
     "created_at",
@@ -64,6 +65,7 @@ _KNOWN_ITEM_ENVELOPE_KEYS = (
     "world_feed_subscription",
     "world_intelligence_state",
 )
+_URI_ONLY_SEGMENT_REF_SNAPSHOT_KINDS = frozenset({"graph_edges", "graph_nodes"})
 
 
 def _run_timed_workflow_step(
@@ -219,6 +221,27 @@ def _iter_known_item_envelopes(candidate: object) -> tuple[Mapping[str, object],
         if isinstance(value, dict):
             envelopes.append(dict(value))
     return tuple(envelopes)
+
+
+def _segment_ref_supports_uri_only_contract(*, snapshot_kind: object, uri: object) -> bool:
+    """Return whether one catalog-segment ref stays readable without a doc id.
+
+    Graph projection refs have always been URI-first. Structured-memory
+    segment refs may now also stay URI-only when they carry the versioned
+    segment token in the URI itself, because that token makes the URI an
+    immutable same-record selector even when the backend omits `document_id`
+    on `documents/full?origin_uri=...` responses.
+    """
+
+    normalized_snapshot_kind = " ".join(str(snapshot_kind or "").split()).strip()
+    if normalized_snapshot_kind in _URI_ONLY_SEGMENT_REF_SNAPSHOT_KINDS:
+        return True
+    normalized_uri = " ".join(str(uri or "").split()).strip()
+    if "/catalog/segment/" not in normalized_uri:
+        return False
+    suffix = normalized_uri.rsplit("/catalog/segment/", 1)[-1]
+    parts = tuple(part for part in suffix.split("/") if part)
+    return len(parts) >= 2
 
 
 _DEFINITIONS: dict[str, _RemoteCollectionDefinition] = {

@@ -352,14 +352,17 @@ class ContinuousAttentionTracker:
                     visible_track_count=len(active_tracks),
                     audio_target_x=audio_target_x,
                 ),
-                confidence=_mean_confidence(
-                    (
-                        speaker_track.confidence,
-                        direction_confidence,
-                        speaker_track.audio_alignment_score if speech_detected else None,
+                confidence=max(
+                    0.6,
+                    _mean_confidence(
+                        (
+                            speaker_track.confidence,
+                            direction_confidence,
+                            speaker_track.audio_alignment_score if speech_detected else None,
+                        )
                     )
-                )
-                or 0.82,
+                    or 0.82,
+                ),
             )
 
         held_speaker_track = self._speaker_hold_track(observed_at=checked_at, tracks=active_tracks)
@@ -1115,8 +1118,10 @@ def _coerce_optional_int(value: object | None) -> int | None:
 
     if value is None or isinstance(value, bool):
         return None
+    if isinstance(value, int):
+        return value
     try:
-        converted = int(float(value))
+        converted = int(float(value if isinstance(value, (float, str)) else str(value)))
     except (TypeError, ValueError):
         return None
     return converted
@@ -1125,10 +1130,13 @@ def _coerce_optional_int(value: object | None) -> int | None:
 def _coerce_optional_float(value: object | None) -> float | None:
     if value is None or isinstance(value, bool):
         return None
-    try:
+    if isinstance(value, (int, float)):
         converted = float(value)
-    except (TypeError, ValueError):
-        return None
+    else:
+        try:
+            converted = float(str(value))
+        except (TypeError, ValueError):
+            return None
     if not math.isfinite(converted):
         return None
     return converted

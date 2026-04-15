@@ -17,7 +17,7 @@ No migration is required. The public import path stays
 - `coordinator_observation_facts.py`: automation fact payload assembly and rising-edge sensor-event derivation, reusing the same runtime attention orchestrator that drives HDMI and servo
 - `coordinator.py`: final `ProactiveCoordinator` composition
 - `monitor.py`: background worker lifecycle wrapper that now keeps shared attention/gesture perception deadlines anchored to the same loop start under Pi overrun so the productive combined capture path does not silently dephase away
-- `builder.py`: default production assembly with wrapper-supplied dependencies for patch compatibility
+- `builder.py`: default production assembly with wrapper-supplied dependencies for patch compatibility; the transcript-first voice runtime keeps only explicitly safe HDMI attention lanes available for local eye-follow, fail-closing `hdmi_wayland` attention refresh and same-device XVF3800 host-control polling so the streaming PID does not starve live voice transport. The heavier gesture lane is only armed downstream when fresh attention-derived hand or intent semantics justify spending that extra camera work inside the same streaming PID. The configured proactive vision provider is now single-lane and fail-closed: no provider fallback chain is attempted during startup.
 
 ## Compatibility
 

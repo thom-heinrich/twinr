@@ -21,11 +21,12 @@ instead of treating them as supported operating modes.
 - the development-host LAN bridge that exposes a stable `:8797` websocket port to the Pi while forwarding byte-for-byte into that host-side orchestrator endpoint
 - the Pi-side bootstrap entrypoint for self-coding Codex prerequisites
 - the Pi-side operator script that fail-closes the OpenAI env contract before isolated provider probes
+- the development-host operator script that joins the current local release, the Pi's persisted `current_release_manifest.json`, and a live checksum drift probe into one release-alignment report
 - the development-host operator script that diagnoses the public ChonkyDB endpoint against the dedicated backend service and only restarts the backend when that backend is the proven failing layer
 - the development-host operator script that stabilizes the dedicated Twinr ChonkyDB host when shared-host system units, user-session units, or non-Twinr workers directly pointed at the dedicated backend reclaim CPU/I/O from it
 - the development-host operator script that force-repairs unreadable prompt-memory and managed-context `catalog/current` heads on one explicit remote namespace when those heads themselves have become unreadable blank documents
-- the development-machine watchdog that mirrors the authoritative repo into `/twinr` without deleting Pi-local runtime state
-- the leading-repo deploy command that snapshots the authoritative repo scope, mirrors code, syncs the authoritative runtime `.env`, reinstalls the editable package, restarts the productive Pi unit set, runs the bounded live retention canary, diagnoses proven dedicated-backend host contention on failure, applies one bounded host-stabilization pass first, re-diagnoses when that pass still leaves the public surface unhealthy, escalates once into guarded dedicated-backend repair when the backend itself still remains unhealthy afterwards, retries the canary once, and verifies the Pi acceptance runtime
+- the development-machine watchdog that mirrors the authoritative repo into `/twinr` without deleting Pi-local runtime state, but now always mirrors from a deterministic tracked-file snapshot instead of the raw workspace tree
+- the leading-repo deploy command that snapshots the authoritative repo scope, mirrors code, syncs the authoritative runtime `.env`, reinstalls the editable package, installs browser-automation runtime support only when its allowlisted manifests are already part of that same authoritative release snapshot, persists the last successful tracked-file release manifest under `/twinr/artifacts/stores/ops/current_release_manifest.json`, restarts the productive Pi unit set, runs the bounded live retention canary, diagnoses proven dedicated-backend host contention on failure, applies one bounded host-stabilization pass first, re-diagnoses when that pass still leaves the public surface unhealthy, escalates once into guarded dedicated-backend repair when the backend itself still remains unhealthy afterwards, re-diagnoses the host after a successful repair so reactivated conflict units cannot slip into the retry window, restabilizes once more when that quiet-host hold already broke again, waits for a fresh post-repair watchdog-ready sample, retries the canary once, and verifies the Pi acceptance runtime
 
 `hardware/ops` does **not** own:
 - the watchdog implementation itself; that lives in `src/twinr/ops`
@@ -40,19 +41,20 @@ instead of treating them as supported operating modes.
 | [twinr-remote-memory-watchdog.service](./twinr-remote-memory-watchdog.service) | Dedicated unit: keep the fail-closed remote-memory watchdog warm and continuously refreshing its artifact |
 | [twinr-runtime-supervisor.service](./twinr-runtime-supervisor.service) | Productive unit: authoritatively supervise the streaming loop while consuming the external remote-memory-watchdog artifact |
 | [twinr-web.service](./twinr-web.service) | Productive unit: keep the Twinr web control portal running with managed sign-in |
-| [drone_daemon.py](./drone_daemon.py) | Development-host bounded drone mission daemon: preflight, manual-arm gate, stationary-observe evidence capture by default, plus an explicit hover-test mode for the first takeoff-hover-land primitive |
+| [drone_daemon.py](./drone_daemon.py) | Development-host bounded drone mission daemon: preflight, manual-arm gate, bounded live telemetry in `GET /state`, stationary-observe evidence capture by default, plus explicit hover-test and bounded local-inspect mission modes for the first live motion primitives |
 | [twinr-drone-daemon.service](./twinr-drone-daemon.service) | Development-host unit: keep the bounded drone daemon alive on a stable local HTTP endpoint for Twinr mission planning |
 | [twinr-orchestrator-server.service](./twinr-orchestrator-server.service) | Development-host unit: keep the host-side orchestrator websocket endpoint plus embedded `/v1/transcribe` remote-ASR surface alive on `127.0.0.1:8798` |
 | [twinr-voice-gateway-bridge.service](./twinr-voice-gateway-bridge.service) | Development-host unit: expose `0.0.0.0:8797` to the Pi and forward it byte-for-byte into the host-side `127.0.0.1:8798` orchestrator endpoint |
 | [bootstrap_self_coding_pi.py](./bootstrap_self_coding_pi.py) | Reproducibly sync the pinned self-coding Codex bridge/auth and run the remote self-test |
 | [install_whatsapp_node_runtime.py](./install_whatsapp_node_runtime.py) | Download, verify, and stage the pinned local Node.js runtime under `state/tools/` for the WhatsApp Baileys worker |
 | [check_pi_openai_env_contract.py](./check_pi_openai_env_contract.py) | Validate `/twinr/.env` for direct OpenAI-backed acceptance probes and optionally run one real provider request without manual key injection |
+| [audit_pi_release.py](./audit_pi_release.py) | Compact operator report that joins the current local release summary, the Pi's persisted `current_release_manifest.json`, and a live checksum drift probe |
 | [repair_remote_chonkydb.py](./repair_remote_chonkydb.py) | Diagnose the public ChonkyDB URL against the dedicated backend host and optionally repair the backend service without blind restarts |
-| [stabilize_remote_chonkydb_host.py](./stabilize_remote_chonkydb_host.py) | Quiesce known shared-host conflict units on `thh1986` across both system and active user-session scope, runtime-mask heavyweight non-Twinr workers such as `ollama-gpu.service`, CPU-hungry `caia-consumer-portal*.service` backends, `caia-ccodex-memory-api.service`, and sibling ChonkyDB services that starve the dedicated Twinr backend, bounded-kill direct writers against the dedicated `twinr_dedicated_<port>/data` ChonkyDB path when they bypass systemd, bounded-kill proven long-running user-session `chonkycode.cli artifact-ingest` and `ccodex_memory_locomo_mc10_eval.py` workloads when they starve the dedicated backend, and raise the dedicated Twinr backend CPU/IO priority before re-probing the public empty-scope-safe current-scope query surface |
+| [stabilize_remote_chonkydb_host.py](./stabilize_remote_chonkydb_host.py) | Quiesce known shared-host conflict units on `thh1986` across both system and active user-session scope, including the broader CAIA boot-storm lanes proven on 2026-04-12 to OOM the whole host after reboot; stage the live stop/disable pass with a short per-unit quiesce pause and a longer post-kill cooldown so host reclaim happens incrementally; install a reboot-persistent boot-pacing policy that brings the same CAIA lanes back in ordered post-boot waves instead of one burst; keep `caia-external-site.service`, `caia-consumer-portal-demo.service`, `caia-ollama-gpu-proxy.service`, and user-session `caia-molt.service` out of that reboot release lane; bounded-kill direct writers against the dedicated `twinr_dedicated_<port>/data` ChonkyDB path when they bypass systemd; bounded-kill proven long-running user-session `chonkycode.cli artifact-ingest` and `ccodex_memory_locomo_mc10_eval.py` workloads when they starve the dedicated backend; and raise the dedicated Twinr backend CPU/IO priority before re-probing the public empty-scope-safe current-scope query surface |
 | [repair_remote_prompt_current_heads.py](./repair_remote_prompt_current_heads.py) | Force-publish canonical empty prompt-memory / managed-context current heads on one explicit remote namespace when the old heads are unreadable |
-| [deploy_pi_runtime.py](./deploy_pi_runtime.py) | Operator-facing Pi deploy command: snapshot the authoritative mirror scope, mirror that stable repo image onto the Pi, sync the authoritative runtime `.env`, independently attest mirrored repo contents on `/twinr`, reinstall Twinr into the Pi venv, repair stale venv entrypoints, restart the base services plus any already-enabled repo-backed Pi runtime units, run the bounded live retention canary by default on its own dedicated timeout budget, diagnose shared-host ChonkyDB contention on canary failure, apply one bounded host-stabilization pass first, re-diagnose when failed stabilization still leaves the public surface unhealthy, escalate once into guarded dedicated-backend repair when the backend still remains unhealthy afterwards, then retry the canary once, keep the recovery SSH budget aligned with the host stabilizer/repair window, optionally first-rollout a disabled Pi unit, and verify post-restart health |
+| [deploy_pi_runtime.py](./deploy_pi_runtime.py) | Operator-facing Pi deploy command: snapshot the authoritative tracked-file release scope, mirror that stable repo image onto the Pi, sync the authoritative runtime `.env`, independently attest mirrored repo contents on `/twinr`, reinstall Twinr into the Pi venv, repair stale venv entrypoints, install browser-automation runtime support only when its allowlisted manifests are already part of the same authoritative release snapshot, persist the last successful release manifest under `artifacts/stores/ops/current_release_manifest.json`, restart the base services plus any already-enabled repo-backed Pi runtime units, run the bounded live retention canary by default on its own dedicated timeout budget, diagnose shared-host ChonkyDB contention on canary failure, apply one bounded host-stabilization pass first, re-diagnose when failed stabilization still leaves the public surface unhealthy, escalate once into guarded dedicated-backend repair when the backend still remains unhealthy afterwards, re-diagnose the host again after a successful repair, restabilize once more when conflict units or unhealthy query surfaces already returned, wait for a fresh post-repair watchdog-ready sample, then retry the canary once, keep the recovery SSH budget aligned with the host stabilizer/repair window, optionally first-rollout a disabled Pi unit, and verify post-restart health |
 | [voice_gateway_tcp_proxy.py](./voice_gateway_tcp_proxy.py) | Transport-only TCP bridge that exposes a LAN-visible port and forwards it to an already-established loopback tunnel for the real thh1986 voice gateway |
-| [watch_pi_repo_mirror.py](./watch_pi_repo_mirror.py) | Continuously mirror the leading repo into `/twinr`, detect drift, and preserve Pi-local runtime-only paths such as `.env`, `.venv`, `state/`, and `artifacts/` |
+| [watch_pi_repo_mirror.py](./watch_pi_repo_mirror.py) | Continuously mirror the leading repo into `/twinr`, detect drift, preserve Pi-local runtime-only paths such as `.env`, `.venv`, `state/`, and `artifacts/`, and source each cycle from the same tracked-file snapshot contract the deploy path uses |
 
 The runtime supervisor intentionally runs as `root` so the productive
 streaming loop keeps access to GPIO devices on deployed hosts. The dedicated
@@ -62,7 +64,8 @@ inside `/twinr/state/` or `/twinr/state/chonkydb/`.
 Because those root-owned services also refresh shared operator diagnostics
 under `/twinr/artifacts/stores/ops/`, the deploy permission-repair step now
 explicitly keeps `remote_memory_watchdog.json` and
-`display_ambient_impulse.json` operator-readable inside that otherwise `0700`
+`display_ambient_impulse.json` plus `current_release_manifest.json`
+operator-readable inside that otherwise `0700`
 ops directory, so non-root acceptance probes can read the same live artifacts
 without weakening directory-level confinement.
 That dedicated watchdog unit now also treats exit code `75` as
@@ -87,16 +90,25 @@ arm approval. Direct roll/pitch/yaw/thrust commands do not belong in this
 surface. The current `stationary_observe_only` mode is the accepted first
 runtime slice: it proves the API, preflight gates, and artifact path while
 keeping motion disabled until the future primitive executor and external
-pose-provider stack are ready. A second explicit mode,
-`bounded_hover_test_only`, is now available for the first live
-`takeoff -> hover -> land` primitive, but it must be enabled intentionally by
-the operator and is not the default service mode.
+pose-provider stack are ready. Additional motion-capable modes must still be
+enabled explicitly by the operator:
+- `bounded_hover_test_only` for the first live `takeoff -> hover -> land` primitive
+- `bounded_local_navigation_only` and `bounded_autonomous_inspect_only` for the first bounded `inspect_local_zone` mission lane
+
+The new `inspect_local_zone` mission stays conservative by construction:
+- the daemon still owns only mission-level orchestration
+- the worker reuses the existing hover/failsafe stack instead of inventing a second control lane
+- the host-side planner may choose at most one bounded lateral translation from the current hover anchor before image capture and landing
+- local manual arm remains mandatory
 
 Retired standalone break-glass units are no longer tracked here. The dedicated
 remote-memory watchdog service is not break-glass; it is the productive owner
 for the watchdog so warm remote state survives runtime-supervisor restarts. If
 an operator wants to keep local copies of older units around during cleanup,
 they belong under the ignored top-level `__legacy__/hardware/ops/` folder.
+When that dedicated unit is configured on `/twinr`, Twinr must not start a
+second detached watchdog process outside systemd; the systemd unit is the only
+authoritative owner lane on the Pi.
 
 The documented Python operator wrappers in this folder now re-exec
 automatically into `/home/thh/twinr/.venv/bin/python`. That keeps
@@ -127,6 +139,14 @@ python3 hardware/ops/stabilize_remote_chonkydb_host.py
 python3 hardware/ops/repair_remote_prompt_current_heads.py --namespace twinr_longterm_v1:twinr:a7f1ed265838 --base-url http://127.0.0.1:43044 --force
 python3 hardware/ops/deploy_pi_runtime.py --live-text "Antworte nur mit: ok."
 ```
+
+`stabilize_remote_chonkydb_host.py` now keeps one extra bounded quiet-hold
+window after each stop/disable pass before it concludes that a conflict unit truly
+reactivated. That avoids false fail-closed reports from transient
+`active`/`enabled` samples while a unit is still finishing its stop or
+disappearing into `not-found`. It also inserts a short per-unit quiesce pause
+and a longer post-kill cooldown so the shared host can shed pressure in smaller
+steps instead of one big unit-control burst.
 
 The `twinr-web.service` unit keeps the portal alive, but remote browser access
 still stays fail-closed until `/twinr/.env` enables `TWINR_WEB_ALLOW_REMOTE=1`,
@@ -164,10 +184,13 @@ The third command is for the opposite failure shape: the host is up and the
 public endpoint may still answer, but shared-host boot catch-up or background
 CAIA work has made the dedicated Twinr backend slow or freeze-prone. The
 stabilizer touches the worst kill-switches, disables the curated conflict-unit
-set across both system and active user-session scope, runtime-masks proven
-non-Twinr workers such as `ollama-gpu.service`, now also quiesces the
-always-on `caia-consumer-portal.service` and
-`caia-consumer-portal-demo.service` uvicorn backends when they reclaim CPU,
+set across both system and active user-session scope, now also syncs a
+reboot-persistent boot-pacing policy so those same CAIA lanes only come back
+in ordered post-boot waves instead of all at once, keeps
+`caia-external-site.service`, `caia-consumer-portal-demo.service`,
+`caia-ollama-gpu-proxy.service`, and user-session `caia-molt.service` out of
+that reboot release plan entirely, still quiesces the always-on
+`caia-consumer-portal.service` uvicorn backend when it reclaims CPU,
 bounded-kills direct non-systemd writers against the dedicated
 `twinr_dedicated_<port>/data` store path when they keep the backend locked,
 bounded-kills proven long-running user-session `chonkycode.cli artifact-ingest`
@@ -233,11 +256,21 @@ python3 -m twinr --env-file .env --drone-hover-test
 python3 -m twinr --env-file .env --drone-manual-arm DRN-...
 ```
 
+For the first bounded local inspect mission, start the daemon in one of the
+bounded local-flight modes and queue the dedicated mission type:
+
+```bash
+python3 hardware/ops/drone_daemon.py --repo-root /home/thh/twinr --env-file /home/thh/twinr/.env --pose-provider stub_ok --skill-layer-mode bounded_local_navigation_only --bind 127.0.0.1 --port 8791
+python3 -m twinr --env-file .env --drone-manual-arm DRN-...
+```
+
 The bounded operator proof is:
 - `POST /missions` returns `pending_manual_arm`
 - `POST /ops/missions/<id>/arm` is local-host only by default
 - mission execution captures stationary evidence by default instead of moving the aircraft
 - hover motion is only available when the daemon was explicitly started in `bounded_hover_test_only`
+- bounded local inspect is only available when the daemon was explicitly started in one of the bounded local-flight modes
+- the `inspect_local_zone` worker may only perform one bounded short-range translation before capture; it does not expose arbitrary waypoint or raw motion control
 - before any live takeoff setpoint, the hover worker now explicitly applies and verifies `stabilizer.estimator=2`, `stabilizer.controller=1`, `motion.disable=0`, and a bounded `kalman.resetEstimation` pulse; those final values are persisted into the mission artifact
 - the hover worker now blocks takeoff until a bounded estimator-settle gate sees stable `kalman.varPX/PY/PZ`, quiet roll/pitch, adequate `motion.squal`, and a valid downward `range.zrange`
 - hover execution now runs through an explicit stateful hover-setpoint primitive with its own abort/landing path instead of depending on the more implicit `MotionCommander` context-manager flow
@@ -248,13 +281,14 @@ The bounded operator proof is:
 - completed hover runs are now fail-closed on the recorded telemetry: large altitude overshoot above the requested hover height or excessive under-load battery sag downgrade the run to `unstable` instead of reporting `completed`
 - if the hover worker times out or is cancelled after a real flight, the daemon now also persists a partial hover artifact with the worker trace file, last trace phase/status, and stdout/stderr tails so teardown hangs can be debugged without losing the run
 - the first bounded hover path now also expects the Twinr STM32 app-layer failsafe (`twinrFs`) to be flashed on the Crazyflie; the worker sends Appchannel heartbeats while the host is healthy, but heartbeat-loss, low-battery, and clearance-triggered safe-land logic then continues locally on the aircraft without the daemon
-- `GET /state` keeps `manual_arm_required=true` and exposes preflight reasons when radio or pose is unhealthy
+- the local inspect worker reuses that same hover/failsafe contract and adds only one bounded clearance-based translation decision plus one bounded still capture
+- `GET /state` keeps `manual_arm_required=true`, exposes preflight reasons when radio or pose is unhealthy, and now carries one bounded runtime telemetry payload with deck, power, range, link, `twinrFs`, and divergence state for operator or mission consumers
 
 Before relying on live hover missions, build and flash the on-device failsafe:
 
 ```bash
-bash hardware/bitcraze/build_on_device_failsafe.sh
-/twinr/bitcraze/.venv/bin/python hardware/bitcraze/flash_on_device_failsafe.py
+bash hardware/bitcraze/build_on_device_failsafe.sh --firmware-root /tmp/crazyflie-firmware --expected-firmware-revision 2025.12.1
+/twinr/bitcraze/.venv/bin/python hardware/bitcraze/flash_on_device_failsafe.py --lane dev --device-role dev --attestation hardware/bitcraze/twinr_on_device_failsafe/build/twinr_on_device_failsafe.build-attestation.json
 ```
 
 The post-flash probe is important: it reconnects over the normal radio URI and
@@ -334,8 +368,9 @@ By default the deploy command:
 
 `deploy_pi_runtime.py` is the operator-facing replacement for the old manual
 "run the mirror watchdog as the deploy step" workflow. The mirror still exists
-as the internal code-sync mechanism and drift-diagnostic tool, but normal Pi
-runtime rollout should go through the deploy command.
+as the internal code-sync mechanism and drift-diagnostic tool, but both paths
+now consume the same deterministic tracked-file snapshot contract, and normal
+Pi runtime rollout should go through the deploy command.
 
 Use `--skip-env-sync` only when the Pi env must intentionally stay divergent
 from the leading repo. Use `--live-text` or `--live-search` when you want the

@@ -419,6 +419,23 @@ class LongTermMultimodalTests(unittest.TestCase):
         self.assertEqual(len(images), 1)
         self.assertTrue(any(item.memory_id.startswith("pattern:camera_use:vision_inspection:") for item in objects))
 
+    def test_support_camera_capture_skips_multimodal_usage_when_persistence_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = _config(temp_dir)
+            runtime = TwinrRuntime(config=config)
+            camera = _FakeCamera()
+            harness = _SupportHarness(runtime=runtime, camera=camera, config=config)
+            harness._persist_multimodal_evidence = False
+
+            images = harness._build_vision_images()
+            runtime.flush_long_term_memory(timeout_s=2.0)
+            objects = tuple(runtime.long_term_memory.object_store.load_objects())
+            runtime.shutdown(timeout_s=2.0)
+
+        self.assertEqual(camera.capture_calls, 1)
+        self.assertEqual(len(images), 1)
+        self.assertFalse(any(item.memory_id.startswith("pattern:camera_use:vision_inspection:") for item in objects))
+
     def test_service_can_store_repeated_print_usage_patterns(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = LongTermMemoryService.from_config(_config(temp_dir))

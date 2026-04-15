@@ -21,25 +21,26 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
-from dataclasses import asdict, dataclass
-from datetime import date as LocalDate, datetime
+from dataclasses import asdict, dataclass, replace
+from datetime import date as LocalDate, datetime, tzinfo
 import errno
 import json
 import logging
 import os
 from pathlib import Path
 import tempfile
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 try:
-    import fcntl
+    import fcntl as fcntl
 except ImportError:  # pragma: no cover - only relevant on non-Unix platforms
-    fcntl = None
+    fcntl = cast(Any, None)
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.contracts import AgentTextProvider
 from twinr.agent.personality.evolution import PersonalityEvolutionResult
 from twinr.agent.personality.intelligence.models import SituationalAwarenessThread, WorldIntelligenceRefreshResult
+from twinr.agent.personality.learning import PersonalityHistoryProbe
 from twinr.agent.workflows.realtime_runtime.nightly_digest_refinement import (
     NightlyDigestRefinement,
     build_nightly_digest_refinement,
@@ -49,6 +50,7 @@ from twinr.agent.workflows.realtime_runtime.nightly_insights import (
     build_nightly_insight_bundle,
 )
 from twinr.memory.longterm.core.models import LongTermReflectionResultV1
+from twinr.memory.longterm.runtime.service import LongTermMemoryService, _writer_state_details
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.memory.reminders import ReminderEntry
 from twinr.ops.remote_memory_watchdog_state import RemoteMemoryWatchdogStore
@@ -67,6 +69,7 @@ _DEFAULT_LIVE_WEB_QUERY_LIMIT = 2
 _DEFAULT_STATE_PATH = "artifacts/stores/ops/nightly_run_state.json"
 _DEFAULT_DIGEST_PATH = "artifacts/stores/ops/nightly_prepared_digest.json"
 _DEFAULT_SUMMARY_PATH = "artifacts/stores/ops/nightly_consolidation_summary.json"
+_DEFAULT_PERSONALITY_STATUS_PATH = "artifacts/stores/ops/nightly_personality_status.json"
 _DEFAULT_LOCK_SUFFIX = ".lock"
 _MAX_TEXT = 4000
 _MAX_LINE = 220
@@ -89,6 +92,9 @@ class _PersonalityLearningLike(Protocol):
         search_backend: object | None = None,
     ) -> WorldIntelligenceRefreshResult | None:
         """Refresh due world/place intelligence and commit it when trusted."""
+
+    def probe_history_status(self) -> PersonalityHistoryProbe:
+        """Return one authoritative read-status probe for persisted personality history."""
 
 
 class _LongTermMemoryLike(Protocol):
@@ -257,6 +263,46 @@ def _bounded_optional_text(value: object | None, *, max_len: int) -> str | None:
     return text or None
 
 
+def _coerce_nonnegative_int(value: object, *, default: int = 0) -> int:
+    """Normalize one optional payload value into a bounded non-negative integer."""
+
+    try:
+        result = int(cast(Any, value))
+    except (TypeError, ValueError):
+        return max(0, default)
+    return max(0, result)
+
+
+def _tuple_from_json_list(payload: Mapping[str, object], key: str) -> tuple[object, ...]:
+    """Return one tuple only when the stored payload value is a JSON list."""
+
+    raw = payload.get(key)
+    return tuple(raw) if isinstance(raw, list) else ()
+
+
+def _tuple_from_value(value: object) -> tuple[object, ...]:
+    """Return one tuple for generic non-string sequences and tuples."""
+
+    if isinstance(value, (str, bytes, bytearray)):
+        return ()
+    if isinstance(value, Sequence):
+        return tuple(value)
+    return ()
+
+
+def _coerce_tzinfo(value: object | None) -> tzinfo | None:
+    """Return one tzinfo object when the input already satisfies that contract."""
+
+    return value if isinstance(value, tzinfo) else None
+
+
+def _coerce_config_int(config: TwinrConfig, attr_name: str, default: int, *, minimum: int = 0) -> int:
+    """Read one integer-like config field and clamp it to a lower bound."""
+
+    raw = getattr(config, attr_name, default) or default
+    return max(minimum, _coerce_nonnegative_int(raw, default=default))
+
+
 def _bounded_text_tuple(values: Sequence[object], *, max_items: int, max_len: int) -> tuple[str, ...]:
     """Normalize one tuple of bounded, deduplicated text items."""
 
@@ -285,6 +331,19 @@ def _join_errors(errors: Sequence[str]) -> str | None:
     return _bounded_optional_text("; ".join(part for part in errors if part), max_len=_MAX_ERROR)
 
 
+def _merge_ranked_status(
+    current: str,
+    candidate: str,
+    *,
+    priorities: Mapping[str, int],
+) -> str:
+    """Keep the higher-priority bounded status token."""
+
+    current_rank = priorities.get(current, -1)
+    candidate_rank = priorities.get(candidate, -1)
+    return candidate if candidate_rank >= current_rank else current
+
+
 @dataclass(frozen=True, slots=True)
 class NightlyPreparedDigest:
     """Persist one prepared morning digest without triggering nighttime output."""
@@ -309,7 +368,7 @@ class NightlyPreparedDigest:
         """Build one prepared digest from persisted JSON-safe data."""
 
         return cls(
-            schema_version=max(1, int(payload.get("schema_version", 1) or 1)),
+            schema_version=max(1, _coerce_nonnegative_int(payload.get("schema_version", 1), default=1)),
             target_local_day=_bounded_text(payload.get("target_local_day"), max_len=16),
             prepared_at=_bounded_text(payload.get("prepared_at"), max_len=64),
             language=_bounded_optional_text(payload.get("language"), max_len=24),
@@ -317,37 +376,33 @@ class NightlyPreparedDigest:
             print_text=_bounded_block_text(payload.get("print_text"), max_len=_MAX_TEXT),
             weather_summary=_bounded_optional_text(payload.get("weather_summary"), max_len=600),
             reminder_lines=_bounded_text_tuple(
-                tuple(payload.get("reminder_lines", ()) if isinstance(payload.get("reminder_lines"), list) else ()),
+                _tuple_from_json_list(payload, "reminder_lines"),
                 max_items=_DEFAULT_REMINDER_LIMIT,
                 max_len=_MAX_LINE,
             ),
             headline_lines=_bounded_text_tuple(
-                tuple(payload.get("headline_lines", ()) if isinstance(payload.get("headline_lines"), list) else ()),
+                _tuple_from_json_list(payload, "headline_lines"),
                 max_items=_DEFAULT_HEADLINE_LIMIT,
                 max_len=_MAX_LINE,
             ),
             new_insights=_bounded_text_tuple(
-                tuple(payload.get("new_insights", ()) if isinstance(payload.get("new_insights"), list) else ()),
+                _tuple_from_json_list(payload, "new_insights"),
                 max_items=_DEFAULT_HEADLINE_LIMIT,
                 max_len=_MAX_LINE,
             ),
             continuity_shifts=_bounded_text_tuple(
-                tuple(
-                    payload.get("continuity_shifts", ())
-                    if isinstance(payload.get("continuity_shifts"), list)
-                    else ()
-                ),
+                _tuple_from_json_list(payload, "continuity_shifts"),
                 max_items=_DEFAULT_HEADLINE_LIMIT,
                 max_len=_MAX_LINE,
             ),
             live_news_summary=_bounded_optional_text(payload.get("live_news_summary"), max_len=1200),
             weather_sources=_bounded_text_tuple(
-                tuple(payload.get("weather_sources", ()) if isinstance(payload.get("weather_sources"), list) else ()),
+                _tuple_from_json_list(payload, "weather_sources"),
                 max_items=12,
                 max_len=512,
             ),
             news_sources=_bounded_text_tuple(
-                tuple(payload.get("news_sources", ()) if isinstance(payload.get("news_sources"), list) else ()),
+                _tuple_from_json_list(payload, "news_sources"),
                 max_items=12,
                 max_len=512,
             ),
@@ -370,10 +425,11 @@ class NightlyPreparedDigest:
 class NightlyConsolidationSummary:
     """Persist one bounded summary of the overnight consolidation stages."""
 
-    schema_version: int = 2
+    schema_version: int = 3
     target_local_day: str = ""
     prepared_at: str = ""
     long_term_flush_ok: bool = True
+    failure_stage: str | None = None
     reflection_reflected_object_count: int = 0
     reflection_created_summary_count: int = 0
     world_refresh_status: str = "unknown"
@@ -382,6 +438,10 @@ class NightlyConsolidationSummary:
     due_reminder_count: int = 0
     target_day_reminder_count: int = 0
     accepted_personality_delta_count: int = 0
+    personality_flush_status: str = "not_run"
+    personality_history_read_status: str = "not_run"
+    last_personality_commit_at: str | None = None
+    personality_history_error: str | None = None
     new_insights: tuple[str, ...] = ()
     continuity_shifts: tuple[str, ...] = ()
     operator_new_insights: tuple[str, ...] = ()
@@ -396,73 +456,76 @@ class NightlyConsolidationSummary:
         """Build one consolidation summary from persisted JSON-safe data."""
 
         return cls(
-            schema_version=max(1, int(payload.get("schema_version", 1) or 1)),
+            schema_version=max(1, _coerce_nonnegative_int(payload.get("schema_version", 1), default=1)),
             target_local_day=_bounded_text(payload.get("target_local_day"), max_len=16),
             prepared_at=_bounded_text(payload.get("prepared_at"), max_len=64),
             long_term_flush_ok=bool(payload.get("long_term_flush_ok", True)),
+            failure_stage=_bounded_optional_text(payload.get("failure_stage"), max_len=96),
             reflection_reflected_object_count=max(
-                0, int(payload.get("reflection_reflected_object_count", 0) or 0)
+                0, _coerce_nonnegative_int(payload.get("reflection_reflected_object_count", 0))
             ),
             reflection_created_summary_count=max(
-                0, int(payload.get("reflection_created_summary_count", 0) or 0)
+                0, _coerce_nonnegative_int(payload.get("reflection_created_summary_count", 0))
             ),
             world_refresh_status=_bounded_text(payload.get("world_refresh_status"), max_len=32) or "unknown",
             world_refresh_refreshed=bool(payload.get("world_refresh_refreshed", False)),
             world_awareness_thread_count=max(
-                0, int(payload.get("world_awareness_thread_count", 0) or 0)
+                0, _coerce_nonnegative_int(payload.get("world_awareness_thread_count", 0))
             ),
-            due_reminder_count=max(0, int(payload.get("due_reminder_count", 0) or 0)),
+            due_reminder_count=max(0, _coerce_nonnegative_int(payload.get("due_reminder_count", 0))),
             target_day_reminder_count=max(
-                0, int(payload.get("target_day_reminder_count", 0) or 0)
+                0, _coerce_nonnegative_int(payload.get("target_day_reminder_count", 0))
             ),
             accepted_personality_delta_count=max(
-                0, int(payload.get("accepted_personality_delta_count", 0) or 0)
+                0, _coerce_nonnegative_int(payload.get("accepted_personality_delta_count", 0))
+            ),
+            personality_flush_status=(
+                _bounded_text(payload.get("personality_flush_status"), max_len=32).lower() or "not_run"
+            ),
+            personality_history_read_status=(
+                _bounded_text(payload.get("personality_history_read_status"), max_len=32).lower() or "not_run"
+            ),
+            last_personality_commit_at=_bounded_optional_text(
+                payload.get("last_personality_commit_at"),
+                max_len=64,
+            ),
+            personality_history_error=_bounded_optional_text(
+                payload.get("personality_history_error"),
+                max_len=_MAX_ERROR,
             ),
             new_insights=_bounded_text_tuple(
-                tuple(payload.get("new_insights", ()) if isinstance(payload.get("new_insights"), list) else ()),
+                _tuple_from_json_list(payload, "new_insights"),
                 max_items=_DEFAULT_HEADLINE_LIMIT,
                 max_len=_MAX_LINE,
             ),
             continuity_shifts=_bounded_text_tuple(
-                tuple(
-                    payload.get("continuity_shifts", ())
-                    if isinstance(payload.get("continuity_shifts"), list)
-                    else ()
-                ),
+                _tuple_from_json_list(payload, "continuity_shifts"),
                 max_items=_DEFAULT_HEADLINE_LIMIT,
                 max_len=_MAX_LINE,
             ),
             operator_new_insights=_bounded_text_tuple(
-                tuple(
-                    payload.get("operator_new_insights", ())
-                    if isinstance(payload.get("operator_new_insights"), list)
-                    else ()
-                ),
+                _tuple_from_json_list(payload, "operator_new_insights"),
                 max_items=_DEFAULT_HEADLINE_LIMIT,
                 max_len=_MAX_LINE,
             ),
             operator_continuity_shifts=_bounded_text_tuple(
-                tuple(
-                    payload.get("operator_continuity_shifts", ())
-                    if isinstance(payload.get("operator_continuity_shifts"), list)
-                    else ()
-                ),
+                _tuple_from_json_list(payload, "operator_continuity_shifts"),
                 max_items=_DEFAULT_HEADLINE_LIMIT,
                 max_len=_MAX_LINE,
             ),
-            live_search_queries=max(0, int(payload.get("live_search_queries", 0) or 0)),
+            live_search_queries=max(0, _coerce_nonnegative_int(payload.get("live_search_queries", 0))),
             weather_sources=_bounded_text_tuple(
-                tuple(payload.get("weather_sources", ()) if isinstance(payload.get("weather_sources"), list) else ()),
+                _tuple_from_json_list(payload, "weather_sources"),
                 max_items=12,
                 max_len=512,
             ),
             news_sources=_bounded_text_tuple(
-                tuple(payload.get("news_sources", ()) if isinstance(payload.get("news_sources"), list) else ()),
+                _tuple_from_json_list(payload, "news_sources"),
                 max_items=12,
                 max_len=512,
             ),
             errors=_bounded_text_tuple(
-                tuple(payload.get("errors", ()) if isinstance(payload.get("errors"), list) else ()),
+                _tuple_from_json_list(payload, "errors"),
                 max_items=32,
                 max_len=_MAX_ERROR,
             ),
@@ -486,12 +549,13 @@ class NightlyConsolidationSummary:
 class NightlyRunState:
     """Persist the last explicit overnight orchestration result."""
 
-    schema_version: int = 1
+    schema_version: int = 2
     prepared_local_day: str | None = None
     last_attempted_at: str | None = None
     last_completed_at: str | None = None
     last_status: str = "idle"
     last_error: str | None = None
+    failure_stage: str | None = None
     remote_ready: bool = False
     remote_status: str | None = None
     digest_ready: bool = False
@@ -501,6 +565,10 @@ class NightlyRunState:
     reflection_created_summary_count: int = 0
     world_refresh_status: str | None = None
     live_search_queries: int = 0
+    personality_flush_status: str = "not_run"
+    personality_history_read_status: str = "not_run"
+    last_personality_commit_at: str | None = None
+    personality_history_error: str | None = None
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "NightlyRunState":
@@ -513,29 +581,86 @@ class NightlyRunState:
             except ValueError:
                 prepared_day = None
         return cls(
-            schema_version=max(1, int(payload.get("schema_version", 1) or 1)),
+            schema_version=max(1, _coerce_nonnegative_int(payload.get("schema_version", 1), default=1)),
             prepared_local_day=prepared_day,
             last_attempted_at=_bounded_optional_text(payload.get("last_attempted_at"), max_len=64),
             last_completed_at=_bounded_optional_text(payload.get("last_completed_at"), max_len=64),
             last_status=_bounded_text(payload.get("last_status"), max_len=32).lower() or "idle",
             last_error=_bounded_optional_text(payload.get("last_error"), max_len=_MAX_ERROR),
+            failure_stage=_bounded_optional_text(payload.get("failure_stage"), max_len=96),
             remote_ready=bool(payload.get("remote_ready", False)),
             remote_status=_bounded_optional_text(payload.get("remote_status"), max_len=32),
             digest_ready=bool(payload.get("digest_ready", False)),
             display_reserve_status=_bounded_optional_text(payload.get("display_reserve_status"), max_len=32),
             display_reserve_reason=_bounded_optional_text(payload.get("display_reserve_reason"), max_len=64),
             reflection_reflected_object_count=max(
-                0, int(payload.get("reflection_reflected_object_count", 0) or 0)
+                0, _coerce_nonnegative_int(payload.get("reflection_reflected_object_count", 0))
             ),
             reflection_created_summary_count=max(
-                0, int(payload.get("reflection_created_summary_count", 0) or 0)
+                0, _coerce_nonnegative_int(payload.get("reflection_created_summary_count", 0))
             ),
             world_refresh_status=_bounded_optional_text(payload.get("world_refresh_status"), max_len=32),
-            live_search_queries=max(0, int(payload.get("live_search_queries", 0) or 0)),
+            live_search_queries=max(0, _coerce_nonnegative_int(payload.get("live_search_queries", 0))),
+            personality_flush_status=(
+                _bounded_text(payload.get("personality_flush_status"), max_len=32).lower() or "not_run"
+            ),
+            personality_history_read_status=(
+                _bounded_text(payload.get("personality_history_read_status"), max_len=32).lower() or "not_run"
+            ),
+            last_personality_commit_at=_bounded_optional_text(
+                payload.get("last_personality_commit_at"),
+                max_len=64,
+            ),
+            personality_history_error=_bounded_optional_text(
+                payload.get("personality_history_error"),
+                max_len=_MAX_ERROR,
+            ),
         )
 
     def to_dict(self) -> dict[str, object]:
         """Serialize one run-state record into JSON-safe data."""
+
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class NightlyPersonalityStatus:
+    """Persist one explicit attestation for the nightly personality lane."""
+
+    schema_version: int = 1
+    target_local_day: str = ""
+    attempted_at: str = ""
+    flush_status: str = "not_run"
+    history_read_status: str = "not_run"
+    accepted_personality_delta_count: int = 0
+    failure_stage: str | None = None
+    last_personality_commit_at: str | None = None
+    error: str | None = None
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "NightlyPersonalityStatus":
+        """Build one persisted nightly personality status from JSON-safe data."""
+
+        return cls(
+            schema_version=max(1, _coerce_nonnegative_int(payload.get("schema_version", 1), default=1)),
+            target_local_day=_bounded_text(payload.get("target_local_day"), max_len=16),
+            attempted_at=_bounded_text(payload.get("attempted_at"), max_len=64),
+            flush_status=_bounded_text(payload.get("flush_status"), max_len=32).lower() or "not_run",
+            history_read_status=_bounded_text(payload.get("history_read_status"), max_len=32).lower()
+            or "not_run",
+            accepted_personality_delta_count=max(
+                0, _coerce_nonnegative_int(payload.get("accepted_personality_delta_count", 0))
+            ),
+            failure_stage=_bounded_optional_text(payload.get("failure_stage"), max_len=96),
+            last_personality_commit_at=_bounded_optional_text(
+                payload.get("last_personality_commit_at"),
+                max_len=64,
+            ),
+            error=_bounded_optional_text(payload.get("error"), max_len=_MAX_ERROR),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize one nightly personality status into JSON-safe data."""
 
         return asdict(self)
 
@@ -551,6 +676,25 @@ class NightlyOrchestrationResult:
     digest: NightlyPreparedDigest | None = None
     summary: NightlyConsolidationSummary | None = None
     display_reserve_result: DisplayReserveNightlyMaintenanceResult | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _LongTermFlushOutcome:
+    """Describe the explicit result of one long-term flush attempt."""
+
+    ok: bool
+    failure_stage: str | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PersonalityFlushOutcome:
+    """Describe one personality flush call plus its explicit status."""
+
+    status: str = "not_run"
+    result: PersonalityEvolutionResult | None = None
+    failure_stage: str | None = None
+    error: str | None = None
 
 
 @dataclass(slots=True)
@@ -686,6 +830,50 @@ class NightlyConsolidationSummaryStore:
 
 
 @dataclass(slots=True)
+class NightlyPersonalityStatusStore:
+    """Persist one bounded nightly personality-attestation artifact."""
+
+    path: Path
+
+    @classmethod
+    def from_config(cls, config: TwinrConfig) -> "NightlyPersonalityStatusStore":
+        """Resolve the nightly personality-status artifact path from configuration."""
+
+        return cls(
+            path=_resolve_store_path(
+                config,
+                "nightly_personality_status_path",
+                _DEFAULT_PERSONALITY_STATUS_PATH,
+            )
+        )
+
+    def load(self) -> NightlyPersonalityStatus | None:
+        """Load the persisted nightly personality status when it exists and parses."""
+
+        if not self.path.exists():
+            return None
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception:
+            _LOGGER.warning("Failed to read nightly personality status from %s.", self.path, exc_info=True)
+            return None
+        if not isinstance(payload, Mapping):
+            return None
+        try:
+            return NightlyPersonalityStatus.from_dict(payload)
+        except Exception:
+            _LOGGER.warning("Ignoring invalid nightly personality status at %s.", self.path, exc_info=True)
+            return None
+
+    def save(self, status: NightlyPersonalityStatus) -> NightlyPersonalityStatus:
+        """Persist one nightly personality status atomically enough for runtime use."""
+
+        payload = json.dumps(status.to_dict(), ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        _atomic_write_text(self.path, payload)
+        return status
+
+
+@dataclass(slots=True)
 class _PrecomputedReflectionMemoryService:
     """Adapt a precomputed reflection result to the reserve-planner contract."""
 
@@ -714,6 +902,7 @@ class TwinrNightlyOrchestrator:
     state_store: NightlyRunStateStore | None = None
     digest_store: NightlyPreparedDigestStore | None = None
     summary_store: NightlyConsolidationSummaryStore | None = None
+    personality_status_store: NightlyPersonalityStatusStore | None = None
     local_now: Callable[[], datetime] = datetime.now
 
     def __post_init__(self) -> None:
@@ -725,6 +914,8 @@ class TwinrNightlyOrchestrator:
             self.digest_store = NightlyPreparedDigestStore.from_config(self.config)
         if self.summary_store is None:
             self.summary_store = NightlyConsolidationSummaryStore.from_config(self.config)
+        if self.personality_status_store is None:
+            self.personality_status_store = NightlyPersonalityStatusStore.from_config(self.config)
         if self.display_planner is None:
             self.display_planner = DisplayReserveCompanionPlanner.from_config(self.config)
         if self.remote_watchdog_store is None:
@@ -740,6 +931,7 @@ class TwinrNightlyOrchestrator:
         state_store = self._require_state_store()
         digest_store = self._require_digest_store()
         summary_store = self._require_summary_store()
+        personality_status_store = self._require_personality_status_store()
         effective_now = self.local_now() if local_now is None else local_now
         if not bool(getattr(self.config, "nightly_orchestration_enabled", True)):
             return NightlyOrchestrationResult(action="inactive", reason="nightly_disabled")
@@ -758,7 +950,7 @@ class TwinrNightlyOrchestrator:
                     target_local_day=target_day_text,
                 )
 
-            existing_state = self.state_store.load()
+            existing_state = state_store.load()
             if self._already_prepared(existing_state, target_day_text):
                 return NightlyOrchestrationResult(
                     action="skipped",
@@ -769,7 +961,18 @@ class TwinrNightlyOrchestrator:
 
             attempted_at = format_timestamp(utc_now())
             remote_status = self._remote_status_label()
+            personality_status = NightlyPersonalityStatus(
+                target_local_day=target_day_text,
+                attempted_at=attempted_at,
+            )
             if not self.remote_ready():
+                personality_status_store.save(
+                    replace(
+                        personality_status,
+                        failure_stage="required_remote_not_ready",
+                        error="required_remote_not_ready",
+                    )
+                )
                 state = self._save_state(
                     NightlyRunState(
                         prepared_local_day=None,
@@ -777,8 +980,10 @@ class TwinrNightlyOrchestrator:
                         last_completed_at=None,
                         last_status="blocked_remote_not_ready",
                         last_error="required_remote_not_ready",
+                        failure_stage="required_remote_not_ready",
                         remote_ready=False,
                         remote_status=remote_status,
+                        personality_history_error="required_remote_not_ready",
                     )
                 )
                 return NightlyOrchestrationResult(
@@ -789,6 +994,13 @@ class TwinrNightlyOrchestrator:
                 )
 
             if not self.background_allowed():
+                personality_status_store.save(
+                    replace(
+                        personality_status,
+                        failure_stage="background_not_idle",
+                        error="background_not_idle",
+                    )
+                )
                 state = self._save_state(
                     NightlyRunState(
                         prepared_local_day=None,
@@ -796,8 +1008,10 @@ class TwinrNightlyOrchestrator:
                         last_completed_at=None,
                         last_status="interrupted",
                         last_error="background_not_idle",
+                        failure_stage="background_not_idle",
                         remote_ready=True,
                         remote_status=remote_status,
+                        personality_history_error="background_not_idle",
                     )
                 )
                 return NightlyOrchestrationResult(
@@ -814,10 +1028,16 @@ class TwinrNightlyOrchestrator:
             world_refresh_result: WorldIntelligenceRefreshResult | None = None
             reflection_result: LongTermReflectionResultV1 | None = None
             personality_results: list[PersonalityEvolutionResult] = []
-            long_term_flush_ok = True
+            long_term_flush_outcome = _LongTermFlushOutcome(ok=True)
+            if personality_learning is None:
+                personality_status = replace(
+                    personality_status,
+                    flush_status="not_configured",
+                    history_read_status="not_configured",
+                )
 
             try:
-                long_term_flush_ok = self._flush_long_term_memory(long_term_memory, errors)
+                long_term_flush_outcome = self._flush_long_term_memory(long_term_memory, errors)
                 self._ensure_background_allowed(
                     attempted_at=attempted_at,
                     remote_status=remote_status,
@@ -825,10 +1045,18 @@ class TwinrNightlyOrchestrator:
                 )
 
                 if personality_learning is not None:
-                    self._flush_personality_learning(
+                    first_flush = self._flush_personality_learning(
                         personality_learning,
                         results=personality_results,
                         errors=errors,
+                    )
+                    personality_status = self._merge_personality_status(
+                        personality_status,
+                        flush_outcome=first_flush,
+                    )
+                    personality_status = self._merge_personality_status(
+                        personality_status,
+                        probe=self._probe_personality_history(personality_learning, errors=errors),
                     )
                     self._ensure_background_allowed(
                         attempted_at=attempted_at,
@@ -859,10 +1087,18 @@ class TwinrNightlyOrchestrator:
                     errors.append(f"reflection:{_exception_summary(exc)}")
 
                 if personality_learning is not None:
-                    self._flush_personality_learning(
+                    second_flush = self._flush_personality_learning(
                         personality_learning,
                         results=personality_results,
                         errors=errors,
+                    )
+                    personality_status = self._merge_personality_status(
+                        personality_status,
+                        flush_outcome=second_flush,
+                    )
+                    personality_status = self._merge_personality_status(
+                        personality_status,
+                        probe=self._probe_personality_history(personality_learning, errors=errors),
                     )
                 self._ensure_background_allowed(
                     attempted_at=attempted_at,
@@ -911,20 +1147,32 @@ class TwinrNightlyOrchestrator:
                 summary = self._build_summary(
                     target_day_text=target_day_text,
                     prepared_at=attempted_at,
-                    long_term_flush_ok=long_term_flush_ok,
+                    long_term_flush_ok=long_term_flush_outcome.ok,
+                    failure_stage=(
+                        personality_status.failure_stage or long_term_flush_outcome.failure_stage
+                    ),
                     reflection_result=reflection_result,
                     world_refresh_result=world_refresh_result,
                     digest=digest,
-                    due_reminder_count=int(digest_inputs.get("due_reminder_count", 0) or 0),
-                    target_day_reminder_count=int(
-                        digest_inputs.get("target_day_reminder_count", 0) or 0
+                    due_reminder_count=_coerce_nonnegative_int(
+                        digest_inputs.get("due_reminder_count", 0)
                     ),
+                    target_day_reminder_count=_coerce_nonnegative_int(
+                        digest_inputs.get("target_day_reminder_count", 0)
+                    ),
+                    personality_status=personality_status,
                     personality_results=personality_results,
                     nightly_insights=nightly_insights,
                     live_search_queries=live_search_queries,
                     errors=errors,
                 )
                 summary_store.save(summary)
+                personality_status_store.save(
+                    replace(
+                        personality_status,
+                        accepted_personality_delta_count=summary.accepted_personality_delta_count,
+                    )
+                )
 
                 display_result = self._prepare_display_reserve(
                     effective_now=effective_now,
@@ -939,6 +1187,7 @@ class TwinrNightlyOrchestrator:
                         last_completed_at=completed_at,
                         last_status="degraded" if errors else "ready",
                         last_error=_join_errors(errors),
+                        failure_stage=summary.failure_stage,
                         remote_ready=True,
                         remote_status=remote_status,
                         digest_ready=True,
@@ -960,6 +1209,10 @@ class TwinrNightlyOrchestrator:
                             else None
                         ),
                         live_search_queries=live_search_queries,
+                        personality_flush_status=summary.personality_flush_status,
+                        personality_history_read_status=summary.personality_history_read_status,
+                        last_personality_commit_at=summary.last_personality_commit_at,
+                        personality_history_error=summary.personality_history_error,
                     )
                 )
                 return NightlyOrchestrationResult(
@@ -971,7 +1224,28 @@ class TwinrNightlyOrchestrator:
                     summary=summary,
                     display_reserve_result=display_result,
                 )
-            except LongTermRemoteUnavailableError:
+            except LongTermRemoteUnavailableError as exc:
+                personality_status_store.save(
+                    replace(
+                        personality_status,
+                        flush_status=_merge_ranked_status(
+                            personality_status.flush_status,
+                            "remote_unavailable",
+                            priorities=self._personality_flush_status_priorities(),
+                        ),
+                        history_read_status=_merge_ranked_status(
+                            personality_status.history_read_status,
+                            "remote_unavailable",
+                            priorities=self._personality_history_status_priorities(),
+                        ),
+                        failure_stage=(
+                            personality_status.failure_stage
+                            or long_term_flush_outcome.failure_stage
+                            or "required_remote_failed"
+                        ),
+                        error=_exception_summary(exc),
+                    )
+                )
                 state = self._save_state(
                     NightlyRunState(
                         prepared_local_day=None,
@@ -979,10 +1253,19 @@ class TwinrNightlyOrchestrator:
                         last_completed_at=None,
                         last_status="blocked_remote_failed",
                         last_error="required_remote_failed",
+                        failure_stage=(
+                            personality_status.failure_stage
+                            or long_term_flush_outcome.failure_stage
+                            or "required_remote_failed"
+                        ),
                         remote_ready=False,
                         remote_status=remote_status,
                         digest_ready=False,
                         live_search_queries=live_search_queries,
+                        personality_flush_status=personality_status.flush_status,
+                        personality_history_read_status=personality_status.history_read_status,
+                        last_personality_commit_at=personality_status.last_personality_commit_at,
+                        personality_history_error=_exception_summary(exc),
                     )
                 )
                 raise
@@ -1054,6 +1337,13 @@ class TwinrNightlyOrchestrator:
             raise RuntimeError("nightly summary store is not configured")
         return self.summary_store
 
+    def _require_personality_status_store(self) -> NightlyPersonalityStatusStore:
+        """Return the configured nightly personality-status store after post-init wiring."""
+
+        if self.personality_status_store is None:
+            raise RuntimeError("nightly personality status store is not configured")
+        return self.personality_status_store
+
     def _require_display_planner(self) -> DisplayReserveCompanionPlanner:
         """Return the configured display planner after post-init wiring."""
 
@@ -1084,8 +1374,10 @@ class TwinrNightlyOrchestrator:
                 last_completed_at=None,
                 last_status="interrupted",
                 last_error=reason,
+                failure_stage=reason,
                 remote_ready=True,
                 remote_status=remote_status,
+                personality_history_error=reason,
             )
         )
 
@@ -1107,7 +1399,81 @@ class TwinrNightlyOrchestrator:
         )
         raise RuntimeError(reason)
 
-    def _flush_long_term_memory(self, long_term_memory: _LongTermMemoryLike, errors: list[str]) -> bool:
+    def _personality_flush_status_priorities(self) -> dict[str, int]:
+        """Return the severity ordering for nightly personality flush statuses."""
+
+        return {
+            "not_run": 0,
+            "not_configured": 1,
+            "no_pending": 2,
+            "committed": 3,
+            "error": 4,
+            "remote_unavailable": 5,
+        }
+
+    def _personality_history_status_priorities(self) -> dict[str, int]:
+        """Return the severity ordering for nightly personality history statuses."""
+
+        return {
+            "not_run": 0,
+            "not_configured": 1,
+            "missing": 2,
+            "loaded": 3,
+            "unavailable": 4,
+            "error": 5,
+            "remote_unavailable": 6,
+        }
+
+    def _merge_personality_status(
+        self,
+        current: NightlyPersonalityStatus,
+        *,
+        flush_outcome: _PersonalityFlushOutcome | None = None,
+        probe: PersonalityHistoryProbe | None = None,
+    ) -> NightlyPersonalityStatus:
+        """Merge one flush/probe observation into the persisted nightly personality status."""
+
+        merged = current
+        if flush_outcome is not None:
+            merged = replace(
+                merged,
+                flush_status=_merge_ranked_status(
+                    merged.flush_status,
+                    flush_outcome.status,
+                    priorities=self._personality_flush_status_priorities(),
+                ),
+                accepted_personality_delta_count=(
+                    merged.accepted_personality_delta_count
+                    + len(flush_outcome.result.accepted_deltas)
+                    if flush_outcome.result is not None
+                    else merged.accepted_personality_delta_count
+                ),
+            )
+            if flush_outcome.failure_stage is not None:
+                merged = replace(merged, failure_stage=flush_outcome.failure_stage)
+            if flush_outcome.error is not None:
+                merged = replace(merged, error=flush_outcome.error)
+        if probe is not None:
+            merged = replace(
+                merged,
+                history_read_status=_merge_ranked_status(
+                    merged.history_read_status,
+                    probe.history_read_status,
+                    priorities=self._personality_history_status_priorities(),
+                ),
+                last_personality_commit_at=probe.last_commit_at or merged.last_personality_commit_at,
+            )
+            if probe.failure_stage is not None:
+                merged = replace(merged, failure_stage=probe.failure_stage)
+            if probe.error is not None:
+                merged = replace(merged, error=probe.error)
+        return merged
+
+    def _flush_long_term_memory(
+        self,
+        long_term_memory: _LongTermMemoryLike,
+        errors: list[str],
+    ) -> _LongTermFlushOutcome:
         """Flush the runtime long-term writers within the configured timeout."""
 
         timeout_s = max(
@@ -1126,11 +1492,55 @@ class TwinrNightlyOrchestrator:
         except LongTermRemoteUnavailableError:
             raise
         except Exception as exc:
-            errors.append(f"long_term_flush:{_exception_summary(exc)}")
-            return False
+            error = _exception_summary(exc)
+            errors.append(f"long_term_flush:{error}")
+            return _LongTermFlushOutcome(
+                ok=False,
+                failure_stage="long_term_flush_exception",
+                error=error,
+            )
         if not flushed:
-            errors.append("long_term_flush:timeout_or_incomplete")
-        return flushed
+            failure_stage, failure_detail = self._inspect_long_term_flush_failure(long_term_memory)
+            if failure_detail:
+                errors.append(f"long_term_flush:{failure_stage}:{failure_detail}")
+            else:
+                errors.append(f"long_term_flush:{failure_stage}")
+            return _LongTermFlushOutcome(
+                ok=False,
+                failure_stage=failure_stage,
+                error=failure_detail,
+            )
+        return _LongTermFlushOutcome(ok=True)
+
+    def _inspect_long_term_flush_failure(
+        self,
+        long_term_memory: _LongTermMemoryLike,
+    ) -> tuple[str, str | None]:
+        """Return one explicit failure stage for an incomplete long-term flush."""
+
+        for label, writer in (
+            ("conversation", getattr(long_term_memory, "writer", None)),
+            ("multimodal", getattr(long_term_memory, "multimodal_writer", None)),
+        ):
+            details = _writer_state_details(writer)
+            if not isinstance(details, Mapping):
+                continue
+            last_error_message = _bounded_optional_text(
+                details.get("last_error_message"),
+                max_len=120,
+            )
+            if last_error_message:
+                return (f"long_term_flush_{label}_writer_error", last_error_message)
+            if details.get("worker_alive") is False:
+                return (f"long_term_flush_{label}_writer_not_alive", None)
+            pending_count = details.get("pending_count")
+            try:
+                pending = _coerce_nonnegative_int(pending_count or 0)
+            except (TypeError, ValueError):
+                pending = 0
+            if pending > 0:
+                return (f"long_term_flush_{label}_writer_pending", f"pending_count={pending}")
+        return ("long_term_flush_timeout_or_incomplete", None)
 
     def _flush_personality_learning(
         self,
@@ -1138,7 +1548,7 @@ class TwinrNightlyOrchestrator:
         *,
         results: list[PersonalityEvolutionResult],
         errors: list[str],
-    ) -> None:
+    ) -> _PersonalityFlushOutcome:
         """Flush one queued personality-learning batch and keep degradations visible."""
 
         try:
@@ -1146,9 +1556,46 @@ class TwinrNightlyOrchestrator:
         except LongTermRemoteUnavailableError:
             raise
         except Exception as exc:
-            errors.append(f"personality_flush:{_exception_summary(exc)}")
-            return
+            error = _exception_summary(exc)
+            errors.append(f"personality_flush:{error}")
+            return _PersonalityFlushOutcome(
+                status="error",
+                failure_stage="personality_flush",
+                error=error,
+            )
         self._capture_personality_result(results, result)
+        if result is None:
+            return _PersonalityFlushOutcome(status="no_pending")
+        return _PersonalityFlushOutcome(
+            status="committed",
+            result=result,
+        )
+
+    def _probe_personality_history(
+        self,
+        personality_learning: _PersonalityLearningLike,
+        *,
+        errors: list[str],
+    ) -> PersonalityHistoryProbe:
+        """Probe the persisted personality history and surface unreadable states explicitly."""
+
+        try:
+            probe = personality_learning.probe_history_status()
+        except LongTermRemoteUnavailableError:
+            raise
+        except Exception as exc:
+            error = _exception_summary(exc)
+            errors.append(f"personality_history:personality_history_probe:{error}")
+            return PersonalityHistoryProbe(
+                history_read_status="error",
+                failure_stage="personality_history_probe",
+                error=error,
+            )
+        if probe.history_read_status not in {"loaded", "missing", "not_configured"}:
+            detail = probe.error or probe.history_read_status
+            stage = probe.failure_stage or "personality_history_probe"
+            errors.append(f"personality_history:{stage}:{_bounded_text(detail, max_len=120)}")
+        return probe
 
     def _capture_personality_result(
         self,
@@ -1164,7 +1611,7 @@ class TwinrNightlyOrchestrator:
         self,
         *,
         target_day: LocalDate,
-        local_tzinfo: object | None,
+        local_tzinfo: tzinfo | None,
     ) -> tuple[ReminderEntry, ...]:
         """Return undelivered reminders relevant to the prepared local day."""
 
@@ -1203,13 +1650,18 @@ class TwinrNightlyOrchestrator:
         self,
         reminders: Sequence[ReminderEntry],
         *,
-        local_tzinfo: object | None,
+        local_tzinfo: tzinfo | None,
     ) -> tuple[str, ...]:
         """Render reminder entries into bounded digest lines."""
 
         lines: list[str] = []
         seen: set[str] = set()
-        limit = max(1, int(getattr(self.config, "nightly_digest_reminder_limit", _DEFAULT_REMINDER_LIMIT) or _DEFAULT_REMINDER_LIMIT))
+        limit = _coerce_config_int(
+            self.config,
+            "nightly_digest_reminder_limit",
+            _DEFAULT_REMINDER_LIMIT,
+            minimum=1,
+        )
         for entry in reminders:
             due_at = getattr(entry, "due_at", None)
             summary = _bounded_text(getattr(entry, "summary", None), max_len=160)
@@ -1240,7 +1692,12 @@ class TwinrNightlyOrchestrator:
         threads = tuple(getattr(refresh_result, "awareness_threads", ()))
         headline_limit = max(
             1,
-            int(getattr(self.config, "nightly_digest_headline_limit", _DEFAULT_HEADLINE_LIMIT) or _DEFAULT_HEADLINE_LIMIT),
+            _coerce_config_int(
+                self.config,
+                "nightly_digest_headline_limit",
+                _DEFAULT_HEADLINE_LIMIT,
+                minimum=1,
+            ),
         )
         ranked = sorted(
             threads,
@@ -1298,7 +1755,7 @@ class TwinrNightlyOrchestrator:
     ) -> dict[str, object]:
         """Build the structured inputs used for digest preparation."""
 
-        local_tzinfo = effective_now.tzinfo
+        local_tzinfo = _coerce_tzinfo(effective_now.tzinfo)
         reminders = self._load_target_day_reminders(
             target_day=target_day,
             local_tzinfo=local_tzinfo,
@@ -1358,7 +1815,11 @@ class TwinrNightlyOrchestrator:
 
         query_limit = max(
             0,
-            int(getattr(self.config, "nightly_live_web_query_limit", _DEFAULT_LIVE_WEB_QUERY_LIMIT) or _DEFAULT_LIVE_WEB_QUERY_LIMIT),
+            _coerce_config_int(
+                self.config,
+                "nightly_live_web_query_limit",
+                _DEFAULT_LIVE_WEB_QUERY_LIMIT,
+            ),
         )
         if query_limit <= 0:
             return 0, None, (), None, ()
@@ -1387,13 +1848,13 @@ class TwinrNightlyOrchestrator:
             queries_used += 1
             weather_summary = _bounded_optional_text(getattr(weather, "answer", None), max_len=600)
             weather_sources = _bounded_text_tuple(
-                tuple(getattr(weather, "sources", ()) or ()),
+                _tuple_from_value(getattr(weather, "sources", ()) or ()),
                 max_items=12,
                 max_len=512,
             )
 
-        headline_lines = tuple(digest_inputs.get("headline_lines", ()))
-        world_news_sources = tuple(digest_inputs.get("world_news_sources", ()))
+        headline_lines = _tuple_from_value(digest_inputs.get("headline_lines", ()))
+        world_news_sources = _tuple_from_value(digest_inputs.get("world_news_sources", ()))
         if headline_lines:
             return queries_used, weather_summary, weather_sources, None, _bounded_text_tuple(
                 world_news_sources,
@@ -1402,7 +1863,12 @@ class TwinrNightlyOrchestrator:
             )
         if queries_used >= query_limit or len(headline_lines) >= max(
             1,
-            int(getattr(self.config, "nightly_digest_headline_limit", _DEFAULT_HEADLINE_LIMIT) or _DEFAULT_HEADLINE_LIMIT),
+            _coerce_config_int(
+                self.config,
+                "nightly_digest_headline_limit",
+                _DEFAULT_HEADLINE_LIMIT,
+                minimum=1,
+            ),
         ):
             return queries_used, weather_summary, weather_sources, None, ()
 
@@ -1423,7 +1889,7 @@ class TwinrNightlyOrchestrator:
             queries_used += 1
             live_news_summary = _bounded_optional_text(getattr(news, "answer", None), max_len=1200)
             news_sources = _bounded_text_tuple(
-                tuple(getattr(news, "sources", ()) or ()),
+                _tuple_from_value(getattr(news, "sources", ()) or ()),
                 max_items=12,
                 max_len=512,
             )
@@ -1458,15 +1924,24 @@ class TwinrNightlyOrchestrator:
         """Refine raw nightly data into calmer user-facing morning-digest content."""
 
         candidate_news_sources = (
-            *tuple(digest_inputs.get("world_news_sources", ())),
-            *tuple(digest_inputs.get("news_sources", ())),
+            *_tuple_from_value(digest_inputs.get("world_news_sources", ())),
+            *_tuple_from_value(digest_inputs.get("news_sources", ())),
         )
         return build_nightly_digest_refinement(
             compose=self._compose_with_backend if self.text_backend is not None else None,
             language=_bounded_optional_text(digest_inputs.get("language"), max_len=24),
             target_day_text=target_day_text,
             location_hint=self._configured_location_hint(),
-            raw_headline_lines=tuple(digest_inputs.get("headline_lines", ())),
+            raw_headline_lines=_bounded_text_tuple(
+                _tuple_from_value(digest_inputs.get("headline_lines", ())),
+                max_items=_coerce_config_int(
+                    self.config,
+                    "nightly_digest_headline_limit",
+                    _DEFAULT_HEADLINE_LIMIT,
+                    minimum=1,
+                ),
+                max_len=_MAX_LINE,
+            ),
             raw_live_news_summary=_bounded_optional_text(digest_inputs.get("live_news_summary"), max_len=1200),
             candidate_news_sources=_bounded_text_tuple(candidate_news_sources, max_items=12, max_len=512),
             raw_new_insights=nightly_insights.new_insights,
@@ -1495,46 +1970,66 @@ class TwinrNightlyOrchestrator:
 
         language = _bounded_optional_text(digest_inputs.get("language"), max_len=24)
         reminder_lines = _bounded_text_tuple(
-            tuple(digest_inputs.get("reminders", ())),
+            _tuple_from_value(digest_inputs.get("reminders", ())),
             max_items=max(
                 1,
-                int(getattr(self.config, "nightly_digest_reminder_limit", _DEFAULT_REMINDER_LIMIT) or _DEFAULT_REMINDER_LIMIT),
+                _coerce_config_int(
+                    self.config,
+                    "nightly_digest_reminder_limit",
+                    _DEFAULT_REMINDER_LIMIT,
+                    minimum=1,
+                ),
             ),
             max_len=_MAX_LINE,
         )
         headline_lines = _bounded_text_tuple(
-            tuple(digest_inputs.get("headline_lines", ())),
+            _tuple_from_value(digest_inputs.get("headline_lines", ())),
             max_items=max(
                 1,
-                int(getattr(self.config, "nightly_digest_headline_limit", _DEFAULT_HEADLINE_LIMIT) or _DEFAULT_HEADLINE_LIMIT),
+                _coerce_config_int(
+                    self.config,
+                    "nightly_digest_headline_limit",
+                    _DEFAULT_HEADLINE_LIMIT,
+                    minimum=1,
+                ),
             ),
             max_len=_MAX_LINE,
         )
         weather_summary = _bounded_optional_text(digest_inputs.get("weather_summary"), max_len=600)
         live_news_summary = _bounded_optional_text(digest_inputs.get("live_news_summary"), max_len=1200)
         new_insights = _bounded_text_tuple(
-            tuple(digest_inputs.get("new_insights", ())),
+            _tuple_from_value(digest_inputs.get("new_insights", ())),
             max_items=max(
                 1,
-                int(getattr(self.config, "nightly_digest_headline_limit", _DEFAULT_HEADLINE_LIMIT) or _DEFAULT_HEADLINE_LIMIT),
+                _coerce_config_int(
+                    self.config,
+                    "nightly_digest_headline_limit",
+                    _DEFAULT_HEADLINE_LIMIT,
+                    minimum=1,
+                ),
             ),
             max_len=_MAX_LINE,
         )
         continuity_shifts = _bounded_text_tuple(
-            tuple(digest_inputs.get("continuity_shifts", ())),
+            _tuple_from_value(digest_inputs.get("continuity_shifts", ())),
             max_items=max(
                 1,
-                int(getattr(self.config, "nightly_digest_headline_limit", _DEFAULT_HEADLINE_LIMIT) or _DEFAULT_HEADLINE_LIMIT),
+                _coerce_config_int(
+                    self.config,
+                    "nightly_digest_headline_limit",
+                    _DEFAULT_HEADLINE_LIMIT,
+                    minimum=1,
+                ),
             ),
             max_len=_MAX_LINE,
         )
         weather_sources = _bounded_text_tuple(
-            tuple(digest_inputs.get("weather_sources", ())),
+            _tuple_from_value(digest_inputs.get("weather_sources", ())),
             max_items=12,
             max_len=512,
         )
         news_sources = _bounded_text_tuple(
-            tuple(digest_inputs.get("news_sources", ())),
+            _tuple_from_value(digest_inputs.get("news_sources", ())),
             max_items=12,
             max_len=512,
         )
@@ -1778,11 +2273,13 @@ class TwinrNightlyOrchestrator:
         target_day_text: str,
         prepared_at: str,
         long_term_flush_ok: bool,
+        failure_stage: str | None,
         reflection_result: LongTermReflectionResultV1 | None,
         world_refresh_result: WorldIntelligenceRefreshResult | None,
         digest: NightlyPreparedDigest,
         due_reminder_count: int,
         target_day_reminder_count: int,
+        personality_status: NightlyPersonalityStatus,
         personality_results: Sequence[PersonalityEvolutionResult],
         nightly_insights: NightlyInsightBundle,
         live_search_queries: int,
@@ -1790,11 +2287,15 @@ class TwinrNightlyOrchestrator:
     ) -> NightlyConsolidationSummary:
         """Build the bounded nightly consolidation summary artifact."""
 
-        accepted_delta_count = sum(len(result.accepted_deltas) for result in personality_results)
+        accepted_delta_count = max(
+            personality_status.accepted_personality_delta_count,
+            sum(len(result.accepted_deltas) for result in personality_results),
+        )
         return NightlyConsolidationSummary(
             target_local_day=target_day_text,
             prepared_at=prepared_at,
             long_term_flush_ok=long_term_flush_ok,
+            failure_stage=_bounded_optional_text(failure_stage, max_len=96),
             reflection_reflected_object_count=len(getattr(reflection_result, "reflected_objects", ())),
             reflection_created_summary_count=len(getattr(reflection_result, "created_summaries", ())),
             world_refresh_status=(
@@ -1809,6 +2310,10 @@ class TwinrNightlyOrchestrator:
             due_reminder_count=max(0, due_reminder_count),
             target_day_reminder_count=max(0, target_day_reminder_count),
             accepted_personality_delta_count=accepted_delta_count,
+            personality_flush_status=personality_status.flush_status,
+            personality_history_read_status=personality_status.history_read_status,
+            last_personality_commit_at=personality_status.last_personality_commit_at,
+            personality_history_error=personality_status.error,
             new_insights=digest.new_insights,
             continuity_shifts=digest.continuity_shifts,
             operator_new_insights=nightly_insights.new_insights,
@@ -1831,8 +2336,12 @@ class TwinrNightlyOrchestrator:
         planner = self._require_display_planner()
         original_factory = planner.long_term_memory_factory
         if reflection_result is not None:
-            planner.long_term_memory_factory = (
-                lambda _config: _PrecomputedReflectionMemoryService(reflection=reflection_result)
+            planner.long_term_memory_factory = cast(
+                Callable[[TwinrConfig], LongTermMemoryService],
+                lambda _config: cast(
+                    LongTermMemoryService,
+                    _PrecomputedReflectionMemoryService(reflection=reflection_result),
+                ),
             )
         try:
             return planner.maybe_run_nightly_maintenance(
@@ -1853,6 +2362,8 @@ __all__ = [
     "NightlyConsolidationSummary",
     "NightlyConsolidationSummaryStore",
     "NightlyOrchestrationResult",
+    "NightlyPersonalityStatus",
+    "NightlyPersonalityStatusStore",
     "NightlyPreparedDigest",
     "NightlyPreparedDigestStore",
     "NightlyRunState",

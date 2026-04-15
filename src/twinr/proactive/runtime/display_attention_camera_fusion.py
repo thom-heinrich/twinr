@@ -2,6 +2,7 @@
 # BUG-1: Prevented infinite dropout-hold ghost persons by never re-caching held-only visibility as a fresh visible frame.
 # BUG-2: Prevented stale pose/hand semantics from self-refreshing forever by tracking semantic-origin timestamps separately from fused-frame timestamps.
 # BUG-3: Rejected out-of-order older full/gesture observations and replaced wall-clock-only aging with monotonic fallback to stop time-warp regressions.
+# BUG-4: Exposed one bounded recent-hand-semantics query so transcript-first voice runtimes can arm the heavier gesture lane only when fresh hand/intent evidence exists.
 # SEC-1: Sanitized non-finite timestamps, anchors, and confidences to block data-plane poisoning that could previously pin stale semantics indefinitely.
 # IMP-1: Added thread-safe multi-lane state access plus confidence-decayed, uncertainty-aware semantic transfer.
 # IMP-2: Added frontier-grade identity gating hooks (track-id and optional bbox IoU) while preserving center/zone fallback.
@@ -159,6 +160,37 @@ class DisplayAttentionCameraFusion:
                 self._last_fused_visible_observation = _build_fused_record(observed_at=checked_at, authoritative_current=observation, fused_observation=fused, received_monotonic_ns=checked_monotonic_ns, pose_source=pose_source, hand_source=hand_source)
             debug_details.update({'result_person_visible': fused.person_visible, 'result_looking_toward_device': fused.looking_toward_device, 'result_looking_signal_state': fused.looking_signal_state, 'result_looking_signal_source': fused.looking_signal_source, 'result_hand_or_object_near_camera': fused.hand_or_object_near_camera, 'result_showing_intent_likely': fused.showing_intent_likely, 'result_body_pose': fused.body_pose.value, 'result_motion_state': fused.motion_state.value})
             return DisplayAttentionCameraFusionResult(observation=fused, debug_details=debug_details)
+
+    def has_recent_hand_semantics(self, *, observed_at: float) -> bool:
+        """Return whether a fresh local observation still carries hand intent."""
+
+        checked_at = _finite_optional_float(observed_at)
+        checked_monotonic_ns = time.monotonic_ns()
+        with self._lock:
+            candidates = (
+                self._fresh_visible_source(
+                    self._last_gesture_observation,
+                    observed_at=checked_at,
+                    observed_monotonic_ns=checked_monotonic_ns,
+                    max_age_s=self.config.gesture_semantic_hold_s,
+                ),
+                self._fresh_visible_source(
+                    self._last_fused_visible_observation,
+                    observed_at=checked_at,
+                    observed_monotonic_ns=checked_monotonic_ns,
+                    max_age_s=self.config.gesture_semantic_hold_s,
+                ),
+                self._fresh_visible_source(
+                    self._last_full_observation,
+                    observed_at=checked_at,
+                    observed_monotonic_ns=checked_monotonic_ns,
+                    max_age_s=self.config.gesture_semantic_hold_s,
+                ),
+            )
+            return any(
+                candidate is not None and _has_hand_semantics(candidate.observation)
+                for candidate in candidates
+            )
 
     def _best_pose_source(self, *, observed_at: float | None, observed_monotonic_ns: int, current: SocialVisionObservation) -> _PreparedSemanticSource | None:
         candidates = (self._compatible_visible_source(self._last_full_observation, observed_at=observed_at, observed_monotonic_ns=observed_monotonic_ns, current=current, semantic_kind='pose', max_age_s=self.config.pose_semantic_hold_s, require_semantics=_has_pose_semantics), self._compatible_visible_source(self._last_fused_visible_observation, observed_at=observed_at, observed_monotonic_ns=observed_monotonic_ns, current=current, semantic_kind='pose', max_age_s=self.config.pose_semantic_hold_s, require_semantics=_has_pose_semantics))

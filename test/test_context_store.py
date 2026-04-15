@@ -342,8 +342,11 @@ class ContextStoreTests(unittest.TestCase):
                 remote_state=remote_state,
                 remote_snapshot_kind="user_context",
             )
-
-            created = store.ensure_remote_snapshot()
+            with patch(
+                "twinr.memory.context_store._probe_remote_collection_head_status",
+                return_value=("missing", None),
+            ):
+                created = store.ensure_remote_snapshot()
 
         self.assertFalse(created)
         self.assertEqual(
@@ -376,6 +379,44 @@ class ContextStoreTests(unittest.TestCase):
             remote_snapshot_kind="user_context",
             fast_fail=True,
         )
+
+    def test_managed_context_store_ensure_remote_snapshot_does_not_republish_when_current_head_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "USER.md"
+            path.write_text(
+                "\n".join(
+                    [
+                        "Base user facts.",
+                        "",
+                        "<!-- TWINR_MANAGED_CONTEXT_START -->",
+                        "## Twinr managed user updates",
+                        "_This section is managed by Twinr. Keep entries short and stable._",
+                        "- pets: Thom has two dogs.",
+                        "<!-- TWINR_MANAGED_CONTEXT_END -->",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            remote_state = _FakeRemoteState()
+            store = ManagedContextFileStore(
+                path,
+                section_title="Twinr managed user updates",
+                remote_state=remote_state,
+                remote_snapshot_kind="user_context",
+            )
+            with patch(
+                "twinr.memory.context_store._probe_remote_collection_head_status",
+                return_value=("unavailable", None),
+            ), patch.object(
+                store,
+                "_try_save_remote_entries",
+                side_effect=AssertionError("managed-context seed must stay read-only on unavailable probes"),
+            ) as save_remote_entries:
+                created = store.ensure_remote_snapshot()
+
+        self.assertFalse(created)
+        save_remote_entries.assert_not_called()
 
     def test_managed_context_store_ensure_remote_snapshot_repairs_invalid_blank_current_head(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -447,8 +488,11 @@ class ContextStoreTests(unittest.TestCase):
                 remote_state=remote_state,
                 remote_snapshot_kind="user_context",
             )
-
-            created = store.ensure_remote_snapshot()
+            with patch(
+                "twinr.memory.context_store._probe_remote_collection_head_status",
+                return_value=("missing", None),
+            ):
+                created = store.ensure_remote_snapshot()
 
         self.assertTrue(created)
         self.assertEqual(remote_state.client.bulk_calls, 5)
@@ -491,6 +535,30 @@ class ContextStoreTests(unittest.TestCase):
             remote_snapshot_kind="prompt_memory",
             fast_fail=True,
         )
+
+    def test_memory_store_ensure_remote_snapshot_does_not_republish_when_current_head_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "MEMORY.md"
+            writer_store = PersistentMemoryMarkdownStore(path)
+            writer_store.remember(
+                kind="appointment",
+                summary="Arzttermin am Montag um 14 Uhr.",
+                details="Bei Dr. Meyer in Hamburg.",
+            )
+            remote_state = _FakeRemoteState()
+            store = PersistentMemoryMarkdownStore(path, remote_state=remote_state)
+            with patch(
+                "twinr.memory.context_store._probe_remote_collection_head_status",
+                return_value=("unavailable", None),
+            ), patch.object(
+                store,
+                "_try_save_remote_entries",
+                side_effect=AssertionError("prompt-memory seed must stay read-only on unavailable probes"),
+            ) as save_remote_entries:
+                created = store.ensure_remote_snapshot()
+
+        self.assertFalse(created)
+        save_remote_entries.assert_not_called()
 
     def test_prompt_context_store_bootstrap_skips_empty_remote_seed_components(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

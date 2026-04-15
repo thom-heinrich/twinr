@@ -14,6 +14,16 @@
 # BUG-8: Keep dual-lane processing feedback behind the bridge/direct speech gate so
 #        auxiliary THINKING audio does not restart the old Pi first-word stutter /
 #        audio-busy failure mode by starting before the first spoken reply.
+# BUG-9: Clear the visible `speaking` state as soon as playback ends even when
+#        follow-up closure evaluation is still running, and only re-open
+#        `listening` later if the closure gate eventually allows it.
+# BUG-10: Use one atomic runtime reopen path for provisional remote follow-up
+#         turns so the Pi does not persist an extra intermediate `waiting`
+#         snapshot before reopening `listening`.
+# BUG-11: Seeded/direct-text turns now enter `processing` and can start their
+#         processing-feedback contract before any post-commit speculative warmup
+#         runs, so transcript-ready voice turns no longer sit silent behind
+#         blocking prewarm work.
 # SEC-1: Sanitize and length-bound emitted key=value payloads so model/user-controlled text cannot inject extra
 #        protocol/log lines via CR/LF or other control characters.
 # SEC-2: Bound concurrent deferred closure-evaluation workers to avoid practical thread/resource exhaustion on
@@ -40,7 +50,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from threading import BoundedSemaphore, Event, RLock, Thread
-from typing import Callable, Protocol
+from typing import Callable, Protocol, SupportsInt, cast
 import time
 
 from twinr.agent.base_agent.config import TwinrConfig
@@ -51,7 +61,11 @@ from twinr.agent.base_agent.conversation.closure import (
 from twinr.agent.base_agent.contracts import FirstWordReply
 from twinr.agent.tools.runtime.streaming_loop import StreamingToolLoopResult
 from twinr.agent.workflows.playback_coordinator import PlaybackCoordinator
-from twinr.agent.workflows.speech_output import InterruptibleSpeechOutput
+from twinr.agent.workflows.speech_output import (
+    InterruptibleSpeechOutput,
+    StreamingTextToSpeechProviderLike,
+    WaveAudioPlayerLike,
+)
 from twinr.agent.workflows.streaming_turn_orchestrator import (
     StreamingTurnLaneOutcome,
     StreamingTurnOrchestrator,
@@ -78,11 +92,20 @@ def _noop_turn_latency_breakdown(_trace_id: str | None) -> None:
     return None
 
 
+def _noop_after_transcript_submitted() -> None:
+    """Default no-op seeded-turn hook for legacy callers and tests."""
+
+    return None
+
+
 def _coerce_positive_int(value: object, default: int, *, minimum: int = 1) -> int:
     """Return a bounded positive integer from config-like values."""
 
     try:
-        return max(minimum, int(value))
+        return max(
+            minimum,
+            int(cast(SupportsInt | str | bytes | bytearray, value)),
+        )
     except (TypeError, ValueError):
         return default
 
@@ -149,7 +172,17 @@ class StreamingTurnRuntimeLike(Protocol):
     def finish_speaking(self) -> None:
         ...
 
+    def finish_speaking_and_rearm_follow_up(
+        self,
+        *,
+        request_source: str = "follow_up",
+    ) -> None:
+        ...
+
     def rearm_follow_up(self, *, request_source: str = "follow_up") -> None:
+        ...
+
+    def cancel_listening(self) -> None:
         ...
 
     def refresh_snapshot_activity(self) -> None:
@@ -228,6 +261,7 @@ class StreamingTurnRequest:
     stt_ms: int
     allow_follow_up_rearm: bool = False
     workflow_trace_id: str | None = None
+    seeded_transcript: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,8 +289,8 @@ class StreamingTurnLanePlan:
 class StreamingTurnSpeechServices:
     """Bundle speech-output dependencies so the coordinator owns playback."""
 
-    tts_provider: object
-    player: object
+    tts_provider: StreamingTextToSpeechProviderLike
+    player: WaveAudioPlayerLike
     playback_coordinator: PlaybackCoordinator | None
     segment_boundary: Callable[[str], int | None]
 
@@ -279,6 +313,7 @@ class StreamingTurnCoordinatorHooks:
     evaluate_follow_up_closure: Callable[..., ConversationClosureEvaluation]
     apply_follow_up_closure_evaluation: Callable[..., bool]
     follow_up_rearm_allowed_now: Callable[[str], bool]
+    after_transcript_submitted: Callable[[], None] = _noop_after_transcript_submitted
     emit_turn_latency_breakdown: Callable[[str | None], None] = _noop_turn_latency_breakdown
 
 
@@ -703,6 +738,11 @@ class _DeferredFollowUpClosureEvaluation:
         )
         return evaluation
 
+    def is_ready(self) -> bool:
+        """Return whether the background evaluation has already finished."""
+
+        return self._ready.is_set()
+
 
 class StreamingTurnCoordinator:
     """Execute one streaming turn under a single stateful owner."""
@@ -764,6 +804,9 @@ class StreamingTurnCoordinator:
                 reason="runtime_submitted_transcript",
                 details={"transcript_len": len(self.request.transcript)},
             )
+            if self.request.seeded_transcript:
+                self.processing_feedback.ensure_started()
+            self.hooks.after_transcript_submitted()
             self._raise_if_interrupted(phase_reason="after_transcript_submission")
             self._lane_plan = self.lane_plan_factory()
             self._raise_if_interrupted(phase_reason="after_lane_plan_build")
@@ -1047,12 +1090,13 @@ class StreamingTurnCoordinator:
             raise RuntimeError("dual-lane turn plan missing run_final_lane callback")
         if self._speech_output is None:
             raise RuntimeError("dual-lane turn requires an initialized speech output")
+        speech_output = self._speech_output
         orchestrator = StreamingTurnOrchestrator(
             timeout_policy=lane_plan.timeout_policy,
             queue_lane_delta=self._queue_lane_segments,
-            wait_for_first_audio=self._speech_output.wait_for_first_audio,
-            wait_until_idle=self._speech_output.wait_until_idle,
-            is_output_idle=lambda: self._speech_output.wait_until_idle(timeout_s=0.0),
+            wait_for_first_audio=speech_output.wait_for_first_audio,
+            wait_until_idle=speech_output.wait_until_idle,
+            is_output_idle=lambda: speech_output.wait_until_idle(timeout_s=0.0),
             ensure_processing_feedback=self.processing_feedback.ensure_started,
             resume_processing_after_bridge=self._resume_processing_after_bridge_wait,
             stop_final_lane_feedback=self.hooks.stop_search_feedback,
@@ -1441,6 +1485,43 @@ class StreamingTurnCoordinator:
                 details={"error_type": type(exc).__name__},
             )
 
+    def _follow_up_rearm_allowed_now(self) -> bool:
+        """Return whether the current runtime may still reopen follow-up now."""
+
+        if not self.request.allow_follow_up_rearm:
+            return False
+        try:
+            return bool(self.hooks.follow_up_rearm_allowed_now(self.request.listen_source))
+        except Exception as exc:
+            self._emit_kv(
+                "streaming_follow_up_rearm_check_failed",
+                type(exc).__name__,
+                max_chars=256,
+            )
+            return False
+
+    def _cancel_provisional_follow_up_rearm(self) -> None:
+        """Collapse one provisional local follow-up reopen back to waiting."""
+
+        cancel_listening = getattr(self.runtime, "cancel_listening", None)
+        if not callable(cancel_listening):
+            raise RuntimeError("runtime.cancel_listening is required to collapse provisional follow-up")
+        cancel_listening()
+        self._emit_status_safe()
+
+    def _finish_and_rearm_follow_up_fast(self) -> None:
+        """Reopen provisional follow-up through one runtime-side fast path."""
+
+        fast_path = getattr(self.runtime, "finish_speaking_and_rearm_follow_up", None)
+        if callable(fast_path):
+            fast_path(request_source="follow_up")
+            self._emit_status_safe()
+            return
+        self.runtime.finish_speaking()
+        self._emit_status_safe()
+        self.runtime.rearm_follow_up(request_source="follow_up")
+        self._emit_status_safe()
+
     def _finish_turn(
         self,
         *,
@@ -1453,6 +1534,37 @@ class StreamingTurnCoordinator:
 
         self._record_usage_best_effort(response=response)
         end_conversation = any(call.name == "end_conversation" for call in response.tool_calls)
+        speaking_finished_before_closure_eval = (
+            deferred_closure_evaluation is not None
+            and not end_conversation
+            and not deferred_closure_evaluation.is_ready()
+        )
+        provisional_follow_up_rearmed = False
+        self.speech_lifecycle.stop_snapshot_heartbeat()
+        if speaking_finished_before_closure_eval:
+            self._raise_if_interrupted(phase_reason="before_runtime_finish")
+            if self._follow_up_rearm_allowed_now():
+                # The remote transcript-first follow-up window is already live
+                # on the server, so skip the extra intermediate waiting
+                # snapshot and reopen the local runtime/display directly.
+                self._emit_kv(
+                    "streaming_turn_finish_path",
+                    "rearm_follow_up_pending_closure_eval",
+                    max_chars=64,
+                )
+                self._finish_and_rearm_follow_up_fast()
+                provisional_follow_up_rearmed = True
+            else:
+                self._emit_kv(
+                    "streaming_turn_finish_path",
+                    "finish_speaking_pending_closure_eval",
+                    max_chars=64,
+                )
+                # Once the speaker is silent, the UI must stop claiming Twinr
+                # is still talking even if the follow-up gate is still
+                # resolving.
+                self.runtime.finish_speaking()
+                self._emit_status_safe()
         closure_evaluation = self._resolve_follow_up_closure_evaluation(
             end_conversation=end_conversation,
             answer=answer,
@@ -1464,18 +1576,7 @@ class StreamingTurnCoordinator:
             request_source=self.request.listen_source,
             proactive_trigger=self.request.proactive_trigger,
         )
-        remote_follow_up_rearm_allowed_now = False
-        if self.request.allow_follow_up_rearm:
-            try:
-                remote_follow_up_rearm_allowed_now = bool(
-                    self.hooks.follow_up_rearm_allowed_now(self.request.listen_source)
-                )
-            except Exception as exc:
-                self._emit_kv(
-                    "streaming_follow_up_rearm_check_failed",
-                    type(exc).__name__,
-                    max_chars=256,
-                )
+        remote_follow_up_rearm_allowed_now = self._follow_up_rearm_allowed_now()
         rearm_follow_up = (
             not force_close
             and self.request.allow_follow_up_rearm
@@ -1486,15 +1587,23 @@ class StreamingTurnCoordinator:
             "streaming_follow_up_rearm_allowed_now",
             remote_follow_up_rearm_allowed_now,
         )
-        self.speech_lifecycle.stop_snapshot_heartbeat()
         self._raise_if_interrupted(phase_reason="before_runtime_finish")
-        if rearm_follow_up:
+        if provisional_follow_up_rearmed:
+            if not rearm_follow_up:
+                self._emit_kv(
+                    "streaming_turn_finish_path",
+                    "cancel_provisional_follow_up",
+                    max_chars=64,
+                )
+                self._cancel_provisional_follow_up_rearm()
+        elif rearm_follow_up:
             self._emit_kv("streaming_turn_finish_path", "rearm_follow_up", max_chars=64)
             self.runtime.rearm_follow_up(request_source="follow_up")
-        else:
+            self._emit_status_safe()
+        elif not speaking_finished_before_closure_eval:
             self._emit_kv("streaming_turn_finish_path", "finish_speaking", max_chars=64)
             self.runtime.finish_speaking()
-        self._emit_status_safe()
+            self._emit_status_safe()
         if end_conversation:
             self._emit_flag("conversation_ended", True)
         elif force_close:

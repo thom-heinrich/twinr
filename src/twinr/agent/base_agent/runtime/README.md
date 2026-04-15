@@ -13,13 +13,18 @@ and runtime snapshot durability.
 - honor the configured required-remote readiness contract during bootstrap, including trusting the external watchdog artifact in Pi `watchdog_artifact` mode instead of forcing a second deep remote probe
 - drive state transitions for listening, answering, printing, and failures
 - rearm follow-up listening directly from `answering` when a conversation stays open after a spoken reply
+- also permit the delayed `waiting -> listening` reopen that occurs when speech has already ended but the follow-up closure gate resolves a moment later
+- collapse transcript-first provisional `tts_finished + follow_up_rearmed` into one persisted `listening` snapshot when the remote follow-up window is already open, so the visible Pi surface does not pay two back-to-back runtime writes before leaving `answering`
 - assemble provider-facing context, adaptive timing, voice guidance, and active guided-discovery state hints for tool-capable turns
 - normalize legacy voice-status labels before provider guidance so low-risk discovery turns do not accidentally fall back to conservative unknown-speaker wording
 - surface the currently visible reserve-lane card as bounded grounding context for supervisor/search lanes when the user is clearly reacting to what Twinr is showing, including a stronger per-turn authoritative overlay for fast supervisor decisions
 - keep the first-word lane on bounded local context so direct replies never block on remote long-term retrieval
 - keep the supervisor fast lane on the same remote-free path while still surfacing one local on-device memory summary
 - keep runtime-local tool turns on a bounded tiny-recent context when broader long-term memory is not needed, so status/control handoffs do not block the streaming final lane on remote retrieval
+- keep tool-context guided-discovery hints on one local prompt-safe status snapshot, so live voice turns never trigger authoritative remote discovery reads just to build a system hint
+- emit provider-context stage metrics and one explicit remote-context decision trace when workflow forensics bind runtime trace hooks, so slow `tool_provider_conversation_context()` turns can be attributed to lock snapshot, discovery, long-term retrieval, or final message assembly instead of appearing as one opaque blob
 - mediate on-device memory, durable memory, reminders, automations, and snapshots
+- expose explicit durable-memory reads from the prompt-context store so later recall of `remember_memory` facts has a runtime-owned read path, not only hidden prompt assembly
 - restore persisted runtime status through the state-machine snapshot contract instead of assigning to the read-only runtime `status` property, so startup restore can reinstate only the safe idle `waiting` state plus any orthogonal `printing_active` flag without false warnings while refusing to resurrect stale non-idle or `error` statuses from older process lifetimes
 - let `state.RuntimeSnapshotStore` remain the authoritative cross-process snapshot lock so Pi runtimes with `portalocker` installed do not self-deadlock by taking the same lock file twice during restore/persist
 - expose reminder-reservation release semantics so workflow races can unwind a reserved reminder before speech starts without forcing a fake failure retry delay

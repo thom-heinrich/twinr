@@ -18,8 +18,33 @@ _MODULE: Any = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 
+_POLICY_PATH = Path(__file__).resolve().parents[1] / "hardware" / "bitcraze" / "firmware_release_policy.py"
+_POLICY_SPEC = importlib.util.spec_from_file_location("bitcraze_firmware_release_policy_module", _POLICY_PATH)
+assert _POLICY_SPEC is not None and _POLICY_SPEC.loader is not None
+_POLICY_MODULE: Any = importlib.util.module_from_spec(_POLICY_SPEC)
+sys.modules[_POLICY_SPEC.name] = _POLICY_MODULE
+_POLICY_SPEC.loader.exec_module(_POLICY_MODULE)
+
 
 class OnDeviceFailsafeFlashHelperTests(unittest.TestCase):
+    def _write_dev_attestation(self, temp_root: Path, artifact: Path) -> Path:
+        app_root = temp_root / "app"
+        app_root.mkdir()
+        (app_root / "main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+        attestation = _POLICY_MODULE.create_build_attestation(
+            artifact_path=artifact,
+            firmware_root=temp_root,
+            firmware_git_commit="abc123def456",
+            firmware_git_tag="2025.12.1",
+            expected_firmware_revision="2025.12.1",
+            app_root=app_root,
+            app_tree_sha256=_POLICY_MODULE.compute_tree_sha256(app_root),
+            toolchain="arm-none-eabi-gcc",
+        )
+        attestation_path = temp_root / "artifact.build-attestation.json"
+        _POLICY_MODULE.write_attestation(attestation_path, attestation)
+        return attestation_path
+
     def test_build_cfloader_command_supports_warm_and_cold_boot(self) -> None:
         command = _MODULE.build_cfloader_command(
             cfloader_executable=Path("/tmp/cfloader"),
@@ -85,10 +110,14 @@ class OnDeviceFailsafeFlashHelperTests(unittest.TestCase):
                 binary.write_bytes(b"fw")
                 cfloader.write_text("#!/bin/sh\n")
                 cfloader.chmod(0o755)
+                attestation_path = self._write_dev_attestation(temp_root, binary)
                 report = _MODULE.flash_on_device_failsafe(
+                    lane="dev",
+                    device_role="dev",
                     uri="radio://0/80/2M",
                     workspace=temp_root,
                     binary_path=binary,
+                    attestation_path=attestation_path,
                     cfloader_executable=cfloader,
                     runner=_runner,
                 )
@@ -100,6 +129,8 @@ class OnDeviceFailsafeFlashHelperTests(unittest.TestCase):
         self.assertIsNotNone(report.availability)
         self.assertTrue(report.availability.loaded)
         self.assertEqual(report.failures, ())
+        self.assertEqual(report.lane, "dev")
+        self.assertEqual(report.device_role, "dev")
         self.assertEqual(
             observed_commands,
             [[str(cfloader), "-w", "radio://0/80/2M", "flash", str(binary), "stm32-fw"]],
@@ -133,9 +164,13 @@ class OnDeviceFailsafeFlashHelperTests(unittest.TestCase):
                 binary.write_bytes(b"fw")
                 cfloader.write_text("#!/bin/sh\n")
                 cfloader.chmod(0o755)
+                attestation_path = self._write_dev_attestation(temp_root, binary)
                 report = _MODULE.flash_on_device_failsafe(
+                    lane="dev",
+                    device_role="dev",
                     workspace=temp_root,
                     binary_path=binary,
+                    attestation_path=attestation_path,
                     cfloader_executable=cfloader,
                     runner=_runner,
                 )
@@ -145,6 +180,34 @@ class OnDeviceFailsafeFlashHelperTests(unittest.TestCase):
         self.assertTrue(report.flashed)
         self.assertTrue(any("protocolVersion" in failure for failure in report.failures))
         self.assertIn("post-flash probe did not see the `twinrFs` firmware app", report.failures)
+
+    def test_flash_on_device_failsafe_blocks_operator_lane_without_operator_release(self) -> None:
+        def _runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(args[0], 0, stdout="flash ok\n", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            binary = temp_root / "twinr.bin"
+            cfloader = temp_root / "cfloader"
+            binary.write_bytes(b"fw")
+            cfloader.write_text("#!/bin/sh\n", encoding="utf-8")
+            cfloader.chmod(0o755)
+            attestation_path = self._write_dev_attestation(temp_root, binary)
+
+            report = _MODULE.flash_on_device_failsafe(
+                lane="operator",
+                device_role="operator",
+                workspace=temp_root,
+                binary_path=binary,
+                attestation_path=attestation_path,
+                cfloader_executable=cfloader,
+                runner=_runner,
+            )
+
+        self.assertFalse(report.flashed)
+        self.assertTrue(
+            any("operator lane requires a promoted release attestation" in failure for failure in report.failures)
+        )
 
     def test_probe_loaded_failsafe_reconnects_and_uses_probe_module(self) -> None:
         class _FakeCRTP:
@@ -187,7 +250,6 @@ class OnDeviceFailsafeFlashHelperTests(unittest.TestCase):
                     uri="radio://0/80/2M",
                     workspace=Path(temp_dir),
                     settle_s=0.0,
-                    link_stats_sample_s=0.0,
                     sleep=lambda _seconds: None,
                 )
         finally:

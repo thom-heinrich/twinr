@@ -575,39 +575,13 @@ def _load_raw_snapshot_payload(
             snapshot_kind=snapshot_kind,
             head_payload=current_head,
         )
-        if payloads:
-            payload_dict = dict(payloads[0])
-            return prompt_remote_state, payload_dict, _sha256_hex(_canonical_json_bytes(payload_dict))
-    legacy_head = current_records.probe_legacy_collection_head(
-        snapshot_kind=snapshot_kind,
-        prefer_metadata_only=True,
-    )
-    if not isinstance(legacy_head, Mapping):
-        return prompt_remote_state, None, None
-
-    with _snapshot_lock(snapshot_kind):
-        raw_payload = prompt_remote_state.load_snapshot(snapshot_kind=snapshot_kind)
-        if raw_payload is None:
-            return prompt_remote_state, None, None
-        if not isinstance(raw_payload, Mapping):
-            raise ValueError(f"{snapshot_kind} must decode to a mapping payload.")
-
-        payload, payload_hash = _unwrap_snapshot_payload(
-            config=config,
-            snapshot_kind=snapshot_kind,
-            raw_payload=raw_payload,
-            max_payload_bytes=max_payload_bytes,
-            max_compressed_bytes=max_compressed_bytes,
-        )
-        snapshot_fingerprint = _snapshot_fingerprint(raw_payload)
-        _set_cached_snapshot_fingerprint(
-            resolved_remote_state=prompt_remote_state,
-            snapshot_kind=snapshot_kind,
-            snapshot_fingerprint=snapshot_fingerprint,
-        )
-        # Keep prompt-time snapshot loads read-only. Legacy-head promotion can
-        # trigger remote writes and job polling, which blocks live Pi turns.
-        return prompt_remote_state, payload, payload_hash
+        if not payloads:
+            raise SnapshotIntegrityError(
+                f"{snapshot_kind} current head exists but exposed no readable payload items."
+            )
+        payload_dict = dict(payloads[0])
+        return prompt_remote_state, payload_dict, _sha256_hex(_canonical_json_bytes(payload_dict))
+    return prompt_remote_state, None, None
 
 
 def _save_raw_snapshot_payload(

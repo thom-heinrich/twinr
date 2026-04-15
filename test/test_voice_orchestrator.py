@@ -1,8 +1,9 @@
+from array import array
+import os
 from pathlib import Path
 from tempfile import TemporaryFile
 from threading import Event, Lock, Thread
 import time
-from types import SimpleNamespace
 from typing import Any, cast
 from unittest import mock
 import sys
@@ -20,6 +21,7 @@ from twinr.agent.workflows.voice_orchestrator import (
     EdgeVoiceOrchestrator,
     _CaptureStreamStalledError,
 )
+from twinr.orchestrator.voice_activation import VoiceActivationMatch
 from twinr.orchestrator.voice_contracts import (
     OrchestratorVoiceErrorEvent,
     OrchestratorVoiceFollowUpClosedEvent,
@@ -27,7 +29,11 @@ from twinr.orchestrator.voice_contracts import (
     OrchestratorVoiceIdentityProfilesEvent,
     OrchestratorVoiceReadyEvent,
     OrchestratorVoiceTranscriptCommittedEvent,
+    OrchestratorVoiceWakeConfirmedEvent,
+    OrchestratorVoiceWakeSpeculativeEvent,
 )
+from twinr.hardware.respeaker.voice_mux import ReSpeakerVoiceMuxState
+from twinr.hardware.respeaker.pcm_content_classifier import PcmSpeechDiscriminatorEvidence
 
 
 class _FakeVoiceClient:
@@ -94,16 +100,30 @@ class _FakeCaptureProcess:
 
 
 class EdgeVoiceOrchestratorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._voice_mux_patcher = mock.patch(
+            "twinr.hardware.respeaker.voice_capture.ensure_respeaker_voice_mux_contract",
+            return_value=ReSpeakerVoiceMuxState(
+                asr_output_enabled=True,
+                output_pairs=((8, 0), (1, 0), (1, 2), (7, 3), (1, 1), (1, 3)),
+            ),
+        )
+        self._voice_mux_patcher.start()
+        self.addCleanup(self._voice_mux_patcher.stop)
+
     def _make_orchestrator(self):
         lines: list[str] = []
-        committed: list[tuple[str, str]] = []
+        committed: list[tuple[str, str, str | None, str | None]] = []
         orchestrator = EdgeVoiceOrchestrator(
             TwinrConfig(
                 voice_orchestrator_ws_url="ws://127.0.0.1:8797/ws/orchestrator/voice",
             ),
             emit=lines.append,
             on_voice_activation=lambda match: True,
-            on_transcript_committed=lambda transcript, source: committed.append((transcript, source)) or True,
+            on_transcript_committed=lambda transcript, source, wait_id, item_id: committed.append(
+                (transcript, source, wait_id, item_id)
+            )
+            or True,
             on_barge_in_interrupt=lambda: True,
         )
         fake_client = _FakeVoiceClient()
@@ -119,7 +139,7 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
             ),
             emit=lambda _msg: None,
             on_voice_activation=lambda match: True,
-            on_transcript_committed=lambda transcript, source: True,
+            on_transcript_committed=lambda transcript, source, wait_id, item_id: True,
             on_barge_in_interrupt=lambda: True,
         )
 
@@ -134,7 +154,7 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
             ),
             emit=lambda _msg: None,
             on_voice_activation=lambda match: True,
-            on_transcript_committed=lambda transcript, source: True,
+            on_transcript_committed=lambda transcript, source, wait_id, item_id: True,
             on_barge_in_interrupt=lambda: True,
         )
 
@@ -149,29 +169,133 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
             ),
             emit=lambda _msg: None,
             on_voice_activation=lambda match: True,
-            on_transcript_committed=lambda transcript, source: True,
+            on_transcript_committed=lambda transcript, source, wait_id, item_id: True,
             on_barge_in_interrupt=lambda: True,
         )
 
         self.assertEqual(orchestrator._device, "sysdefault:CARD=Array")
 
-    def test_send_frame_attaches_speech_probability_side_channel(self) -> None:
+    def test_send_frame_includes_edge_speech_probability(self) -> None:
         orchestrator, fake_client, _lines, _committed = self._make_orchestrator()
         orchestrator._connected = True
-        orchestrator._frame_speech_annotator = cast(
-            Any,
-            SimpleNamespace(
-                classify_frame=lambda pcm_bytes, stream_ended=False: SimpleNamespace(
-                    speech_probability=0.81
-                )
-            ),
-        )
 
-        sent = orchestrator._send_frame_now(b"\x01\x00" * 1600)
+        sent = orchestrator._send_frame_now(b"\x01\x00" * 1600, speech_probability=0.83)
 
         self.assertTrue(sent)
         self.assertEqual(len(fake_client.audio_frames), 1)
-        self.assertEqual(fake_client.audio_frames[0].speech_probability, 0.81)
+        self.assertEqual(fake_client.audio_frames[0].speech_probability, 0.83)
+
+    def test_nonempty_transport_frame_uses_fail_closed_pcm_speech_attestation(self) -> None:
+        orchestrator, _fake_client, _lines, _committed = self._make_orchestrator()
+
+        evidence = PcmSpeechDiscriminatorEvidence(
+            speech_probability=0.23,
+            backend="silero-onnx+dsp",
+        )
+        with mock.patch(
+            "twinr.agent.workflows.voice_orchestrator.classify_pcm_speech_likeness",
+            return_value=evidence,
+        ) as classify:
+            self.assertEqual(orchestrator._classify_edge_speech_probability(b"\x01\x00" * 1600), 0.23)
+
+        classify.assert_called_once()
+        self.assertEqual(orchestrator._classify_edge_speech_probability(b""), 0.0)
+
+    def test_nonempty_transport_frame_fails_closed_without_required_attestation_backend(self) -> None:
+        orchestrator, _fake_client, _lines, _committed = self._make_orchestrator()
+
+        with mock.patch(
+            "twinr.agent.workflows.voice_orchestrator.classify_pcm_speech_likeness",
+            return_value=PcmSpeechDiscriminatorEvidence(
+                speech_probability=0.23,
+                backend="dsp-only",
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "silero-onnx\\+dsp"):
+                orchestrator._classify_edge_speech_probability(b"\x01\x00" * 1600)
+
+    def test_respeaker_capture_contract_extracts_live_asr_lane(self) -> None:
+        orchestrator = EdgeVoiceOrchestrator(
+            TwinrConfig(
+                voice_orchestrator_ws_url="ws://127.0.0.1:8797/ws/orchestrator/voice",
+                voice_orchestrator_audio_device="plughw:CARD=Array,DEV=0",
+            ),
+            emit=lambda _msg: None,
+            on_voice_activation=lambda match: True,
+            on_transcript_committed=lambda transcript, source, wait_id, item_id: True,
+            on_barge_in_interrupt=lambda: True,
+        )
+        interleaved = array(
+            "h",
+            [
+                100,
+                200,
+                300,
+                400,
+                500,
+                600,
+                110,
+                210,
+                310,
+                410,
+                510,
+                610,
+            ],
+        ).tobytes()
+        projected = array("h")
+        projected.frombytes(orchestrator._project_capture_frame(interleaved))
+
+        self.assertEqual(orchestrator._channels, 1)
+        self.assertEqual(orchestrator._capture_channels, 6)
+        self.assertEqual(orchestrator._capture_contract.route_label, "respeaker_usb_asr_lane")
+        self.assertEqual(orchestrator._capture_extract_channel_index, 1)
+        self.assertEqual(list(projected), [200, 210])
+
+    def test_voice_client_send_timeout_preserves_lower_configured_budget(self) -> None:
+        with mock.patch.dict(os.environ, {"TWINR_VOICE_TRANSPORT_QUEUE_MS": "1000"}, clear=False):
+            orchestrator = EdgeVoiceOrchestrator(
+                TwinrConfig(
+                    voice_orchestrator_ws_url="ws://127.0.0.1:8797/ws/orchestrator/voice",
+                    voice_orchestrator_send_timeout_s=0.75,
+                ),
+                emit=lambda _msg: None,
+                on_voice_activation=lambda match: True,
+                on_transcript_committed=lambda transcript, source, wait_id, item_id: True,
+                on_barge_in_interrupt=lambda: True,
+            )
+
+        self.assertEqual(orchestrator._client.send_timeout_seconds, 0.75)
+
+    def test_voice_client_send_timeout_caps_at_transport_queue_budget(self) -> None:
+        with mock.patch.dict(os.environ, {"TWINR_VOICE_TRANSPORT_QUEUE_MS": "350"}, clear=False):
+            orchestrator = EdgeVoiceOrchestrator(
+                TwinrConfig(
+                    voice_orchestrator_ws_url="ws://127.0.0.1:8797/ws/orchestrator/voice",
+                    voice_orchestrator_send_timeout_s=2.0,
+                ),
+                emit=lambda _msg: None,
+                on_voice_activation=lambda match: True,
+                on_transcript_committed=lambda transcript, source, wait_id, item_id: True,
+                on_barge_in_interrupt=lambda: True,
+            )
+
+        self.assertEqual(orchestrator._send_timeout_s, 0.35)
+        self.assertEqual(orchestrator._client.send_timeout_seconds, 0.35)
+
+    def test_voice_client_default_send_timeout_matches_default_transport_queue_budget(self) -> None:
+        orchestrator = EdgeVoiceOrchestrator(
+            TwinrConfig(
+                voice_orchestrator_ws_url="ws://127.0.0.1:8797/ws/orchestrator/voice",
+            ),
+            emit=lambda _msg: None,
+            on_voice_activation=lambda match: True,
+            on_transcript_committed=lambda transcript, source, wait_id, item_id: True,
+            on_barge_in_interrupt=lambda: True,
+        )
+
+        self.assertEqual(orchestrator._transport_queue_ms, 400)
+        self.assertEqual(orchestrator._send_timeout_s, 0.4)
+        self.assertEqual(orchestrator._client.send_timeout_seconds, 0.4)
 
     def test_respeaker_duplex_keepalive_supports_twinr_owned_playback_pcm(self) -> None:
         self.assertTrue(
@@ -379,6 +503,147 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
             self.assertTrue(second_entered.wait(timeout=0.5))
             keepalive.close()
 
+    def test_direct_guard_keepalive_open_fails_closed_when_direct_guard_is_busy(self) -> None:
+        keepalive = build_respeaker_duplex_keepalive(
+            config=TwinrConfig(audio_output_device="twinr_playback_softvol"),
+            capture_device="plughw:CARD=Array,DEV=0",
+            playback_coordinator=None,
+        )
+        self.assertIsNotNone(keepalive)
+        assert keepalive is not None
+
+        with mock.patch(
+            "twinr.agent.workflows.respeaker_duplex_keepalive.maybe_open_respeaker_duplex_playback_guard",
+            side_effect=RuntimeError(
+                "Required ReSpeaker duplex playback guard could not acquire twinr_playback_softvol: aplay busy"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "could not claim playback ownership",
+            ):
+                keepalive.open()
+
+        self.assertIsNone(keepalive._thread)
+
+    def test_direct_guard_keepalive_allows_expected_startup_playback_contention(self) -> None:
+        guard_entered = Event()
+        attempt_count = 0
+
+        class _Guard:
+            active = True
+
+            def __enter__(self):
+                guard_entered.set()
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                del exc_type, exc, traceback
+                return False
+
+        keepalive = build_respeaker_duplex_keepalive(
+            config=TwinrConfig(audio_output_device="twinr_playback_softvol"),
+            capture_device="plughw:CARD=Array,DEV=0",
+            playback_coordinator=None,
+        )
+        self.assertIsNotNone(keepalive)
+        assert keepalive is not None
+
+        def guard_factory(**_kwargs):
+            nonlocal attempt_count
+            attempt_count += 1
+            if attempt_count == 1:
+                Thread(
+                    target=lambda: keepalive.handle_playback_activity(
+                        PlaybackActivityEvent(
+                            phase="starting",
+                            owner="startup_boot_sound",
+                            priority=10,
+                            category="wav_bytes",
+                        )
+                    ),
+                    daemon=True,
+                ).start()
+                time.sleep(0.05)
+                raise RuntimeError(
+                    "Required ReSpeaker duplex playback guard could not acquire "
+                    "twinr_playback_softvol: aplay: main:831: audio open error: Device or resource busy"
+                )
+            return _Guard()
+
+        with mock.patch(
+            "twinr.agent.workflows.respeaker_duplex_keepalive.maybe_open_respeaker_duplex_playback_guard",
+            side_effect=guard_factory,
+        ):
+            keepalive.open()
+            keepalive.handle_playback_activity(
+                PlaybackActivityEvent(
+                    phase="finished",
+                    owner="startup_boot_sound",
+                    priority=10,
+                    category="wav_bytes",
+                )
+            )
+            self.assertTrue(guard_entered.wait(timeout=1.0))
+            keepalive.close()
+
+    def test_direct_guard_keepalive_preserves_already_active_startup_playback_across_open(self) -> None:
+        guard_entered = Event()
+        playback_finished = Event()
+
+        class _Guard:
+            active = True
+
+            def __enter__(self):
+                guard_entered.set()
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                del exc_type, exc, traceback
+                return False
+
+        keepalive = build_respeaker_duplex_keepalive(
+            config=TwinrConfig(audio_output_device="twinr_playback_softvol"),
+            capture_device="plughw:CARD=Array,DEV=0",
+            playback_coordinator=None,
+        )
+        self.assertIsNotNone(keepalive)
+        assert keepalive is not None
+
+        keepalive.handle_playback_activity(
+            PlaybackActivityEvent(
+                phase="starting",
+                owner="startup_boot_sound",
+                priority=10,
+                category="wav_bytes",
+            )
+        )
+
+        def guard_factory(**_kwargs):
+            if not playback_finished.is_set():
+                raise RuntimeError(
+                    "Required ReSpeaker duplex playback guard could not acquire "
+                    "twinr_playback_softvol: aplay: main:831: audio open error: Device or resource busy"
+                )
+            return _Guard()
+
+        with mock.patch(
+            "twinr.agent.workflows.respeaker_duplex_keepalive.maybe_open_respeaker_duplex_playback_guard",
+            side_effect=guard_factory,
+        ):
+            keepalive.open()
+            playback_finished.set()
+            keepalive.handle_playback_activity(
+                PlaybackActivityEvent(
+                    phase="finished",
+                    owner="startup_boot_sound",
+                    priority=10,
+                    category="wav_bytes",
+                )
+            )
+            self.assertTrue(guard_entered.wait(timeout=1.0))
+            keepalive.close()
+
     def test_orchestrator_registers_duplex_keepalive_with_playback_coordinator(self) -> None:
         class _FakePlaybackCoordinator:
             def __init__(self) -> None:
@@ -397,7 +662,7 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
             emit=lambda _msg: None,
             playback_coordinator=coordinator,
             on_voice_activation=lambda match: True,
-            on_transcript_committed=lambda transcript, source: True,
+            on_transcript_committed=lambda transcript, source, wait_id, item_id: True,
             on_barge_in_interrupt=lambda: True,
         )
 
@@ -415,7 +680,7 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
                 ),
                 emit=lambda _msg: None,
                 on_voice_activation=lambda match: True,
-                on_transcript_committed=lambda transcript, source: True,
+                on_transcript_committed=lambda transcript, source, wait_id, item_id: True,
                 on_barge_in_interrupt=lambda: True,
             )
 
@@ -427,7 +692,7 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
             ),
             emit=lambda _msg: None,
             on_voice_activation=lambda match: True,
-            on_transcript_committed=lambda transcript, source: True,
+            on_transcript_committed=lambda transcript, source, wait_id, item_id: True,
             on_barge_in_interrupt=lambda: True,
         )
 
@@ -617,7 +882,7 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
             ),
             emit=lines.append,
             on_voice_activation=lambda match: True,
-            on_transcript_committed=lambda transcript, source: True,
+            on_transcript_committed=lambda transcript, source, wait_id, item_id: True,
             on_barge_in_interrupt=lambda: True,
         )
         fake_client = _FakeVoiceClient()
@@ -649,6 +914,77 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
         self.assertEqual(fake_client.open_calls, 2)
         self.assertEqual(len(fake_client.audio_frames), 1)
         self.assertIn("voice_orchestrator_reconnected=true", lines)
+
+    def test_disconnect_flushes_pending_queue_without_counting_backpressure(self) -> None:
+        orchestrator, _fake_client, lines, _committed = self._make_orchestrator()
+        frame = b"\x00" * orchestrator._frame_bytes
+        orchestrator._connected = True
+
+        orchestrator._enqueue_frame(frame, speech_probability=0.05)
+        orchestrator._enqueue_frame(frame, speech_probability=0.05)
+        self.assertEqual(orchestrator._sender_queue.qsize(), 2)
+
+        orchestrator._mark_disconnected(
+            emit_message="voice_orchestrator_error=closed",
+            retry_delay_s=0.5,
+        )
+
+        self.assertEqual(orchestrator._sender_queue.qsize(), 0)
+        self.assertEqual(orchestrator._queue_drop_count, 0)
+        self.assertEqual(orchestrator._transport_gap_drop_count, 2)
+        self.assertIn("voice_orchestrator_error=closed", lines)
+        self.assertIn("voice_orchestrator_transport_gap_drops=2", lines)
+
+        orchestrator._enqueue_frame(frame, speech_probability=0.05)
+
+        self.assertEqual(orchestrator._sender_queue.qsize(), 0)
+        self.assertEqual(orchestrator._transport_gap_drop_count, 3)
+        self.assertFalse(
+            any(line.startswith("voice_orchestrator_backpressure_drops=") for line in lines)
+        )
+
+    def test_sender_discards_stale_frame_immediately_while_reconnect_is_pending(self) -> None:
+        orchestrator, _fake_client, lines, _committed = self._make_orchestrator()
+        frame = b"\x00" * orchestrator._frame_bytes
+        orchestrator._connected = True
+        orchestrator._enqueue_frame(frame, speech_probability=0.05)
+        queued_frame = orchestrator._sender_queue.get_nowait()
+        self.assertIsNotNone(queued_frame)
+        assert queued_frame is not None
+        orchestrator._connected = False
+        orchestrator._next_reconnect_at = time.monotonic() + 5.0
+
+        with (
+            mock.patch.object(orchestrator, "_ensure_connected", return_value=False) as ensure_connected,
+            mock.patch.object(orchestrator, "_send_frame_now") as send_frame_now,
+            mock.patch.object(orchestrator._stop_event, "wait") as stop_wait,
+        ):
+            orchestrator._send_queued_frame(queued_frame)
+
+        ensure_connected.assert_called_once_with()
+        send_frame_now.assert_not_called()
+        stop_wait.assert_not_called()
+        self.assertEqual(orchestrator._transport_gap_drop_count, 1)
+        self.assertIn("voice_orchestrator_transport_gap_drops=1", lines)
+
+    def test_sender_loop_reconnects_even_while_queue_is_idle(self) -> None:
+        orchestrator, _fake_client, _lines, _committed = self._make_orchestrator()
+        orchestrator._connected = False
+        reconnect_attempted = Event()
+
+        def fake_ensure_connected() -> bool:
+            reconnect_attempted.set()
+            orchestrator._stop_event.set()
+            return False
+
+        sender_thread = Thread(target=orchestrator._sender_loop, daemon=True)
+        orchestrator._sender_thread = sender_thread
+        with mock.patch.object(orchestrator, "_ensure_connected", side_effect=fake_ensure_connected):
+            sender_thread.start()
+            sender_thread.join(timeout=1.0)
+
+        self.assertTrue(reconnect_attempted.is_set())
+        self.assertFalse(sender_thread.is_alive())
 
     def test_ready_backend_tracks_remote_asr_gateway(self) -> None:
         orchestrator, _fake_client, _lines, _committed = self._make_orchestrator()
@@ -698,34 +1034,92 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
             OrchestratorVoiceTranscriptCommittedEvent(
                 transcript="wie geht es dir",
                 source="follow_up",
+                wait_id="wait-follow-up",
+                item_id="item-follow-up-1",
             )
         )
         orchestrator._handle_server_event(
-            OrchestratorVoiceFollowUpClosedEvent(reason="timeout")
+            OrchestratorVoiceFollowUpClosedEvent(
+                reason="timeout",
+                wait_id="wait-follow-up",
+                item_id="item-follow-up-1",
+            )
         )
 
-        self.assertEqual(committed, [("wie geht es dir", "follow_up")])
+        self.assertEqual(
+            committed,
+            [("wie geht es dir", "follow_up", "wait-follow-up", "item-follow-up-1")],
+        )
         self.assertIn("voice_orchestrator_transcript_committed=follow_up", lines)
         self.assertIn("voice_orchestrator_follow_up_closed=timeout", lines)
 
+    def test_speculative_wake_event_dispatches_display_only_callback_and_clears_on_confirmed_wake(
+        self,
+    ) -> None:
+        speculative: list[tuple[str | None, int]] = []
+        cleared: list[str] = []
+        activations: list[VoiceActivationMatch] = []
+        orchestrator = EdgeVoiceOrchestrator(
+            TwinrConfig(
+                voice_orchestrator_ws_url="ws://127.0.0.1:8797/ws/orchestrator/voice",
+            ),
+            emit=lambda _msg: None,
+            on_voice_activation=lambda match: activations.append(match) or True,
+            on_transcript_committed=lambda transcript, source, wait_id, item_id: True,
+            on_follow_up_closed=None,
+            on_barge_in_interrupt=lambda: True,
+            on_speculative_wake=lambda event: speculative.append((event.matched_phrase, event.ttl_ms)),
+            on_speculative_wake_cleared=cleared.append,
+        )
+
+        orchestrator._handle_server_event(
+            OrchestratorVoiceWakeSpeculativeEvent(
+                matched_phrase="hey twinr",
+                backend="remote_asr",
+                ttl_ms=2400,
+                detector_label="stage1",
+                score=0.93,
+            )
+        )
+        orchestrator._handle_server_event(
+            OrchestratorVoiceWakeConfirmedEvent(
+                matched_phrase="hey twinr",
+                remaining_text="",
+                backend="remote_asr",
+                detector_label="stage1",
+                score=0.93,
+            )
+        )
+
+        self.assertEqual(speculative, [("hey twinr", 2400)])
+        self.assertEqual(cleared, ["wake_confirmed"])
+        self.assertEqual(len(activations), 1)
+        self.assertTrue(activations[0].detected)
+
     def test_follow_up_closed_event_dispatches_local_callback(self) -> None:
-        closed: list[str] = []
+        closed: list[tuple[str, str | None, str | None]] = []
         orchestrator = EdgeVoiceOrchestrator(
             TwinrConfig(
                 voice_orchestrator_ws_url="ws://127.0.0.1:8797/ws/orchestrator/voice",
             ),
             emit=lambda _msg: None,
             on_voice_activation=lambda match: True,
-            on_transcript_committed=lambda transcript, source: True,
-            on_follow_up_closed=closed.append,
+            on_transcript_committed=lambda transcript, source, wait_id, item_id: True,
+            on_follow_up_closed=lambda reason, wait_id, item_id: closed.append(
+                (reason, wait_id, item_id)
+            ),
             on_barge_in_interrupt=lambda: True,
         )
 
         orchestrator._handle_server_event(
-            OrchestratorVoiceFollowUpClosedEvent(reason="timeout")
+            OrchestratorVoiceFollowUpClosedEvent(
+                reason="timeout",
+                wait_id="wait-follow-up",
+                item_id="item-follow-up-1",
+            )
         )
 
-        self.assertEqual(closed, ["timeout"])
+        self.assertEqual(closed, [("timeout", "wait-follow-up", "item-follow-up-1")])
 
     def test_capture_loop_retries_transient_respeaker_process_exit_before_first_frame(self) -> None:
         orchestrator, _fake_client, lines, _committed = self._make_orchestrator()
@@ -741,8 +1135,9 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
                 return [], [], []
             return [read_fds[0]], [], []
 
-        def fake_enqueue_frame(frame: bytes) -> None:
+        def fake_enqueue_frame(frame: bytes, *, speech_probability: float) -> None:
             sent_frames.append(frame)
+            self.assertEqual(speech_probability, 0.17)
             orchestrator._stop_event.set()
 
         with (
@@ -759,6 +1154,11 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
             mock.patch(
                 "twinr.agent.workflows.voice_orchestrator.os.read",
                 return_value=b"\x01\x00" * (orchestrator._frame_bytes // 2),
+            ),
+            mock.patch.object(
+                orchestrator,
+                "_attest_edge_speech_frame",
+                return_value=(0.17, "silero-onnx+dsp"),
             ),
             mock.patch.object(orchestrator, "_drain_stderr"),
             mock.patch.object(orchestrator, "_enqueue_frame", side_effect=fake_enqueue_frame),
@@ -784,8 +1184,9 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
                 return [], [], []
             return [read_fds[0]], [], []
 
-        def fake_enqueue_frame(frame: bytes) -> None:
+        def fake_enqueue_frame(frame: bytes, *, speech_probability: float) -> None:
             sent_frames.append(frame)
+            self.assertEqual(speech_probability, 0.19)
             orchestrator._stop_event.set()
 
         with (
@@ -803,6 +1204,11 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
             mock.patch(
                 "twinr.agent.workflows.voice_orchestrator.os.read",
                 return_value=b"\x01\x00" * (orchestrator._frame_bytes // 2),
+            ),
+            mock.patch.object(
+                orchestrator,
+                "_attest_edge_speech_frame",
+                return_value=(0.19, "silero-onnx+dsp"),
             ),
             mock.patch.object(orchestrator, "_drain_stderr"),
             mock.patch.object(orchestrator, "_enqueue_frame", side_effect=fake_enqueue_frame),
@@ -830,8 +1236,9 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
                 return [], [], []
             return [read_fds[0]], [], []
 
-        def fake_enqueue_frame(frame: bytes) -> None:
+        def fake_enqueue_frame(frame: bytes, *, speech_probability: float) -> None:
             sent_frames.append(frame)
+            self.assertEqual(speech_probability, 0.21)
             if len(sent_frames) >= 2:
                 orchestrator._stop_event.set()
 
@@ -855,6 +1262,11 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
             mock.patch(
                 "twinr.agent.workflows.voice_orchestrator.os.read",
                 return_value=b"\x01\x00" * (orchestrator._frame_bytes // 2),
+            ),
+            mock.patch.object(
+                orchestrator,
+                "_attest_edge_speech_frame",
+                return_value=(0.21, "silero-onnx+dsp"),
             ),
             mock.patch.object(orchestrator, "_drain_stderr"),
             mock.patch.object(orchestrator, "_enqueue_frame", side_effect=fake_enqueue_frame),
@@ -893,6 +1305,88 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
         self.assertTrue(popen.call_args.kwargs["close_fds"])
         self.assertNotIn("start_new_session", popen.call_args.kwargs)
         self.assertIn("voice_orchestrator_capture=started", lines)
+
+    def test_start_process_requests_native_respeaker_usb_channel_layout(self) -> None:
+        lines: list[str] = []
+        orchestrator = EdgeVoiceOrchestrator(
+            TwinrConfig(
+                voice_orchestrator_ws_url="ws://127.0.0.1:8797/ws/orchestrator/voice",
+                voice_orchestrator_audio_device="plughw:CARD=Array,DEV=0",
+            ),
+            emit=lines.append,
+            on_voice_activation=lambda match: True,
+            on_transcript_committed=lambda transcript, source, wait_id, item_id: True,
+            on_barge_in_interrupt=lambda: True,
+        )
+        fake_process = _FakeCaptureProcess()
+
+        with (
+            mock.patch("twinr.agent.workflows.voice_orchestrator.shutil.which", return_value="/usr/bin/arecord"),
+            mock.patch(
+                "twinr.agent.workflows.voice_orchestrator.build_audio_subprocess_env_for_mode",
+                return_value={"PATH": "/usr/bin"},
+            ),
+            mock.patch(
+                "twinr.agent.workflows.voice_orchestrator.subprocess.Popen",
+                return_value=fake_process,
+            ) as popen,
+            mock.patch("twinr.agent.workflows.voice_orchestrator.os.set_blocking"),
+        ):
+            orchestrator._start_process()
+
+        popen_args = popen.call_args.args[0]
+        self.assertEqual(popen_args[popen_args.index("-c") + 1], "6")
+        self.assertIn("voice_orchestrator_capture_route=respeaker_usb_asr_lane", lines)
+        self.assertIn("voice_orchestrator_capture_channel=2", lines)
+
+    def test_capture_level_snapshot_reports_selected_and_dominant_asr_channels(self) -> None:
+        lines: list[str] = []
+        orchestrator = EdgeVoiceOrchestrator(
+            TwinrConfig(
+                voice_orchestrator_ws_url="ws://127.0.0.1:8797/ws/orchestrator/voice",
+                voice_orchestrator_audio_device="plughw:CARD=Array,DEV=0",
+            ),
+            emit=lines.append,
+            on_voice_activation=lambda match: True,
+            on_transcript_committed=lambda transcript, source, wait_id, item_id: True,
+            on_barge_in_interrupt=lambda: True,
+        )
+        captured_frame = array(
+            "h",
+            [
+                3000,
+                20,
+                400,
+                30,
+                50,
+                60,
+                3000,
+                20,
+                400,
+                30,
+                50,
+                60,
+            ],
+        ).tobytes()
+        projected_frame = orchestrator._project_capture_frame(captured_frame)
+
+        with mock.patch("twinr.agent.workflows.voice_orchestrator.time.monotonic", return_value=42.0):
+            orchestrator._maybe_emit_capture_level_snapshot(
+                captured_frame,
+                projected_frame,
+                speech_probability=0.37,
+                speech_backend="silero-onnx+dsp",
+            )
+
+        level_lines = [line for line in lines if line.startswith("voice_orchestrator_capture_levels=")]
+        self.assertEqual(len(level_lines), 1)
+        self.assertIn("selected_channel=2", level_lines[0])
+        self.assertIn("selected_rms=20", level_lines[0])
+        self.assertIn("dominant_channel=1", level_lines[0])
+        self.assertIn("dominant_rms=3000", level_lines[0])
+        self.assertIn("channel_rms=3000,20,400,30,50,60", level_lines[0])
+        self.assertIn("speech_probability=0.3700", level_lines[0])
+        self.assertIn("speech_backend=silero-onnx+dsp", level_lines[0])
 
 
 if __name__ == "__main__":

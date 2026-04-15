@@ -2,6 +2,8 @@
 # BUG-1: Contained perception/callback failures so HDMI and servo refresh no longer crash on transient attention-runtime faults.
 # BUG-2: Fixed changed-only HDMI trace churn by rounding jitter-prone float fields and tracking head_dy/publish_owner changes.
 # BUG-3: Isolated ops/debug emission from the control path; telemetry serialization failures can no longer break actuation.
+# BUG-4: Disabled continuous hdmi_wayland face-cue publication while preserving the shared attention/live-context/servo lane, because
+#        sustained real Wayland rerenders still push the streaming runtime into memory-pressure territory on the Pi.
 # SEC-1: Added bounded telemetry sanitization/redaction to reduce PII leakage and log-amplification / disk-pressure risk on Pi deployments.
 # IMP-1: Added fail-closed stale-camera gating and freshness metadata for availability-aware multimodal attention handling.
 # IMP-2: Added resilient live-facts normalization and safe fallback publishing aligned with 2026 edge-robotics / observability practices.
@@ -30,7 +32,11 @@ from ..social.camera_surface import ProactiveCameraSnapshot, ProactiveCameraSurf
 from ..social.engine import SocialAudioObservation, SocialObservation, SocialVisionObservation
 from .attention_targeting import MultimodalAttentionTargetSnapshot
 from .audio_policy import ReSpeakerAudioPolicySnapshot
-from .display_attention import DisplayAttentionCuePublishResult, display_attention_refresh_supported
+from .display_attention import (
+    DisplayAttentionCuePublishResult,
+    display_attention_face_publish_supported,
+    display_attention_refresh_supported,
+)
 
 
 _MISSING = object()
@@ -448,6 +454,8 @@ def _publish_display_attention_from_facts(
 ) -> DisplayAttentionCuePublishResult | None:
     publisher = coordinator.display_attention_publisher
     if publisher is None:
+        return None
+    if not display_attention_face_publish_supported(config=coordinator.config):
         return None
     try:
         return publisher.publish_from_facts(

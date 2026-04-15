@@ -5,6 +5,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 import importlib
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -119,6 +120,28 @@ class _FakeRuntimeSupervisor:
         return 0
 
 
+class _FakeCliCamera:
+    def __init__(self) -> None:
+        self.output_root = None
+        self.calls: list[dict[str, object]] = []
+
+    def capture_photo(self, *, output_path=None, filename: str = "camera-capture.png"):
+        self.calls.append(
+            {
+                "output_root": self.output_root,
+                "output_path": output_path,
+                "filename": filename,
+            }
+        )
+        return SimpleNamespace(
+            data=b"png-bytes",
+            source_device="/dev/video0",
+            input_format="rpicam-still",
+            content_type="image/png",
+            filename=filename,
+        )
+
+
 @contextmanager
 def _fake_lock(_config, _name: str):
     yield
@@ -190,6 +213,118 @@ class MainCliTests(unittest.TestCase):
                 self.assertFalse(main_mod._should_enable_display_companion(disabled, "/twinr/.env"))
         finally:
             sys.modules.pop("twinr.__main__", None)
+
+    def test_should_disable_display_companion_when_runtime_supervisor_is_active(self) -> None:
+        main_mod = importlib.import_module("twinr.__main__")
+        try:
+            enabled = main_mod.TwinrConfig(display_companion_enabled=True)
+            with patch.dict(os.environ, {main_mod._RUNTIME_SUPERVISOR_ENV_KEY: "1"}):
+                self.assertFalse(main_mod._should_enable_display_companion(enabled, "/twinr/.env"))
+        finally:
+            sys.modules.pop("twinr.__main__", None)
+
+    def test_should_disable_display_companion_for_hdmi_wayland_voice_runtime_by_default_but_honor_override(
+        self,
+    ) -> None:
+        main_mod = importlib.import_module("twinr.__main__")
+        try:
+            guarded = main_mod.TwinrConfig(
+                display_driver="hdmi_wayland",
+                voice_orchestrator_enabled=True,
+                voice_orchestrator_ws_url="ws://192.0.2.10:8797/ws/orchestrator/voice",
+            )
+            explicitly_enabled = main_mod.TwinrConfig(
+                display_driver="hdmi_wayland",
+                voice_orchestrator_enabled=True,
+                display_companion_enabled=True,
+                voice_orchestrator_ws_url="ws://192.0.2.10:8797/ws/orchestrator/voice",
+            )
+            with patch.object(main_mod, "_is_raspberry_pi_host", return_value=True):
+                self.assertFalse(main_mod._should_enable_display_companion(guarded, "/twinr/.env"))
+                self.assertTrue(main_mod._should_enable_display_companion(explicitly_enabled, "/twinr/.env"))
+        finally:
+            sys.modules.pop("twinr.__main__", None)
+
+    def test_capture_photo_for_cli_output_temporarily_allows_absolute_operator_path(self) -> None:
+        main_mod = importlib.import_module("twinr.__main__")
+        try:
+            camera = _FakeCliCamera()
+            output_path = Path("/tmp/twinr-camera.png")
+
+            capture = main_mod._capture_photo_for_cli_output(
+                camera,
+                output_path=output_path,
+                filename=output_path.name,
+            )
+        finally:
+            sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(capture.filename, "twinr-camera.png")
+        self.assertIsNone(camera.output_root)
+        self.assertEqual(len(camera.calls), 1)
+        self.assertEqual(camera.calls[0]["output_root"], output_path.parent.resolve(strict=False))
+        self.assertEqual(camera.calls[0]["output_path"], output_path)
+
+    def test_capture_photo_for_cli_output_restores_output_root_after_failure(self) -> None:
+        main_mod = importlib.import_module("twinr.__main__")
+
+        class _ExplodingCliCamera(_FakeCliCamera):
+            def capture_photo(self, *, output_path=None, filename: str = "camera-capture.png"):
+                del output_path, filename
+                raise RuntimeError("boom")
+
+        try:
+            camera = _ExplodingCliCamera()
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                main_mod._capture_photo_for_cli_output(
+                    camera,
+                    output_path=Path("/tmp/twinr-camera.png"),
+                    filename="twinr-camera.png",
+                )
+        finally:
+            sys.modules.pop("twinr.__main__", None)
+
+        self.assertIsNone(camera.output_root)
+
+    def test_camera_capture_output_allows_absolute_operator_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                f"TWINR_RUNTIME_STATE_PATH={root / 'runtime-state.json'}\n",
+                encoding="utf-8",
+            )
+            fake_camera = _FakeCliCamera()
+            fake_camera_module = ModuleType("twinr.hardware.camera")
+            fake_camera_module.V4L2StillCamera = SimpleNamespace(from_config=lambda _config: fake_camera)
+            original_argv = list(sys.argv)
+            stdout = StringIO()
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(sys.modules, {"twinr.hardware.camera": fake_camera_module}):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    with patch.object(main_mod, "_ensure_remote_watchdog_for_runtime_boot", return_value=None):
+                        with patch.object(main_mod, "_build_runtime", return_value=_FakeTurnRuntime()):
+                            with patch("sys.stdout", stdout):
+                                sys.argv = [
+                                    "twinr",
+                                    "--env-file",
+                                    str(env_path),
+                                    "--camera-capture-output",
+                                    "/tmp/twinr-camera.png",
+                                ]
+                                exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(fake_camera.calls), 1)
+        self.assertEqual(fake_camera.calls[0]["output_root"], Path("/tmp"))
+        self.assertEqual(fake_camera.calls[0]["output_path"], Path("/tmp/twinr-camera.png"))
+        self.assertIn("camera_capture=/tmp/twinr-camera.png", stdout.getvalue())
+        self.assertIn("camera_input_format=rpicam-still", stdout.getvalue())
 
     def test_should_enable_respeaker_led_companion_defaults_to_targeted_real_pi_hosts(self) -> None:
         main_mod = importlib.import_module("twinr.__main__")
@@ -273,6 +408,58 @@ class MainCliTests(unittest.TestCase):
         finally:
             sys.modules.pop("twinr.__main__", None)
 
+    def test_assert_authoritative_repo_runtime_root_rejects_non_repo_cwd(self) -> None:
+        main_mod = importlib.import_module("twinr.__main__")
+        twinr_package = importlib.import_module("twinr")
+        module_file = getattr(main_mod, "__file__", None)
+        self.assertIsNotNone(module_file)
+        repo_root = Path(str(module_file)).resolve().parents[2]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_cwd = Path(temp_dir)
+            with patch("pathlib.Path.cwd", return_value=fake_cwd):
+                with patch.object(twinr_package, "__file__", str(repo_root / "src" / "twinr" / "__init__.py")):
+                    with self.assertRaisesRegex(RuntimeError, "must be launched from"):
+                        main_mod._assert_authoritative_repo_runtime_root(
+                            "/home/thh/twinr/.voice_gateway_alias.env",
+                            command_name="run-orchestrator-server",
+                        )
+
+        sys.modules.pop("twinr.__main__", None)
+
+    def test_assert_authoritative_repo_runtime_root_rejects_non_repo_source_root(self) -> None:
+        main_mod = importlib.import_module("twinr.__main__")
+        twinr_package = importlib.import_module("twinr")
+        module_file = getattr(main_mod, "__file__", None)
+        self.assertIsNotNone(module_file)
+        repo_root = Path(str(module_file)).resolve().parents[2]
+        try:
+            with patch("pathlib.Path.cwd", return_value=repo_root):
+                with patch.object(twinr_package, "__file__", "/var/tmp/stale-stage/src/twinr/__init__.py"):
+                    with self.assertRaisesRegex(RuntimeError, "must import from"):
+                        main_mod._assert_authoritative_repo_runtime_root(
+                            "/home/thh/twinr/.voice_gateway_alias.env",
+                            command_name="run-orchestrator-server",
+                        )
+        finally:
+            sys.modules.pop("twinr.__main__", None)
+
+    def test_assert_authoritative_repo_runtime_root_accepts_leading_repo(self) -> None:
+        main_mod = importlib.import_module("twinr.__main__")
+        twinr_package = importlib.import_module("twinr")
+        module_file = getattr(main_mod, "__file__", None)
+        self.assertIsNotNone(module_file)
+        repo_root = Path(str(module_file)).resolve().parents[2]
+        try:
+            with patch("pathlib.Path.cwd", return_value=repo_root):
+                with patch.object(twinr_package, "__file__", str(repo_root / "src" / "twinr" / "__init__.py")):
+                    main_mod._assert_authoritative_repo_runtime_root(
+                        "/home/thh/twinr/.voice_gateway_alias.env",
+                        command_name="run-orchestrator-server",
+                    )
+        finally:
+            sys.modules.pop("twinr.__main__", None)
+
     def test_run_display_loop_does_not_require_workflow_imports(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -306,6 +493,45 @@ class MainCliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(fake_loop.duration_s, 0.0)
+
+    def test_run_orchestrator_server_forces_websockets_sansio_backend(self) -> None:
+        main_mod = importlib.import_module("twinr.__main__")
+        try:
+            config = main_mod.TwinrConfig(
+                orchestrator_host="127.0.0.1",
+                orchestrator_port=8798,
+            )
+            fake_app = object()
+            uvicorn_calls: list[dict[str, object]] = []
+
+            fake_orchestrator = ModuleType("twinr.orchestrator")
+            fake_orchestrator.create_app = lambda env_path: fake_app
+            fake_uvicorn = ModuleType("uvicorn")
+            fake_uvicorn.run = lambda app, **kwargs: uvicorn_calls.append(
+                {"app": app, **kwargs}
+            )
+
+            with patch.object(main_mod, "_assert_pi_runtime_root", return_value=None):
+                with patch.dict(
+                    sys.modules,
+                    {
+                        "twinr.orchestrator": fake_orchestrator,
+                        "uvicorn": fake_uvicorn,
+                    },
+                ):
+                    exit_code = main_mod._run_orchestrator_server(
+                        config,
+                        "/twinr/.env",
+                    )
+        finally:
+            sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(uvicorn_calls), 1)
+        self.assertIs(uvicorn_calls[0]["app"], fake_app)
+        self.assertEqual(uvicorn_calls[0]["host"], "127.0.0.1")
+        self.assertEqual(uvicorn_calls[0]["port"], 8798)
+        self.assertEqual(uvicorn_calls[0]["ws"], "websockets-sansio")
 
     def test_main_primes_user_audio_env_before_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

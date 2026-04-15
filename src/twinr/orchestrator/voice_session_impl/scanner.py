@@ -16,7 +16,7 @@
 #        leaking sensitive user speech into routine logs; raw previews remain
 #        opt-in via `voice_trace_include_transcripts=True`.
 # IMP-1: Add optional neural-VAD speech-probability support (e.g. Silero/openWakeWord
-#        side-channel scores) while preserving RMS fallback for drop-in compatibility.
+#        side-channel scores) and keep remote utterance gating on that single attested lane.
 # IMP-2: Add duplicate-window suppression for remote stage-1 and barge-in scans to
 #        avoid rescanning identical audio and wasting latency, CPU, and API budget.
 # IMP-3: Preserve a small true pre-roll before the latest active burst, including
@@ -32,14 +32,15 @@
 from __future__ import annotations
 
 import hashlib
+from typing import Callable, cast
+from uuid import uuid4
 
 from twinr.hardware.audio import AmbientAudioCaptureWindow, AmbientAudioLevelSample
-from twinr.orchestrator.voice_activation import VoiceActivationMatch
-
 from ..voice_contracts import (
     OrchestratorVoiceBargeInInterruptEvent,
     OrchestratorVoiceTranscriptCommittedEvent,
     OrchestratorVoiceWakeConfirmedEvent,
+    OrchestratorVoiceWakeSpeculativeEvent,
 )
 from .builders import pcm_capture_to_wav_bytes
 from .types import (
@@ -107,13 +108,6 @@ class VoiceSessionScannerMixin:
             if raw_probability is not None:
                 break
         if raw_probability is None:
-            resolver = getattr(self, "_resolve_frame_speech_probability", None)
-            if callable(resolver):
-                try:
-                    raw_probability = resolver(frame)  # pylint: disable=not-callable
-                except Exception:
-                    raw_probability = None
-        if raw_probability is None:
             return None
         try:
             probability_input = (
@@ -136,14 +130,12 @@ class VoiceSessionScannerMixin:
 
         speech_probability = self._frame_speech_probability(frame)
         probability_threshold = self._remote_asr_speech_probability_threshold()
-        if speech_probability is not None and probability_threshold is not None:
-            if speech_probability >= probability_threshold:
-                return True
-            continue_threshold = self._remote_asr_speech_continue_probability_threshold()
-            return continuing and continue_threshold is not None and speech_probability >= continue_threshold
-        if frame.rms >= self.speech_threshold:
+        if speech_probability is None or probability_threshold is None:
+            return False
+        if speech_probability >= probability_threshold:
             return True
-        return continuing and frame.rms >= self._remote_asr_speech_continue_threshold()
+        continue_threshold = self._remote_asr_speech_continue_probability_threshold()
+        return continuing and continue_threshold is not None and speech_probability >= continue_threshold
 
     def _remote_asr_speech_flags(
         self,
@@ -471,20 +463,29 @@ class VoiceSessionScannerMixin:
 
     def _advance_remote_asr_utterance(
         self,
-    ) -> OrchestratorVoiceWakeConfirmedEvent | OrchestratorVoiceTranscriptCommittedEvent | None:
+    ) -> list[
+        OrchestratorVoiceWakeSpeculativeEvent
+        | OrchestratorVoiceWakeConfirmedEvent
+        | OrchestratorVoiceTranscriptCommittedEvent
+    ]:
         """Drive one same-stream utterance until endpointing decides it is complete."""
 
+        events: list[
+            OrchestratorVoiceWakeSpeculativeEvent
+            | OrchestratorVoiceWakeConfirmedEvent
+            | OrchestratorVoiceTranscriptCommittedEvent
+        ] = []
         latest_frame = self._history[-1] if self._history else None
         if latest_frame is None:
-            return None
+            return events
         if not self._runtime_state_attested:
-            return None
+            return events
         pending = self._pending_transcript_utterance
         if pending is None:
             if self._state == "waiting" and not self._waiting_activation_allowed():
-                return None
+                return events
             if not self._frame_counts_as_remote_asr_speech(latest_frame):
-                return None
+                return events
             pending = self._new_pending_transcript_utterance(origin_state=self._state)
             self._pending_transcript_utterance = pending
             if pending.active_ms < self._effective_remote_asr_min_activation_duration_ms():
@@ -501,14 +502,19 @@ class VoiceSessionScannerMixin:
                         **self._intent_context.trace_details(),
                     },
                 )
-            return None
+                return events
         if pending.origin_state == "waiting" and not self._waiting_activation_allowed():
             self._cancel_blocked_waiting_activation_buffers(
                 previous_state=pending.origin_state,
                 detail="runtime_context_blocked",
             )
-            return None
-        self._append_pending_frame(pending, latest_frame)
+            self._wake_speculative_active = False
+            return events
+        if pending is not self._pending_transcript_utterance or pending.frames[-1] is not latest_frame:
+            self._append_pending_frame(pending, latest_frame)
+        speculative_event = self._maybe_detect_remote_asr_activation_candidate(pending=pending)
+        if speculative_event is not None:
+            events.append(speculative_event)
         should_finalize = False
         if pending.captured_ms >= pending.max_capture_ms:
             should_finalize = True
@@ -521,8 +527,9 @@ class VoiceSessionScannerMixin:
             ):
                 should_finalize = True
         if not should_finalize:
-            return None
+            return events
         self._pending_transcript_utterance = None
+        self._wake_speculative_active = False
         capture = self._pending_transcript_capture_window(pending)
         if pending.active_ms < self._effective_remote_asr_min_activation_duration_ms():
             self._record_transcript_debug(
@@ -537,7 +544,7 @@ class VoiceSessionScannerMixin:
                     **self._intent_context.trace_details(),
                 },
             )
-            return None
+            return events
         familiar_speaker_assessment = (
             self._assess_familiar_speaker_capture(capture, origin_state=pending.origin_state)
             if pending.origin_state == "waiting"
@@ -554,48 +561,21 @@ class VoiceSessionScannerMixin:
                 details=match_details,
             )
         else:
-            supports_transcript_matching = self._wake_phrase_spotter_supports_transcript_matching(
+            transcript = self._transcribe_capture(
                 capture=capture,
-                origin_state=pending.origin_state,
+                stage="activation_utterance",
+                details=match_details,
             )
-            if supports_transcript_matching:
-                transcript = self._transcribe_capture(
-                    capture=capture,
-                    stage="activation_utterance",
-                    details=match_details,
-                )
-                if transcript is None:
-                    return None
-                match = self._match_transcribed_wake(
-                    transcript=transcript,
-                    capture=capture,
-                    stage="activation_utterance",
-                    details=match_details,
-                )
-            else:
-                match = self._detect_wake_capture(
-                    capture=capture,
-                    stage="activation_utterance",
-                    details=match_details,
-                )
-                if match is None:
-                    return None
-                if not match.detected:
-                    transcript = self._transcribe_capture(
-                        capture=capture,
-                        stage="activation_utterance",
-                        details=match_details,
-                    )
-                    if transcript is None:
-                        return None
-                    match = VoiceActivationMatch(
-                        detected=False,
-                        transcript=transcript,
-                        normalized_transcript=str(transcript or "").strip().lower(),
-                        backend=self.backend_name,
-                    )
+            if transcript is None:
+                return events
+            match = self._match_transcribed_wake(
+                transcript=transcript,
+                capture=capture,
+                stage="activation_utterance",
+                details=match_details,
+            )
         if match is None:
-            return None
+            return events
         outcome = "matched" if match.detected else "no_match"
         self._record_transcript_debug(
             stage="activation_utterance",
@@ -633,13 +613,16 @@ class VoiceSessionScannerMixin:
                     ),
                 },
             )
-            return OrchestratorVoiceWakeConfirmedEvent(
-                matched_phrase=match.matched_phrase,
-                remaining_text=str(match.remaining_text or "").strip(),
-                backend=match.backend or self.backend_name,
-                detector_label=match.detector_label,
-                score=match.score,
+            events.append(
+                OrchestratorVoiceWakeConfirmedEvent(
+                    matched_phrase=match.matched_phrase,
+                    remaining_text=str(match.remaining_text or "").strip(),
+                    backend=match.backend or self.backend_name,
+                    detector_label=match.detector_label,
+                    score=match.score,
+                )
             )
+            return events
         transcript = str(match.transcript or "").strip()
         if pending.origin_state == "follow_up_open" and _normalize_text_length(transcript) >= self.follow_up_min_transcript_chars:
             self._state = "waiting"
@@ -660,10 +643,15 @@ class VoiceSessionScannerMixin:
                     "transcript_preview": self._safe_transcript_preview(transcript, limit=80),
                 },
             )
-            return OrchestratorVoiceTranscriptCommittedEvent(
-                transcript=transcript,
-                source="follow_up",
+            events.append(
+                OrchestratorVoiceTranscriptCommittedEvent(
+                    transcript=transcript,
+                    source="follow_up",
+                    wait_id=pending.wait_id,
+                    item_id=pending.item_id,
+                )
             )
+            return events
         if pending.origin_state == "listening" and _normalize_text_length(transcript) >= self.follow_up_min_transcript_chars:
             self._state = "thinking"
             self._record_transcript_debug(
@@ -673,22 +661,53 @@ class VoiceSessionScannerMixin:
                 capture=capture,
                 details={"origin_state": pending.origin_state},
             )
-            return OrchestratorVoiceTranscriptCommittedEvent(
-                transcript=transcript,
-                source="listening",
+            events.append(
+                OrchestratorVoiceTranscriptCommittedEvent(
+                    transcript=transcript,
+                    source="listening",
+                    wait_id=pending.wait_id,
+                    item_id=pending.item_id,
+                )
             )
-        return None
+        return events
 
     def _new_pending_transcript_utterance(self, *, origin_state: str) -> _PendingTranscriptUtterance:
         """Seed one same-stream utterance from the latest active speech burst."""
 
-        seed_frames = self._latest_active_speech_burst_frames(self._recent_frames_window(self.history_ms))
+        seed_frames = self._latest_active_speech_burst_frames(
+            self._recent_frames_window(self.history_ms),
+            pre_roll_ms=self._effective_remote_asr_stage1_window_ms(),
+        )
         if not seed_frames:
             seed_frames = self._recent_frames_window(self.chunk_ms)
         return self._pending_transcript_utterance_from_frames(
             origin_state=origin_state,
             frames=seed_frames,
         )
+
+    def _required_remote_wait_id_for_origin_state(self, origin_state: str) -> str | None:
+        """Return the attested edge wait token for one remote-owned utterance state."""
+
+        if origin_state not in {"listening", "follow_up_open"}:
+            return None
+        wait_id_getter = cast(
+            Callable[[str], str | None] | None,
+            getattr(self, "_active_remote_wait_id_for_state", None),
+        )
+        wait_id = wait_id_getter(origin_state) if wait_id_getter is not None else None
+        if isinstance(wait_id, str) and wait_id.strip():
+            return wait_id.strip()
+        raise RuntimeError(
+            f"Remote utterance state {origin_state!r} requires an attested edge wait_id before buffering audio."
+        )
+
+    def _generated_remote_item_id_for_origin_state(self, origin_state: str) -> str | None:
+        """Create one server item identifier for the current remote wait window."""
+
+        if origin_state not in {"listening", "follow_up_open"}:
+            return None
+        self._required_remote_wait_id_for_origin_state(origin_state)
+        return uuid4().hex
 
     def _pending_transcript_utterance_from_frames(
         self,
@@ -701,6 +720,8 @@ class VoiceSessionScannerMixin:
 
         pending = _PendingTranscriptUtterance(
             origin_state=origin_state,
+            wait_id=self._required_remote_wait_id_for_origin_state(origin_state),
+            item_id=self._generated_remote_item_id_for_origin_state(origin_state),
             max_capture_ms=max_capture_ms
             if max_capture_ms is not None
             else max(self.history_ms, self.wake_candidate_window_ms + self.wake_tail_max_ms),
@@ -730,7 +751,15 @@ class VoiceSessionScannerMixin:
     ) -> None:
         """Append one frame into the wake buffer and trim to the bounded budget."""
 
-        pending.frames.append(frame)
+        appended_frame = frame
+        if pending.stage1_seeded and self._frame_counts_as_remote_asr_speech(frame):
+            appended_frame = _RecentFrame(
+                pcm_bytes=frame.pcm_bytes,
+                rms=frame.rms,
+                duration_ms=frame.duration_ms,
+                speech_probability=1.0,
+            )
+        pending.frames.append(appended_frame)
         pending.captured_ms += frame.duration_ms
         while pending.captured_ms > pending.max_capture_ms and pending.frames:
             removed = pending.frames.popleft()
@@ -749,12 +778,12 @@ class VoiceSessionScannerMixin:
             frames = self._recent_frames_window(self.history_ms)
         return self._capture_window_from_frames(frames)
 
-    def _recent_remote_asr_stage1_capture(
+    def _recent_remote_asr_stage1_frames(
         self,
         *,
         window_ms: int | None = None,
-    ) -> AmbientAudioCaptureWindow:
-        """Prefer the start of the latest active speech burst over the newest tail."""
+    ) -> tuple[_RecentFrame, ...]:
+        """Return the bounded frame slice used for stage-one wake scanning."""
 
         target_window_ms = (
             self._effective_remote_asr_stage1_window_ms()
@@ -762,24 +791,53 @@ class VoiceSessionScannerMixin:
             else max(self.chunk_ms, min(self.history_ms, int(window_ms)))
         )
         recent_frames = self._recent_frames_window(self.history_ms)
-        burst_frames = self._latest_active_speech_burst_frames(recent_frames)
+        burst_frames = self._latest_active_speech_burst_frames(
+            recent_frames,
+            pre_roll_ms=target_window_ms,
+        )
         if burst_frames:
-            return self._capture_window_from_frames(
-                self._leading_frames_window(
-                    burst_frames,
-                    duration_ms=target_window_ms,
-                )
-            )
-        return self._capture_window_from_frames(
-            self._leading_frames_window(
-                recent_frames,
+            return self._leading_frames_window(
+                burst_frames,
                 duration_ms=target_window_ms,
             )
+        return self._leading_frames_window(
+            recent_frames,
+            duration_ms=target_window_ms,
+        )
+
+    def _recent_remote_asr_stage1_capture(
+        self,
+        *,
+        window_ms: int | None = None,
+    ) -> AmbientAudioCaptureWindow:
+        """Prefer the start of the latest active speech burst over the newest tail."""
+
+        return self._capture_window_from_frames(
+            self._recent_remote_asr_stage1_frames(window_ms=window_ms)
+        )
+
+    def _pending_remote_asr_stage1_capture(
+        self,
+        pending: _PendingTranscriptUtterance,
+        *,
+        window_ms: int | None = None,
+    ) -> AmbientAudioCaptureWindow:
+        """Build the early speculative scan from the current pending utterance only."""
+
+        target_window_ms = (
+            self._effective_remote_asr_stage1_window_ms()
+            if window_ms is None
+            else max(self.chunk_ms, min(self.history_ms, int(window_ms)))
+        )
+        return self._capture_window_from_frames(
+            self._leading_frames_window(tuple(pending.frames), duration_ms=target_window_ms)
         )
 
     def _latest_active_speech_burst_frames(
         self,
         frames: tuple[_RecentFrame, ...],
+        *,
+        pre_roll_ms: int | None = None,
     ) -> tuple[_RecentFrame, ...]:
         """Return the latest speech burst plus contiguous non-silent onset frames."""
 
@@ -810,13 +868,15 @@ class VoiceSessionScannerMixin:
                 continue
             if have_active:
                 silence_ms += max(0, int(frame.duration_ms))
-        pre_roll_ms = min(
-            self._effective_remote_asr_stage1_window_ms(),
-            max(self.chunk_ms, self.chunk_ms * 2),
-        )
+        resolved_pre_roll_ms = self.history_ms
+        if pre_roll_ms is not None:
+            resolved_pre_roll_ms = max(
+                self.chunk_ms,
+                min(self.history_ms, int(pre_roll_ms)),
+            )
         pre_roll_start_index = start_index
         collected_pre_roll_ms = 0
-        while pre_roll_start_index > 0 and collected_pre_roll_ms < pre_roll_ms:
+        while pre_roll_start_index > 0 and collected_pre_roll_ms < resolved_pre_roll_ms:
             previous_frame = resolved_frames[pre_roll_start_index - 1]
             if max(0, int(getattr(previous_frame, "rms", 0))) <= 0:
                 break
@@ -842,22 +902,50 @@ class VoiceSessionScannerMixin:
                 break
         return tuple(selected)
 
-    def _maybe_detect_remote_asr_activation_candidate(self) -> VoiceActivationMatch | None:
-        """Transcribe a recent speech window remotely and match activation phrases."""
+    def _maybe_detect_remote_asr_activation_candidate(
+        self,
+        *,
+        pending: _PendingTranscriptUtterance | None = None,
+    ) -> OrchestratorVoiceWakeSpeculativeEvent | None:
+        """Run at most one speculative stage-one wake scan for one pending utterance."""
 
-        now = self._monotonic()
-        if now < self._next_wake_candidate_check_at:
+        resolved_pending = pending or self._pending_transcript_utterance
+        if resolved_pending is None:
             return None
+        if resolved_pending.origin_state != "waiting":
+            return None
+        if resolved_pending.stage1_attempted:
+            return None
+        if self._wake_speculative_active:
+            return None
+        if resolved_pending.active_ms < self._effective_remote_asr_min_activation_duration_ms():
+            return None
+        if self._state == "waiting" and not self._waiting_activation_allowed():
+            self._record_transcript_debug(
+                stage="activation_stage1",
+                outcome="skipped_context_blocked",
+                details=self._intent_context.trace_details(),
+            )
+            self._trace_event(
+                "voice_remote_asr_stage1_context_blocked",
+                kind="branch",
+                details=self._intent_context.trace_details(),
+            )
+            return None
+        resolved_pending.stage1_attempted = True
+        scan_started_at = self._monotonic()
         try:
             with self._trace_span(
                 name="voice_remote_asr_stage1_scan",
                 kind="llm_call",
                 details={
                     "window_ms": self._effective_remote_asr_stage1_window_ms(),
+                    "pending_captured_ms": int(resolved_pending.captured_ms),
+                    "pending_active_ms": int(resolved_pending.active_ms),
                     **self._intent_context.trace_details(),
                 },
             ):
-                capture = self._recent_remote_asr_stage1_capture()
+                capture = self._pending_remote_asr_stage1_capture(resolved_pending)
             if capture.sample.peak_rms <= 0 and capture.sample.average_rms <= 0:
                 self._record_transcript_debug(
                     stage="activation_stage1",
@@ -880,6 +968,39 @@ class VoiceSessionScannerMixin:
                     },
                     confidence="high",
                     guardrails=["nonzero_audio_energy_required"],
+                )
+                return None
+            if capture.sample.active_chunk_count <= 0 or capture.sample.active_ratio <= 0.0:
+                self._record_transcript_debug(
+                    stage="activation_stage1",
+                    outcome="buffering_no_attested_speech",
+                    capture=capture,
+                    details={"reason": "edge_speech_probability_required"},
+                )
+                self._trace_decision(
+                    "voice_remote_asr_stage1_buffering",
+                    question="Should this remote-ASR activation candidate be scanned already?",
+                    selected={
+                        "id": "buffer",
+                        "summary": "Wait for attested speech before scanning",
+                    },
+                    options=[
+                        {
+                            "id": "buffer",
+                            "summary": "Keep buffering until the edge attests speech",
+                        },
+                        {
+                            "id": "scan",
+                            "summary": "Run a wake scan on non-speech edge evidence",
+                        },
+                    ],
+                    context={
+                        "window_ms": capture.sample.duration_ms,
+                        "active_chunk_count": int(capture.sample.active_chunk_count),
+                        "active_ratio": round(float(capture.sample.active_ratio), 4),
+                    },
+                    confidence="high",
+                    guardrails=["edge_speech_probability_required"],
                 )
                 return None
             if capture.sample.duration_ms < self._effective_remote_asr_min_activation_duration_ms():
@@ -944,7 +1065,8 @@ class VoiceSessionScannerMixin:
                 familiar_speaker_assessment,
                 origin_state="waiting",
             ):
-                expanded_capture = self._recent_remote_asr_stage1_capture(
+                expanded_capture = self._pending_remote_asr_stage1_capture(
+                    resolved_pending,
                     window_ms=(
                         self._effective_remote_asr_stage1_window_ms()
                         + self._STRONG_SPEAKER_STAGE1_WINDOW_BONUS_MS
@@ -956,17 +1078,6 @@ class VoiceSessionScannerMixin:
                         capture,
                         origin_state="waiting",
                     )
-            if self._should_skip_duplicate_remote_scan(
-                scan_kind="remote_asr_stage1",
-                capture=capture,
-            ):
-                self._record_transcript_debug(
-                    stage="activation_stage1",
-                    outcome="buffering_duplicate_window",
-                    capture=capture,
-                    details={"reason": "duplicate_remote_scan"},
-                )
-                return None
             match = self._detect_wake_capture(
                 capture=capture,
                 stage="activation_stage1",
@@ -1064,9 +1175,28 @@ class VoiceSessionScannerMixin:
                     ),
                 },
             )
-            return match
+            self._wake_speculative_active = True
+            resolved_pending.stage1_seeded = True
+            return OrchestratorVoiceWakeSpeculativeEvent(
+                matched_phrase=match.matched_phrase,
+                backend=match.backend or self.backend_name,
+                ttl_ms=self._wake_speculative_ttl_ms(),
+                detector_label=match.detector_label,
+                score=match.score,
+            )
         finally:
-            self._next_wake_candidate_check_at = self._monotonic() + self._wake_candidate_cooldown_s
+            completed_at = self._monotonic()
+            scan_elapsed_s = max(0.0, completed_at - scan_started_at)
+            self._trace_event(
+                "voice_remote_asr_stage1_scan_completed",
+                kind="metric",
+                details={
+                    "scan_elapsed_ms": int(round(scan_elapsed_s * 1000.0)),
+                    "pending_captured_ms": int(resolved_pending.captured_ms),
+                    "pending_active_ms": int(resolved_pending.active_ms),
+                    "pending_stage1_attempted": True,
+                },
+            )
 
     def _maybe_detect_barge_in_candidate(self) -> OrchestratorVoiceBargeInInterruptEvent | None:
         """Transcribe one bounded speaking window to detect a user interruption."""

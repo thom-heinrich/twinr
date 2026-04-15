@@ -15,6 +15,7 @@ import time
 from typing import Any
 from urllib.parse import quote
 
+from twinr.agent.workflows.forensics import workflow_span
 from twinr.memory.chonkydb.client import ChonkyDBError
 from twinr.memory.longterm.storage.remote_read_diagnostics import (
     LongTermRemoteReadContext,
@@ -174,10 +175,34 @@ class LongTermRemoteCatalogStoreBase(
         return f"twinr://longterm/{namespace}/{definition.uri_segment}/catalog/current"
 
     def _load_catalog_payload(self, *, snapshot_kind: str):
-        recent_head = self._recent_catalog_head_payload(snapshot_kind=snapshot_kind)
-        if isinstance(recent_head, Mapping) and self.is_catalog_payload(snapshot_kind=snapshot_kind, payload=recent_head):
-            return dict(recent_head)
-        if self._catalog_head_known_invalid(snapshot_kind=snapshot_kind):
+        with workflow_span(
+            name="longterm_remote_catalog_load_catalog_payload",
+            kind="retrieval",
+            details={"snapshot_kind": str(snapshot_kind or "").strip()},
+        ):
+            recent_head = self._recent_catalog_head_payload(snapshot_kind=snapshot_kind)
+            if isinstance(recent_head, Mapping) and self.is_catalog_payload(snapshot_kind=snapshot_kind, payload=recent_head):
+                return dict(recent_head)
+            if self._catalog_head_known_invalid(snapshot_kind=snapshot_kind):
+                payload = self._load_remote_state_snapshot_fallback(snapshot_kind=snapshot_kind)
+                if not isinstance(payload, Mapping):
+                    return None
+                payload_dict = dict(payload)
+                if not self.is_catalog_payload(snapshot_kind=snapshot_kind, payload=payload_dict):
+                    return None
+                self._maybe_promote_legacy_catalog_head(snapshot_kind=snapshot_kind, payload=payload_dict)
+                return payload_dict
+            # Current heads frequently persist the authoritative payload in
+            # metadata. Try the lighter metadata-only read first and keep the
+            # existing fail-closed full-content fallback inside the shared head
+            # loader for backends that omit enough envelope detail.
+            direct_result = self._load_catalog_head_result(
+                snapshot_kind=snapshot_kind,
+                metadata_only=True,
+            )
+            direct_payload = direct_result.payload
+            if isinstance(direct_payload, dict):
+                return direct_payload
             payload = self._load_remote_state_snapshot_fallback(snapshot_kind=snapshot_kind)
             if not isinstance(payload, Mapping):
                 return None
@@ -186,18 +211,6 @@ class LongTermRemoteCatalogStoreBase(
                 return None
             self._maybe_promote_legacy_catalog_head(snapshot_kind=snapshot_kind, payload=payload_dict)
             return payload_dict
-        direct_result = self._load_catalog_head_result(snapshot_kind=snapshot_kind)
-        direct_payload = direct_result.payload
-        if isinstance(direct_payload, dict):
-            return direct_payload
-        payload = self._load_remote_state_snapshot_fallback(snapshot_kind=snapshot_kind)
-        if not isinstance(payload, Mapping):
-            return None
-        payload_dict = dict(payload)
-        if not self.is_catalog_payload(snapshot_kind=snapshot_kind, payload=payload_dict):
-            return None
-        self._maybe_promote_legacy_catalog_head(snapshot_kind=snapshot_kind, payload=payload_dict)
-        return payload_dict
 
     def _load_remote_state_snapshot_fallback(
         self,
@@ -241,109 +254,135 @@ class LongTermRemoteCatalogStoreBase(
     ) -> _CatalogHeadLoadResult:
         """Read one current-head document while preserving not-found semantics."""
 
-        remote_state = self._require_remote_state()
-        read_client = self._require_client(getattr(remote_state, "read_client", None), operation="read")
-        retry_attempts = 1 if fast_fail else max(1, self._remote_retry_attempts())
-        retry_backoff_s = 0.0 if fast_fail else self._remote_retry_backoff_s()
-        effective_read_client = read_client if fast_fail else self._catalog_head_read_client(read_client=read_client)
-        context = LongTermRemoteReadContext(
-            snapshot_kind=snapshot_kind,
-            operation="load_catalog_current_head",
-            request_method="GET",
-            request_payload_kind="catalog_current_head_document",
-            uri_hint=self._catalog_head_uri(snapshot_kind=snapshot_kind),
-            request_path="/v1/external/documents/full",
-            namespace=self._normalize_text(getattr(remote_state, "namespace", None)),
-            access_classification="catalog_current_head",
-            attempt_count=retry_attempts,
-            retry_attempts_configured=self._remote_retry_attempts(),
-            retry_backoff_s=retry_backoff_s,
-            retry_mode="single_probe" if fast_fail else "bounded_transient_retry",
-        )
-        started_monotonic = time.monotonic()
-        attempt_index = 0
-        envelope: Mapping[str, object] | None = None
-        while True:
-            try:
-                envelope = self._fetch_catalog_head_envelope(
-                    read_client=effective_read_client,
-                    snapshot_kind=snapshot_kind,
-                    metadata_only=metadata_only,
-                )
-                break
-            except Exception as exc:
-                if self._status_code_from_exception(exc) == 404:
-                    self._clear_invalid_catalog_head(snapshot_kind=snapshot_kind)
-                    record_remote_read_observation(
+        with workflow_span(
+            name="longterm_remote_catalog_load_catalog_head_result",
+            kind="retrieval",
+            details={
+                "snapshot_kind": str(snapshot_kind or "").strip(),
+                "metadata_only": bool(metadata_only),
+                "fast_fail": bool(fast_fail),
+            },
+        ):
+            remote_state = self._require_remote_state()
+            read_client = self._require_client(getattr(remote_state, "read_client", None), operation="read")
+            retry_attempts = 1 if fast_fail else max(1, self._remote_retry_attempts())
+            retry_backoff_s = 0.0 if fast_fail else self._remote_retry_backoff_s()
+            effective_read_client = read_client if fast_fail else self._catalog_head_read_client(read_client=read_client)
+            context = LongTermRemoteReadContext(
+                snapshot_kind=snapshot_kind,
+                operation="load_catalog_current_head",
+                request_method="GET",
+                request_payload_kind="catalog_current_head_document",
+                uri_hint=self._catalog_head_uri(snapshot_kind=snapshot_kind),
+                request_path="/v1/external/documents/full",
+                namespace=self._normalize_text(getattr(remote_state, "namespace", None)),
+                access_classification="catalog_current_head",
+                attempt_count=retry_attempts,
+                retry_attempts_configured=self._remote_retry_attempts(),
+                retry_backoff_s=retry_backoff_s,
+                retry_mode="single_probe" if fast_fail else "bounded_transient_retry",
+            )
+            started_monotonic = time.monotonic()
+            attempt_index = 0
+            envelope: Mapping[str, object] | None = None
+            while True:
+                try:
+                    envelope = self._fetch_catalog_head_envelope(
+                        read_client=effective_read_client,
+                        snapshot_kind=snapshot_kind,
+                        metadata_only=metadata_only,
+                    )
+                    break
+                except Exception as exc:
+                    if self._status_code_from_exception(exc) == 404:
+                        self._clear_invalid_catalog_head(snapshot_kind=snapshot_kind)
+                        record_remote_read_observation(
+                            remote_state=remote_state,
+                            context=context,
+                            latency_ms=max(0.0, (time.monotonic() - started_monotonic) * 1000.0),
+                            outcome="missing",
+                            classification="not_found",
+                        )
+                        return _CatalogHeadLoadResult(status="not_found")
+                    if should_retry_remote_read_error(exc) and attempt_index + 1 < retry_attempts:
+                        delay_s = remote_read_retry_delay_s(
+                            exc,
+                            default_backoff_s=retry_backoff_s,
+                            attempt_index=attempt_index,
+                        )
+                        if delay_s > 0.0:
+                            time.sleep(delay_s)
+                        attempt_index += 1
+                        continue
+                    record_remote_read_diagnostic(
                         remote_state=remote_state,
                         context=context,
-                        latency_ms=max(0.0, (time.monotonic() - started_monotonic) * 1000.0),
-                        outcome="missing",
-                        classification="not_found",
+                        exc=exc,
+                        started_monotonic=started_monotonic,
+                        outcome="fallback",
                     )
-                    return _CatalogHeadLoadResult(status="not_found")
-                if should_retry_remote_read_error(exc) and attempt_index + 1 < retry_attempts:
-                    delay_s = remote_read_retry_delay_s(
-                        exc,
-                        default_backoff_s=retry_backoff_s,
-                        attempt_index=attempt_index,
+                    return _CatalogHeadLoadResult(status="unavailable")
+            assert envelope is not None
+            with workflow_span(
+                name="longterm_remote_catalog_extract_catalog_head_payload",
+                kind="retrieval",
+                details={
+                    "snapshot_kind": str(snapshot_kind or "").strip(),
+                    "metadata_only": bool(metadata_only),
+                },
+            ):
+                payload = self._extract_catalog_payload_from_document(snapshot_kind=snapshot_kind, payload=envelope)
+            if payload is None and metadata_only:
+                # Metadata-only current-head reads are an optimization. Non-empty
+                # heads can still require one content-bearing read when the backend
+                # omits enough envelope detail that the catalog cannot be rebuilt
+                # from metadata alone.
+                try:
+                    envelope = self._fetch_catalog_head_envelope(
+                        read_client=effective_read_client,
+                        snapshot_kind=snapshot_kind,
+                        metadata_only=False,
                     )
-                    if delay_s > 0.0:
-                        time.sleep(delay_s)
-                    attempt_index += 1
-                    continue
+                except Exception as exc:
+                    record_remote_read_diagnostic(
+                        remote_state=remote_state,
+                        context=context,
+                        exc=exc,
+                        started_monotonic=started_monotonic,
+                        outcome="fallback",
+                    )
+                    return _CatalogHeadLoadResult(status="unavailable")
+                with workflow_span(
+                    name="longterm_remote_catalog_extract_catalog_head_payload",
+                    kind="retrieval",
+                    details={
+                        "snapshot_kind": str(snapshot_kind or "").strip(),
+                        "metadata_only": False,
+                        "fallback_from_metadata_only": True,
+                    },
+                ):
+                    payload = self._extract_catalog_payload_from_document(snapshot_kind=snapshot_kind, payload=envelope)
+            if payload is None:
                 record_remote_read_diagnostic(
                     remote_state=remote_state,
                     context=context,
-                    exc=exc,
+                    exc=ValueError(
+                        f"Remote long-term {snapshot_kind!r} current-head document did not contain a supported catalog payload."
+                    ),
                     started_monotonic=started_monotonic,
                     outcome="fallback",
                 )
-                return _CatalogHeadLoadResult(status="unavailable")
-        assert envelope is not None
-        payload = self._extract_catalog_payload_from_document(snapshot_kind=snapshot_kind, payload=envelope)
-        if payload is None and metadata_only:
-            # Metadata-only current-head reads are an optimization. Non-empty
-            # heads can still require one content-bearing read when the backend
-            # omits enough envelope detail that the catalog cannot be rebuilt
-            # from metadata alone.
-            try:
-                envelope = self._fetch_catalog_head_envelope(
-                    read_client=effective_read_client,
-                    snapshot_kind=snapshot_kind,
-                    metadata_only=False,
-                )
-            except Exception as exc:
-                record_remote_read_diagnostic(
-                    remote_state=remote_state,
-                    context=context,
-                    exc=exc,
-                    started_monotonic=started_monotonic,
-                    outcome="fallback",
-                )
-                return _CatalogHeadLoadResult(status="unavailable")
-            payload = self._extract_catalog_payload_from_document(snapshot_kind=snapshot_kind, payload=envelope)
-        if payload is None:
-            record_remote_read_diagnostic(
+                self._remember_invalid_catalog_head(snapshot_kind=snapshot_kind)
+                return _CatalogHeadLoadResult(status="invalid")
+            self._clear_invalid_catalog_head(snapshot_kind=snapshot_kind)
+            record_remote_read_observation(
                 remote_state=remote_state,
                 context=context,
-                exc=ValueError(
-                    f"Remote long-term {snapshot_kind!r} current-head document did not contain a supported catalog payload."
-                ),
-                started_monotonic=started_monotonic,
-                outcome="fallback",
+                latency_ms=max(0.0, (time.monotonic() - started_monotonic) * 1000.0),
+                outcome="ok",
+                classification="ok",
             )
-            self._remember_invalid_catalog_head(snapshot_kind=snapshot_kind)
-            return _CatalogHeadLoadResult(status="invalid")
-        self._clear_invalid_catalog_head(snapshot_kind=snapshot_kind)
-        record_remote_read_observation(
-            remote_state=remote_state,
-            context=context,
-            latency_ms=max(0.0, (time.monotonic() - started_monotonic) * 1000.0),
-            outcome="ok",
-            classification="ok",
-        )
-        return _CatalogHeadLoadResult(status="found", payload=payload)
+            return _CatalogHeadLoadResult(status="found", payload=payload)
 
     def _catalog_head_read_client(self, *, read_client: object) -> object:
         """Return the client used for fixed current-head reads.
@@ -446,20 +485,37 @@ class LongTermRemoteCatalogStoreBase(
         """
 
         origin_uri = self._catalog_head_uri(snapshot_kind=snapshot_kind)
-        try:
+        with workflow_span(
+            name="longterm_remote_catalog_fetch_catalog_head_envelope",
+            kind="http",
+            details={
+                "snapshot_kind": str(snapshot_kind or "").strip(),
+                "metadata_only": bool(metadata_only),
+            },
+        ):
+            try:
+                return read_client.fetch_full_document(
+                    origin_uri=origin_uri,
+                    include_content=not metadata_only,
+                    max_content_chars=self._metadata_only_max_content_chars() if metadata_only else self._max_content_chars(),
+                )
+            except ChonkyDBError as exc:
+                if not metadata_only or int(exc.status_code or 0) != 400:
+                    raise
+        with workflow_span(
+            name="longterm_remote_catalog_fetch_catalog_head_envelope",
+            kind="http",
+            details={
+                "snapshot_kind": str(snapshot_kind or "").strip(),
+                "metadata_only": False,
+                "fallback_from_metadata_only": True,
+            },
+        ):
             return read_client.fetch_full_document(
                 origin_uri=origin_uri,
-                include_content=not metadata_only,
-                max_content_chars=self._metadata_only_max_content_chars() if metadata_only else self._max_content_chars(),
+                include_content=True,
+                max_content_chars=self._max_content_chars(),
             )
-        except ChonkyDBError as exc:
-            if not metadata_only or int(exc.status_code or 0) != 400:
-                raise
-        return read_client.fetch_full_document(
-            origin_uri=origin_uri,
-            include_content=True,
-            max_content_chars=self._max_content_chars(),
-        )
 
     def _load_catalog_entries_for_write(
         self,
@@ -761,7 +817,12 @@ class LongTermRemoteCatalogStoreBase(
         except Exception:
             return client
 
-    def _catalog_entry_metadata_from_mapping(self, payload: Mapping[str, object]) -> dict[str, object]:
+    def _catalog_entry_metadata_from_mapping(
+        self,
+        payload: Mapping[str, object],
+        *,
+        include_selection_projection: bool = True,
+    ) -> dict[str, object]:
         metadata: dict[str, object] = {}
         for field_name in (*self._catalog_entry_text_fields(), "payload_sha256"):
             value = self._normalize_text(payload.get(field_name))
@@ -771,6 +832,8 @@ class LongTermRemoteCatalogStoreBase(
             values = self._normalize_text_list(payload.get(field_name))
             if values:
                 metadata[field_name] = list(values)
+        if not include_selection_projection:
+            return metadata
         for field_name in self._catalog_entry_object_fields():
             object_value = payload.get(field_name)
             if isinstance(object_value, Mapping):

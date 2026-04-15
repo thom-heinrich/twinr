@@ -16,9 +16,11 @@ subpackages.
 - keep reminder reservation state reversible when a background delivery loses its idle window before speech starts, so Twinr does not invent retry backoff for work that never began
 - persist the guided user-discovery state that powers Twinr's resumable onboarding and lifelong profile-learning flow
 - review, correct, and delete learned discovery facts while keeping managed-context and structured-memory commits synchronized
+- keep runtime-context guided-discovery status local to persisted discovery state, so live prompt assembly never opens authoritative remote profile reads just to render a hint
 - write local prompt-context snapshots world-readable (`0644`) so the dedicated remote-memory watchdog can validate them even when the productive runtime itself runs as `root`
 - persist prompt memory plus managed user/personality context remotely as typed current-head/item records rather than treating ChonkyDB as a generic prompt-context blob store
 - let prompt-memory and managed-context readiness reuse a current head or a synthetic empty head in the live prompt path, while keeping legacy-head probes only for explicit seed/migration checks, so the Pi watchdog stays read-only and pointer/blob fallback stays out of first-turn rendering
+- keep prompt-memory and managed-context seed helpers read-only when a current-head probe returns `unavailable`; only truly missing or invalid heads may be re-seeded from local bootstrap content, so required-remote recovery does not devolve into slow local re-publish loops
 - overlap independent prompt/user/personality remote current-head bootstrap reads so required-remote readiness is bounded by the slowest prompt-context check instead of the sum of all three
 - provide shared full-text and query-normalization helpers reused by memory stores
 - keep live long-term recall from blocking on cold query-rewrite misses by returning an immediate fallback profile and filling the rewrite cache asynchronously in the background

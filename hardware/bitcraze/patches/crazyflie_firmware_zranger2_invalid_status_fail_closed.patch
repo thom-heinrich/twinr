@@ -1,0 +1,27 @@
+diff --git a/src/deck/drivers/src/zranger2.c b/src/deck/drivers/src/zranger2.c
+--- a/src/deck/drivers/src/zranger2.c
++++ b/src/deck/drivers/src/zranger2.c
+@@ -47,6 +47,7 @@
+ // Measurement noise model
+ static const float expPointA = 2.5f;
+ static const float expStdA = 0.0025f; // STD at elevation expPointA [m]
++static uint16_t filterMask = 1 << VL53L1_RANGESTATUS_RANGE_VALID;
+ static const float expPointB = 4.0f;
+ static const float expStdB = 0.2f;    // STD at elevation expPointB [m]
+ static float expCoeff;
+@@ -73,7 +74,14 @@ static uint16_t zRanger2GetMeasurementAndRestart(VL53L1_Dev_t *dev)
+     }
+ 
+     status = VL53L1_GetRangingMeasurementData(dev, &rangingData);
+-    range = rangingData.RangeMilliMeter;
++    if (filterMask & (1 << rangingData.RangeStatus))
++    {
++        range = rangingData.RangeMilliMeter;
++    }
++    else
++    {
++        range = 32767;
++    }
+ 
+     VL53L1_StopMeasurement(dev);
+     status = VL53L1_StartMeasurement(dev);

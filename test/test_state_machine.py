@@ -73,6 +73,48 @@ class TwinrRuntimeTests(unittest.TestCase):
             (TwinrStatus.ANSWERING, TwinrEvent.FOLLOW_UP_ARMED, TwinrStatus.LISTENING),
         )
 
+    def test_follow_up_rearm_can_resume_from_waiting_after_tts_finished(self) -> None:
+        runtime = TwinrRuntime(config=TwinrConfig())
+
+        runtime.press_green_button()
+        runtime.submit_transcript("Hallo")
+        runtime.complete_agent_turn("Mir geht's gut, danke! Und dir?")
+        runtime.finish_speaking()
+
+        runtime.rearm_follow_up()
+
+        self.assertEqual(runtime.status, TwinrStatus.LISTENING)
+        self.assertEqual(
+            runtime.state_machine.history[-2:],
+            [
+                (TwinrStatus.ANSWERING, TwinrEvent.TTS_FINISHED, TwinrStatus.WAITING),
+                (TwinrStatus.WAITING, TwinrEvent.FOLLOW_UP_ARMED, TwinrStatus.LISTENING),
+            ],
+        )
+
+    def test_finish_speaking_and_rearm_follow_up_persists_listening_without_waiting_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            snapshot_path = Path(temp_dir) / "runtime-state.json"
+            runtime = TwinrRuntime(config=TwinrConfig(runtime_state_path=str(snapshot_path)))
+
+            runtime.press_green_button()
+            runtime.submit_transcript("Hallo")
+            runtime.complete_agent_turn("Mir geht's gut, danke! Und dir?")
+
+            runtime.finish_speaking_and_rearm_follow_up()
+
+            snapshot = RuntimeSnapshotStore(snapshot_path).load()
+
+        self.assertEqual(runtime.status, TwinrStatus.LISTENING)
+        self.assertEqual(snapshot.status, "listening")
+        self.assertEqual(
+            runtime.state_machine.history[-2:],
+            [
+                (TwinrStatus.ANSWERING, TwinrEvent.TTS_FINISHED, TwinrStatus.WAITING),
+                (TwinrStatus.WAITING, TwinrEvent.FOLLOW_UP_ARMED, TwinrStatus.LISTENING),
+            ],
+        )
+
     def test_print_requires_previous_answer(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             snapshot_path = Path(temp_dir) / "runtime-state.json"

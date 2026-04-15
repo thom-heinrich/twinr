@@ -135,6 +135,9 @@ class RealtimeToolExecutor:
     def handle_remember_memory(self, arguments: dict[str, object]) -> dict[str, object]:
         return self._invoke("remember_memory", memory.handle_remember_memory, arguments)
 
+    def handle_review_saved_memories(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self._invoke("review_saved_memories", memory.handle_review_saved_memories, arguments)
+
     def handle_remember_contact(self, arguments: dict[str, object]) -> dict[str, object]:
         return self._invoke("remember_contact", memory.handle_remember_contact, arguments)
 

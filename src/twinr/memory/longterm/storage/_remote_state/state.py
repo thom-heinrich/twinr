@@ -15,7 +15,12 @@ from typing import Any, Iterator, Self, cast
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.chonkydb import ChonkyDBClient, ChonkyDBConnectionConfig, ChonkyDBError, chonkydb_data_path
-from twinr.memory.longterm.storage._remote_retry import clone_client_with_capped_timeout
+from twinr.memory.longterm.storage._remote_retry import (
+    clone_client_with_capped_timeout,
+    exception_chain,
+    remote_read_retry_delay_s,
+    should_retry_remote_read_error,
+)
 
 from .shared import (
     LongTermRemoteSnapshotProbe,
@@ -63,10 +68,13 @@ from .shared import (
     _safe_resolve_path,
     _strip_text,
     _utcnow_iso,
+    is_explicit_remote_transient_detail,
 )
 
 _STATUS_PROBE_SENTINEL_DOCUMENT_ID = "00000000-0000-0000-0000-000000000000"
 _STATUS_PROBE_LIVENESS_HTTP_CODES = frozenset({400, 404})
+_DEFAULT_STATUS_PROBE_FAILURE_THRESHOLD = 2
+_STATUS_PROBE_MAX_RETRY_ATTEMPTS = 3
 
 
 class LongTermRemoteStateSupportMixin:  # pylint: disable=too-many-public-methods,no-member
@@ -174,23 +182,39 @@ class LongTermRemoteStateSupportMixin:  # pylint: disable=too-many-public-method
             )
         if self.read_client is None or self.write_client is None:
             return LongTermRemoteStatus(mode="remote_primary", ready=False, detail="ChonkyDB is not configured.")
-        probe_client = self._status_probe_client(self.read_client)
-        deadline = time.monotonic() + self._status_probe_timeout_s()
+        probe_client = self._status_probe_client(
+            self.read_client,
+            timeout_s=self._status_probe_instance_timeout_s(),
+        )
         try:
-            instance = probe_client.instance()
+            instance = self._status_probe_instance(probe_client)
         except Exception as exc:
             if self._status_probe_document_liveness(
                 client=probe_client,
-                timeout_s=deadline - time.monotonic(),
+                timeout_s=self._status_probe_liveness_timeout_s(),
             ):
                 self._note_remote_success()
-                return LongTermRemoteStatus(mode="remote_primary", ready=True)
-            self._note_remote_failure()
+                return LongTermRemoteStatus(
+                    mode="remote_primary",
+                    ready=True,
+                    operational_probe_allowed=True,
+                )
+            consecutive_failures = self._note_remote_failure()
+            detail = self._status_probe_failure_detail(exc) or (
+                f"ChonkyDB health check failed ({type(exc).__name__})."
+            )
             _LOGGER.warning("ChonkyDB health check failed: %s", self._safe_exception_text(exc))
+            if self.required and consecutive_failures < self._status_probe_failure_threshold():
+                return LongTermRemoteStatus(
+                    mode="remote_primary",
+                    ready=False,
+                    detail=detail,
+                    operational_probe_allowed=True,
+                )
             return LongTermRemoteStatus(
                 mode="remote_primary",
                 ready=False,
-                detail=f"ChonkyDB health check failed ({type(exc).__name__}).",
+                detail=detail,
             )
         self._note_remote_success()
         if not bool(getattr(instance, "ready", False)):
@@ -198,8 +222,30 @@ class LongTermRemoteStateSupportMixin:  # pylint: disable=too-many-public-method
                 mode="remote_primary",
                 ready=False,
                 detail="ChonkyDB instance responded but is not ready.",
+                operational_probe_allowed=True,
             )
-        return LongTermRemoteStatus(mode="remote_primary", ready=True)
+        return LongTermRemoteStatus(
+            mode="remote_primary",
+            ready=True,
+            operational_probe_allowed=True,
+        )
+
+    @staticmethod
+    def _status_probe_failure_detail(exc: BaseException) -> str | None:
+        """Preserve explicit upstream restart/warmup details from chained ChonkyDB errors."""
+
+        for item in exception_chain(exc):
+            if not isinstance(item, ChonkyDBError):
+                continue
+            response_json = item.response_json if isinstance(item.response_json, Mapping) else None
+            if response_json is not None:
+                detail = _normalize_text(str(response_json.get("detail") or ""))
+                if is_explicit_remote_transient_detail(detail):
+                    return detail
+            detail = _normalize_text(item.response_text)
+            if is_explicit_remote_transient_detail(detail):
+                return detail
+        return None
 
     def _status_probe_document_liveness(
         self,
@@ -231,24 +277,52 @@ class LongTermRemoteStateSupportMixin:  # pylint: disable=too-many-public-method
                 return False
             if not math.isfinite(resolved_timeout_s) or resolved_timeout_s <= 0.0:
                 return False
-            probe_client = cast(
+        else:
+            resolved_timeout_s = self._status_probe_liveness_timeout_s()
+        attempt_budget_s = max(0.1, float(resolved_timeout_s))
+        deadline_monotonic = time.monotonic() + attempt_budget_s
+        attempts = self._status_probe_retry_attempts()
+        for attempt_index in range(attempts):
+            remaining_s = deadline_monotonic - time.monotonic()
+            if remaining_s <= 0.0:
+                return False
+            attempt_client = cast(
                 ChonkyDBClient,
                 clone_client_with_capped_timeout(
                     probe_client,
-                    timeout_s=resolved_timeout_s,
+                    timeout_s=max(0.1, remaining_s),
                 ),
             )
-        try:
-            probe_client.fetch_full_document(
-                document_id=_STATUS_PROBE_SENTINEL_DOCUMENT_ID,
-                include_content=False,
-                max_content_chars=1,
-            )
-        except ChonkyDBError as exc:
-            return int(exc.status_code or 0) in _STATUS_PROBE_LIVENESS_HTTP_CODES
-        except Exception:
-            return False
-        return True
+            try:
+                attempt_client.fetch_full_document(
+                    document_id=_STATUS_PROBE_SENTINEL_DOCUMENT_ID,
+                    include_content=False,
+                    max_content_chars=1,
+                )
+            except ChonkyDBError as exc:
+                if int(exc.status_code or 0) in _STATUS_PROBE_LIVENESS_HTTP_CODES:
+                    return True
+                if attempt_index >= (attempts - 1) or not self._status_probe_should_retry(exc):
+                    return False
+                if not self._status_probe_retry_sleep(
+                    exc=exc,
+                    attempt_index=attempt_index,
+                    deadline_monotonic=deadline_monotonic,
+                ):
+                    return False
+                continue
+            except Exception as exc:
+                if attempt_index >= (attempts - 1) or not self._status_probe_should_retry(exc):
+                    return False
+                if not self._status_probe_retry_sleep(
+                    exc=exc,
+                    attempt_index=attempt_index,
+                    deadline_monotonic=deadline_monotonic,
+                ):
+                    return False
+                continue
+            return True
+        return False
 
     @contextmanager
     def cache_probe_reads(self) -> Iterator[None]:
@@ -376,17 +450,109 @@ class LongTermRemoteStateSupportMixin:  # pylint: disable=too-many-public-method
             self._consecutive_failures = 0
             self._circuit_open_until_monotonic = 0.0
 
-    def _note_remote_failure(self) -> None:
+    def _note_remote_failure(self) -> int:
         cooldown_s = self._circuit_breaker_cooldown_s()
-        if cooldown_s <= 0:
-            return
+        failure_threshold = self._status_probe_failure_threshold()
         with self._state_lock:
             self._consecutive_failures += 1
-            multiplier = min(self._consecutive_failures, 4)
+            consecutive_failures = self._consecutive_failures
+            if cooldown_s <= 0 or consecutive_failures < failure_threshold:
+                return consecutive_failures
+            multiplier = min((self._consecutive_failures - failure_threshold) + 1, 4)
             self._circuit_open_until_monotonic = max(
                 self._circuit_open_until_monotonic,
                 time.monotonic() + (cooldown_s * multiplier),
             )
+            return consecutive_failures
+
+    def _status_probe_failure_threshold(self) -> int:
+        """Return how many failed status probes are required before local cooldown opens."""
+
+        explicit_threshold = getattr(
+            self.config,
+            "long_term_memory_remote_required_failure_threshold",
+            None,
+        )
+        if explicit_threshold is not None:
+            try:
+                return max(1, int(explicit_threshold))
+            except (TypeError, ValueError):
+                pass
+        if self.required:
+            return _DEFAULT_STATUS_PROBE_FAILURE_THRESHOLD
+        return 1
+
+    def _status_probe_retry_attempts(self) -> int:
+        """Return the bounded transient retry budget for one status probe lane."""
+
+        return min(_STATUS_PROBE_MAX_RETRY_ATTEMPTS, self._retry_attempts())
+
+    def _status_probe_should_retry(self, exc: BaseException) -> bool:
+        """Return whether one status-probe error is a transient HTTP backend spike.
+
+        `/instance` timeouts still fall through immediately to the reserved
+        synthetic liveness probe; only explicit retryable HTTP responses should
+        consume more of the status probe's bounded instance budget.
+        """
+
+        if not should_retry_remote_read_error(exc):
+            return False
+        for item in exception_chain(exc):
+            if isinstance(item, ChonkyDBError):
+                return item.status_code is not None
+        return False
+
+    def _status_probe_retry_sleep(
+        self,
+        *,
+        exc: BaseException,
+        attempt_index: int,
+        deadline_monotonic: float,
+    ) -> bool:
+        """Sleep between transient probe attempts while preserving the probe deadline."""
+
+        delay_s = remote_read_retry_delay_s(
+            exc,
+            default_backoff_s=self._retry_backoff_s(),
+            attempt_index=attempt_index,
+        )
+        remaining_s = deadline_monotonic - time.monotonic()
+        sleep_s = min(delay_s, max(0.0, remaining_s - 0.1))
+        if sleep_s <= 0.0:
+            return False
+        time.sleep(sleep_s)
+        return True
+
+    def _status_probe_instance(self, client: ChonkyDBClient) -> Any:
+        """Run the bounded `/instance` health probe with transient-read retries."""
+
+        attempt_budget_s = self._status_probe_instance_timeout_s()
+        deadline_monotonic = time.monotonic() + attempt_budget_s
+        attempts = self._status_probe_retry_attempts()
+        last_exc: Exception | None = None
+        for attempt_index in range(attempts):
+            remaining_s = deadline_monotonic - time.monotonic()
+            if remaining_s <= 0.0:
+                break
+            attempt_client = self._status_probe_client(
+                client,
+                timeout_s=max(0.1, remaining_s),
+            )
+            try:
+                return attempt_client.instance()
+            except Exception as exc:  # pragma: no branch - bounded retry gate follows immediately.
+                last_exc = exc if isinstance(exc, Exception) else Exception(str(exc))
+                if attempt_index >= (attempts - 1) or not self._status_probe_should_retry(exc):
+                    break
+                if not self._status_probe_retry_sleep(
+                    exc=exc,
+                    attempt_index=attempt_index,
+                    deadline_monotonic=deadline_monotonic,
+                ):
+                    break
+        if last_exc is not None:
+            raise last_exc
+        raise TimeoutError("ChonkyDB status probe exhausted its reserved /instance budget.")
 
     def _remote_failure_detail(
         self,
@@ -410,7 +576,11 @@ class LongTermRemoteStateSupportMixin:  # pylint: disable=too-many-public-method
     def _safe_exception_text(self, exc: BaseException) -> str:
         return _redact_secrets(
             f"{type(exc).__name__}: {exc}",
-            secrets=(self.config.chonkydb_api_key,),
+            secrets=tuple(
+                secret
+                for secret in (self.config.chonkydb_api_key,)
+                if isinstance(secret, str) and secret.strip()
+            ),
         )
 
     def _normalize_snapshot_kind(self, snapshot_kind: str) -> str:
@@ -537,6 +707,17 @@ class LongTermRemoteStateSupportMixin:  # pylint: disable=too-many-public-method
         """Return one client tuned for cold `origin_uri` resolution."""
 
         target_timeout_s = self._origin_resolution_bootstrap_timeout_s()
+        client_timeout_cap_s = getattr(client, "_twinr_timeout_cap_s", None)
+        if isinstance(client_timeout_cap_s, (int, float)) and math.isfinite(float(client_timeout_cap_s)):
+            target_timeout_s = min(
+                target_timeout_s,
+                _coerce_float(
+                    float(client_timeout_cap_s),
+                    default=float(client.config.timeout_s),
+                    minimum=0.1,
+                    maximum=_DEFAULT_ORIGIN_RESOLUTION_BOOTSTRAP_TIMEOUT_CAP_S,
+                ),
+            )
         if math.isclose(float(client.config.timeout_s), target_timeout_s, rel_tol=0.0, abs_tol=1e-9):
             return client
         return client.clone_with_timeout(target_timeout_s)
@@ -594,10 +775,20 @@ class LongTermRemoteStateSupportMixin:  # pylint: disable=too-many-public-method
             maximum=_DEFAULT_ASYNC_JOB_VISIBILITY_TIMEOUT_CAP_S,
         )
 
-    def _status_probe_client(self, client: ChonkyDBClient) -> ChonkyDBClient:
+    def _status_probe_client(
+        self,
+        client: ChonkyDBClient,
+        *,
+        timeout_s: float | None = None,
+    ) -> ChonkyDBClient:
         """Return one client tuned for fail-closed remote health probes."""
 
-        target_timeout_s = self._status_probe_timeout_s()
+        target_timeout_s = self._status_probe_timeout_s() if timeout_s is None else _coerce_float(
+            timeout_s,
+            default=self._status_probe_timeout_s(),
+            minimum=0.1,
+            maximum=_DEFAULT_STATUS_PROBE_TIMEOUT_CAP_S,
+        )
         if math.isclose(float(client.config.timeout_s), target_timeout_s, rel_tol=0.0, abs_tol=1e-9):
             return client
         return client.clone_with_timeout(target_timeout_s)
@@ -623,6 +814,36 @@ class LongTermRemoteStateSupportMixin:  # pylint: disable=too-many-public-method
             default=_DEFAULT_STATUS_PROBE_TIMEOUT_S,
             minimum=read_timeout_s,
             maximum=_DEFAULT_STATUS_PROBE_TIMEOUT_CAP_S,
+        )
+
+    def _status_probe_liveness_timeout_s(self) -> float:
+        """Reserve one ordinary hot-read window for the synthetic liveness probe."""
+
+        read_timeout_s = _coerce_timeout_s(
+            getattr(self.config, "long_term_memory_remote_read_timeout_s", _DEFAULT_REMOTE_READ_TIMEOUT_S),
+            default=_DEFAULT_REMOTE_READ_TIMEOUT_S,
+        )
+        total_probe_timeout_s = self._status_probe_timeout_s()
+        maximum_timeout_s = max(0.1, total_probe_timeout_s - 0.1)
+        candidate = min(read_timeout_s, maximum_timeout_s)
+        return _coerce_float(
+            candidate,
+            default=candidate,
+            minimum=0.1,
+            maximum=maximum_timeout_s,
+        )
+
+    def _status_probe_instance_timeout_s(self) -> float:
+        """Return the reserved shallow-instance portion of the total status budget."""
+
+        total_probe_timeout_s = self._status_probe_timeout_s()
+        liveness_timeout_s = self._status_probe_liveness_timeout_s()
+        candidate = max(0.1, total_probe_timeout_s - liveness_timeout_s)
+        return _coerce_float(
+            candidate,
+            default=candidate,
+            minimum=0.1,
+            maximum=total_probe_timeout_s,
         )
 
     def _origin_resolution_bootstrap_timeout_s(self) -> float:

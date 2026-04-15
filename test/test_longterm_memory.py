@@ -38,7 +38,10 @@ from twinr.memory.longterm import (
     LongTermStructuredStore,
 )
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
-from twinr.memory.longterm.runtime.prepared_context import PreparedLongTermContextFront
+from twinr.memory.longterm.runtime.prepared_context import (
+    PreparedLongTermContextFront,
+    PreparedLongTermContextResolution,
+)
 from twinr.memory.longterm.runtime.provider_answer_front import MaterializedProviderAnswerFront
 from twinr.memory.longterm.evaluation.live_memory_acceptance import _seed_synthetic_memory
 from twinr.memory.longterm.storage.provider_answer_front_store import MaterializedProviderAnswerFrontRecord
@@ -938,6 +941,58 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         finally:
             service.shutdown()
 
+    def test_prewarm_provider_context_does_not_wait_for_query_rewrite(self) -> None:
+        retriever = _BlockingPreparedRetriever()
+        service = object.__new__(LongTermMemoryService)
+        service.config = TwinrConfig(
+            project_root=".",
+            personality_dir="personality",
+            long_term_memory_enabled=True,
+            long_term_memory_fast_topic_enabled=False,
+        )
+
+        class _CapturingQueryRewriter:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str | None, float]] = []
+
+            def profile(
+                self,
+                query_text: str | None,
+                *,
+                wait_for_rewrite_s: float = 0.0,
+            ) -> LongTermQueryProfile:
+                self.calls.append((query_text, wait_for_rewrite_s))
+                return LongTermQueryProfile.from_text(
+                    query_text,
+                    canonical_english_text="Who is Janina?",
+                )
+
+        query_rewriter = _CapturingQueryRewriter()
+        service.query_rewriter = query_rewriter
+        service.retriever = retriever
+        service.object_store = retriever.object_store
+        service.prompt_context_store = SimpleNamespace(
+            memory_store=SimpleNamespace(remote_state=None),
+            user_store=SimpleNamespace(remote_state=None),
+            personality_store=SimpleNamespace(remote_state=None),
+        )
+        service.graph_store = SimpleNamespace(remote_state=None)
+        service.midterm_store = SimpleNamespace(remote_state=None)
+        service.writer = None
+        service.multimodal_writer = None
+        service.fast_topic_builder = None
+        service.prepared_context_front = PreparedLongTermContextFront()
+        service.provider_answer_front = None
+        service._store_lock = threading.RLock()
+
+        try:
+            scheduled = service.prewarm_provider_context("Wer ist Janina?", rewrite_query=True)
+
+            self.assertTrue(scheduled)
+            self.assertEqual(query_rewriter.calls, [("Wer ist Janina?", 0.0)])
+        finally:
+            service.shutdown()
+
     def test_build_provider_context_does_not_block_on_materialized_front_persist(self) -> None:
         remote_state = _CountingRemoteState()
         retriever = _ProbeCachingRetriever(remote_state)
@@ -1226,6 +1281,80 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertEqual(snapshot.context, context)
         self.assertEqual(snapshot.source, "built_sync")
 
+    def test_build_tool_provider_context_emits_query_resolution_and_snapshot_spans(self) -> None:
+        service = object.__new__(LongTermMemoryService)
+        service.config = TwinrConfig(project_root=".", personality_dir="personality")
+        service.query_rewriter = _StaticQueryRewriter({})
+        service.writer = None
+        service.multimodal_writer = None
+        snapshot_calls: list[dict[str, object]] = []
+        service._remember_context_snapshot = lambda **kwargs: snapshot_calls.append(dict(kwargs))
+        service._consume_prepared_context = lambda **kwargs: PreparedLongTermContextResolution(
+            context=LongTermMemoryContext(durable_context="tool durable"),
+            source="built_sync",
+        )
+        span_entries: list[tuple[str, str, dict[str, object]]] = []
+        events: list[dict[str, object]] = []
+
+        @contextmanager
+        def _recording_span(name: str, kind: str, details: dict[str, object] | None = None):
+            span_entries.append((name, kind, dict(details or {})))
+            yield
+
+        with patch(
+            "twinr.memory.longterm.runtime.service_impl.context.workflow_span",
+            side_effect=lambda name, kind, details=None: _recording_span(name, kind, details),
+        ):
+            with patch(
+                "twinr.memory.longterm.runtime.service_impl.context.workflow_event",
+                side_effect=lambda **kwargs: events.append(dict(kwargs)),
+            ):
+                with patch(
+                    "twinr.memory.longterm.runtime.service_impl.context.record_voice_turn_remote_memory_ready",
+                    side_effect=lambda **_kwargs: None,
+                ):
+                    context = service.build_tool_provider_context(
+                        "na alles klar",
+                        include_graph_fallback=False,
+                    )
+
+        self.assertEqual(context.durable_context, "tool durable")
+        span_names = [entry[0] for entry in span_entries]
+        self.assertIn("longterm_service_profile_tool_query", span_names)
+        self.assertIn("longterm_service_build_tool_provider_context", span_names)
+        self.assertIn("longterm_service_resolve_tool_context", span_names)
+        self.assertIn("longterm_service_remember_tool_context_snapshot", span_names)
+        resolve_entry = next(entry for entry in span_entries if entry[0] == "longterm_service_resolve_tool_context")
+        self.assertFalse(resolve_entry[2]["include_graph_fallback"])
+        self.assertFalse(resolve_entry[2]["prepared_front_available"])
+        self.assertEqual(len(snapshot_calls), 1)
+        built_event = next(event for event in events if event.get("msg") == "longterm_tool_provider_context_built")
+        self.assertEqual(built_event["details"]["prepared_source"], "built_sync")
+
+    def test_build_tool_provider_context_surfaces_retriever_failures(self) -> None:
+        service = object.__new__(LongTermMemoryService)
+        service.config = TwinrConfig(project_root=".", personality_dir="personality")
+        service.query_rewriter = _StaticQueryRewriter({})
+        service.writer = None
+        service.multimodal_writer = None
+        service.retriever = SimpleNamespace()
+        service.object_store = SimpleNamespace(remote_state=None)
+        service.prompt_context_store = SimpleNamespace(
+            memory_store=SimpleNamespace(remote_state=None),
+            user_store=SimpleNamespace(remote_state=None),
+            personality_store=SimpleNamespace(remote_state=None),
+        )
+        service.graph_store = SimpleNamespace(remote_state=None)
+        service.midterm_store = SimpleNamespace(remote_state=None)
+        service._consume_prepared_context = lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("tool context exploded"))
+
+        with patch(
+            "twinr.memory.longterm.runtime.service_impl.context.record_voice_turn_remote_memory_ready",
+            side_effect=lambda **_kwargs: None,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "tool context exploded"):
+                service.build_tool_provider_context("na alles klar")
+
     def test_longterm_retriever_build_tool_context_reuses_loaded_inputs(self) -> None:
         retriever = LongTermRetriever(
             config=TwinrConfig(project_root=".", personality_dir="personality"),
@@ -1294,6 +1423,22 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertIsNone(context.graph_context)
         self.assertIsNone(context.subtext_context)
         self.assertIsNone(context.conflict_context)
+
+    def test_longterm_retriever_build_tool_context_surfaces_input_failures(self) -> None:
+        retriever = LongTermRetriever(
+            config=TwinrConfig(project_root=".", personality_dir="personality"),
+            prompt_context_store=SimpleNamespace(),
+            graph_store=SimpleNamespace(),
+            object_store=SimpleNamespace(),
+            midterm_store=SimpleNamespace(),
+            conflict_resolver=SimpleNamespace(),
+            subtext_builder=SimpleNamespace(),
+        )
+        query = LongTermQueryProfile.from_text("Worueber haben wir heute gesprochen?")
+
+        with patch.object(LongTermRetriever, "_load_context_inputs", side_effect=RuntimeError("inputs exploded")):
+            with self.assertRaisesRegex(RuntimeError, "inputs exploded"):
+                retriever.build_tool_context(query=query, original_query_text=query.original_text)
 
     def test_longterm_retriever_build_tool_context_uses_graph_only_as_empty_fallback(self) -> None:
         retriever = LongTermRetriever(

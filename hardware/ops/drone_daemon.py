@@ -85,7 +85,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import IO, Any, Callable, Generic, Literal, Protocol, TypeVar
+from typing import IO, Any, Callable, Generic, Literal, Mapping, Protocol, TypeVar, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
@@ -97,6 +97,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, ConfigDict
 import uvicorn
+from starlette.types import Message, Receive, Scope, Send
 
 
 LOGGER = logging.getLogger(__name__)
@@ -111,8 +112,19 @@ _DEFAULT_HOVER_TEST_DURATION_S = 3.0
 _DEFAULT_HOVER_TEST_VELOCITY_MPS = 0.2
 _DEFAULT_HOVER_TEST_MIN_VBAT_V = 3.8
 _DEFAULT_HOVER_TEST_MIN_BATTERY_LEVEL = 20
+_DEFAULT_LOCAL_INSPECT_HEIGHT_M = 0.25
+_DEFAULT_LOCAL_INSPECT_TRANSLATION_VELOCITY_MPS = 0.15
+_DEFAULT_LOCAL_INSPECT_NOMINAL_TRANSLATION_M = 0.20
+_DEFAULT_LOCAL_INSPECT_MIN_TRANSLATION_M = 0.10
+_DEFAULT_LOCAL_INSPECT_MAX_TRANSLATION_M = 0.30
+_DEFAULT_LOCAL_INSPECT_SETTLE_S = 0.35
+_DEFAULT_LOCAL_INSPECT_CAPTURE_DWELL_S = 0.30
+_DEFAULT_LOCAL_INSPECT_MIN_VBAT_V = 3.8
+_DEFAULT_LOCAL_INSPECT_MIN_BATTERY_LEVEL = 20
+_DEFAULT_LOCAL_INSPECT_MIN_CLEARANCE_M = 0.35
 _DEFAULT_POSE_CACHE_TTL_S = 0.5
 _DEFAULT_RADIO_CACHE_TTL_S = 2.0
+_DEFAULT_TELEMETRY_CACHE_TTL_S = 1.0
 _DEFAULT_MAX_POSE_AGE_S = 1.5
 _DEFAULT_MIN_POSE_CONFIDENCE = 0.5
 _DEFAULT_MAX_OUTSTANDING_MISSIONS = 8
@@ -120,7 +132,14 @@ _DEFAULT_LIMIT_CONCURRENCY = 16
 _DEFAULT_BACKLOG = 128
 _DEFAULT_KEEPALIVE_TIMEOUT_S = 5
 _DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_S = 20
-_HOVER_TEST_ENABLED_SKILL_MODES = frozenset({"bounded_hover_test_only", "bounded_test_primitives_only"})
+_LOCAL_FLIGHT_ENABLED_SKILL_MODES = frozenset(
+    {
+        "bounded_hover_test_only",
+        "bounded_test_primitives_only",
+        "bounded_local_navigation_only",
+        "bounded_autonomous_inspect_only",
+    }
+)
 _MAX_BODY_BYTES = 16384
 _FINAL_MISSION_STATES = frozenset({"completed", "failed", "cancelled"})
 _HOVER_WORKER_STDIO_TAIL_CHARS = 4000
@@ -247,7 +266,10 @@ def _structured_log(event: str, **fields: object) -> None:
 
 def _new_mission_id() -> str:
     uuid7_fn = getattr(uuid, "uuid7", None)
-    generated = uuid7_fn() if callable(uuid7_fn) else uuid.uuid4()
+    uuid_factory: Callable[[], uuid.UUID] = uuid.uuid4
+    if callable(uuid7_fn):
+        uuid_factory = cast(Callable[[], uuid.UUID], uuid7_fn)
+    generated = uuid_factory()
     return f"DRN-{str(generated).upper()}"
 
 
@@ -285,7 +307,7 @@ def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> Non
     _atomic_write_bytes(path, text.encode(encoding))
 
 
-def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
+def _atomic_write_json(path: Path, payload: Mapping[str, object]) -> None:
     _atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
@@ -566,6 +588,159 @@ class BitcrazeRadioStatusProvider:
         }
 
 
+def _telemetry_failure_payload(error: str, *, collected_at: str) -> dict[str, object]:
+    """Return one bounded unhealthy telemetry payload for operator state."""
+
+    normalized_error = str(error or "telemetry_unavailable").strip() or "telemetry_unavailable"
+    return {
+        "profile": "operator",
+        "collected_at": collected_at,
+        "healthy": False,
+        "failures": [normalized_error],
+        "freshness_by_signal": {},
+        "catalog": {
+            "log_group_count": 0,
+            "log_variable_count": 0,
+            "param_group_count": 0,
+            "param_count": 0,
+        },
+        "deck": {"flags": {}, "refreshed_age_s": None},
+        "power": {"vbat_v": None, "battery_level": None, "state": None, "state_name": "unknown"},
+        "range": {
+            "zrange_m": None,
+            "front_m": None,
+            "back_m": None,
+            "left_m": None,
+            "right_m": None,
+            "up_m": None,
+            "downward_observed": False,
+        },
+        "flight": {
+            "roll_deg": None,
+            "pitch_deg": None,
+            "yaw_deg": None,
+            "x_m": None,
+            "y_m": None,
+            "z_m": None,
+            "vx_mps": None,
+            "vy_mps": None,
+            "vz_mps": None,
+            "thrust": None,
+            "motion_squal": None,
+            "supervisor_info": None,
+            "can_fly": None,
+            "is_flying": None,
+            "unsafe_supervisor_flags": [],
+        },
+        "link": {
+            "radio_connected": None,
+            "rssi_dbm": None,
+            "observation_age_s": None,
+            "latency_ms": None,
+            "link_quality": None,
+            "uplink_rssi": None,
+            "uplink_rate_hz": None,
+            "downlink_rate_hz": None,
+            "uplink_congestion": None,
+            "downlink_congestion": None,
+            "monitor_available": False,
+            "monitor_failure": normalized_error,
+        },
+        "failsafe": {
+            "loaded": False,
+            "protocol_version": None,
+            "enabled": None,
+            "state_code": None,
+            "state_name": None,
+            "reason_code": None,
+            "reason_name": None,
+            "heartbeat_age_ms": None,
+            "last_status_received_age_s": None,
+            "session_id": None,
+            "rejected_packets": None,
+            "last_reject_code": None,
+        },
+        "command": {
+            "mission_name": None,
+            "phase": "idle",
+            "phase_status": None,
+            "age_s": None,
+            "target_height_m": None,
+            "hover_duration_s": None,
+            "forward_m": None,
+            "left_m": None,
+            "translation_velocity_mps": None,
+            "takeoff_confirmed": False,
+            "aborted": False,
+            "abort_reason": None,
+            "last_message": None,
+        },
+        "divergences": [],
+        "available_blocks": [],
+        "skipped_blocks": [],
+    }
+
+
+class BitcrazeTelemetrySnapshotProvider:
+    """Capture one bounded operator telemetry snapshot via the shared runtime."""
+
+    def __init__(
+        self,
+        *,
+        repo_root: Path,
+        workspace: Path,
+        bitcraze_python: Path,
+    ) -> None:
+        self.repo_root = repo_root
+        self.workspace = workspace
+        self.bitcraze_python = bitcraze_python
+
+    def snapshot(self) -> dict[str, object]:
+        script_path = self.repo_root / "hardware" / "bitcraze" / "capture_runtime_telemetry.py"
+        collected_at = _utc_now_iso()
+        if not script_path.exists():
+            return _telemetry_failure_payload(f"missing_probe:{script_path}", collected_at=collected_at)
+        if not self.bitcraze_python.exists():
+            return _telemetry_failure_payload(
+                f"missing_bitcraze_python:{self.bitcraze_python}",
+                collected_at=collected_at,
+            )
+        try:
+            result = subprocess.run(
+                [
+                    str(self.bitcraze_python),
+                    str(script_path),
+                    "--workspace",
+                    str(self.workspace),
+                    "--profile",
+                    "operator",
+                    "--json",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15.0,
+            )
+        except Exception as exc:
+            return _telemetry_failure_payload(
+                f"telemetry_exec_failed:{exc.__class__.__name__}",
+                collected_at=collected_at,
+            )
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip() or "telemetry_probe_failed"
+            return _telemetry_failure_payload(stderr, collected_at=collected_at)
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return _telemetry_failure_payload("telemetry_invalid_json", collected_at=collected_at)
+        telemetry = payload.get("telemetry") if isinstance(payload, dict) else None
+        if not isinstance(telemetry, dict):
+            return _telemetry_failure_payload("telemetry_missing_snapshot", collected_at=collected_at)
+        return telemetry
+
+
 @dataclass(frozen=True, slots=True)
 class MissionRecord:
     mission_id: str
@@ -608,7 +783,33 @@ class HoverTestSkillConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class LocalInspectSkillConfig:
+    height_m: float = _DEFAULT_LOCAL_INSPECT_HEIGHT_M
+    takeoff_velocity_mps: float = _DEFAULT_HOVER_TEST_VELOCITY_MPS
+    land_velocity_mps: float = _DEFAULT_HOVER_TEST_VELOCITY_MPS
+    translation_velocity_mps: float = _DEFAULT_LOCAL_INSPECT_TRANSLATION_VELOCITY_MPS
+    nominal_translation_m: float = _DEFAULT_LOCAL_INSPECT_NOMINAL_TRANSLATION_M
+    min_translation_m: float = _DEFAULT_LOCAL_INSPECT_MIN_TRANSLATION_M
+    max_translation_m: float = _DEFAULT_LOCAL_INSPECT_MAX_TRANSLATION_M
+    hover_settle_s: float = _DEFAULT_LOCAL_INSPECT_SETTLE_S
+    capture_dwell_s: float = _DEFAULT_LOCAL_INSPECT_CAPTURE_DWELL_S
+    min_vbat_v: float = _DEFAULT_LOCAL_INSPECT_MIN_VBAT_V
+    min_battery_level: int = _DEFAULT_LOCAL_INSPECT_MIN_BATTERY_LEVEL
+    min_clearance_m: float = _DEFAULT_LOCAL_INSPECT_MIN_CLEARANCE_M
+
+
+@dataclass(frozen=True, slots=True)
 class HoverWorkerRunResult:
+    report: dict[str, object]
+    trace_file: str | None
+    trace_events: tuple[dict[str, object], ...]
+    stdout: str
+    stderr: str
+    return_code: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class LocalInspectWorkerRunResult:
     report: dict[str, object]
     trace_file: str | None
     trace_events: tuple[dict[str, object], ...]
@@ -706,24 +907,32 @@ class SnapshotCache(Generic[T]):
 def _mission_started_summary(mission_type: str) -> str:
     if mission_type == "hover_test":
         return "Bounded hover test started."
+    if mission_type == "inspect_local_zone":
+        return "Bounded local inspect mission started."
     return "Stationary inspection started."
 
 
 def _mission_completed_summary(mission_type: str) -> str:
     if mission_type == "hover_test":
         return "Bounded hover test completed and landed."
+    if mission_type == "inspect_local_zone":
+        return "Bounded local inspect mission completed and landed."
     return "Stationary inspection evidence captured."
 
 
 def _mission_failure_prefix(mission_type: str) -> str:
     if mission_type == "hover_test":
         return "Hover test failed"
+    if mission_type == "inspect_local_zone":
+        return "Local inspect mission failed"
     return "Inspection failed"
 
 
 def _manual_arm_summary(mission_type: str) -> str:
     if mission_type == "hover_test":
         return "Mission armed locally and queued for bounded hover test."
+    if mission_type == "inspect_local_zone":
+        return "Mission armed locally and queued for bounded local inspect."
     return "Mission armed locally and queued for bounded inspection."
 
 
@@ -789,6 +998,7 @@ class DroneDaemonService:
         env_file: Path | None,
         pose_provider: PoseProvider,
         radio_provider: BitcrazeRadioStatusProvider,
+        telemetry_provider: BitcrazeTelemetrySnapshotProvider | None = None,
         skill_layer_mode: str = "stationary_observe_only",
         manual_arm_required: bool = True,
         allow_remote_ops: bool = False,
@@ -796,8 +1006,10 @@ class DroneDaemonService:
         api_key: str | None = None,
         multiranger_timeout_s: float = _DEFAULT_MULTIRANGER_TIMEOUT_S,
         hover_test_config: HoverTestSkillConfig | None = None,
+        local_inspect_config: LocalInspectSkillConfig | None = None,
         pose_cache_ttl_s: float = _DEFAULT_POSE_CACHE_TTL_S,
         radio_cache_ttl_s: float = _DEFAULT_RADIO_CACHE_TTL_S,
+        telemetry_cache_ttl_s: float = _DEFAULT_TELEMETRY_CACHE_TTL_S,
         max_pose_age_s: float = _DEFAULT_MAX_POSE_AGE_S,
         min_pose_confidence: float = _DEFAULT_MIN_POSE_CONFIDENCE,
         max_outstanding_missions: int = _DEFAULT_MAX_OUTSTANDING_MISSIONS,
@@ -810,6 +1022,7 @@ class DroneDaemonService:
         self.env_file = env_file
         self.pose_provider = pose_provider
         self.radio_provider = radio_provider
+        self.telemetry_provider = telemetry_provider
         self.skill_layer_mode = str(skill_layer_mode or "stationary_observe_only").strip() or "stationary_observe_only"
         self.manual_arm_required = bool(manual_arm_required)
         self.allow_remote_ops = bool(allow_remote_ops)
@@ -821,6 +1034,7 @@ class DroneDaemonService:
             minimum=1.0,
         )
         self.hover_test_config = hover_test_config or HoverTestSkillConfig()
+        self.local_inspect_config = local_inspect_config or LocalInspectSkillConfig()
         self.max_pose_age_s = _safe_float(max_pose_age_s, default=_DEFAULT_MAX_POSE_AGE_S, minimum=0.1)
         self.min_pose_confidence = _safe_float(
             min_pose_confidence,
@@ -862,6 +1076,24 @@ class DroneDaemonService:
             loader=self.radio_provider.snapshot,
             ttl_s=radio_cache_ttl_s,
         )
+        if self.telemetry_provider is None:
+            workspace = getattr(self.radio_provider, "workspace", None)
+            bitcraze_python = getattr(self.radio_provider, "bitcraze_python", None)
+            if isinstance(workspace, Path) and isinstance(bitcraze_python, Path):
+                self.telemetry_provider = BitcrazeTelemetrySnapshotProvider(
+                    repo_root=resolved_repo_root,
+                    workspace=workspace,
+                    bitcraze_python=bitcraze_python,
+                )
+        self._telemetry_cache: SnapshotCache[dict[str, object]] | None
+        if self.telemetry_provider is None:
+            self._telemetry_cache = None
+        else:
+            self._telemetry_cache = SnapshotCache(
+                name="telemetry",
+                loader=self.telemetry_provider.snapshot,
+                ttl_s=telemetry_cache_ttl_s,
+            )
 
     def start(self) -> None:
         with self._cond:
@@ -935,13 +1167,21 @@ class DroneDaemonService:
         _structured_log("daemon_stopped")
 
     def _hover_test_enabled(self) -> bool:
-        return self.skill_layer_mode in _HOVER_TEST_ENABLED_SKILL_MODES
+        return self.skill_layer_mode in _LOCAL_FLIGHT_ENABLED_SKILL_MODES
+
+    def _local_inspect_enabled(self) -> bool:
+        return self.skill_layer_mode in _LOCAL_FLIGHT_ENABLED_SKILL_MODES
 
     def _sync_pose_snapshot(self, *, force_refresh: bool) -> TimedSnapshot[PoseSnapshot]:
         return self._pose_cache.get(force_refresh=force_refresh)
 
     def _sync_radio_snapshot(self, *, force_refresh: bool) -> TimedSnapshot[dict[str, object]]:
         return self._radio_cache.get(force_refresh=force_refresh)
+
+    def _sync_telemetry_snapshot(self, *, force_refresh: bool) -> TimedSnapshot[dict[str, object]] | None:
+        if self._telemetry_cache is None:
+            return None
+        return self._telemetry_cache.get(force_refresh=force_refresh)
 
     def _evaluate_safety(
         self,
@@ -1001,6 +1241,7 @@ class DroneDaemonService:
     def health_payload(self) -> dict[str, object]:
         state = self.state_payload()
         safety = _payload_dict(state.get("safety"))
+        telemetry = _payload_dict(state.get("telemetry"))
         return {
             "ok": self._lifecycle_state == "active",
             "service": "drone_daemon",
@@ -1010,6 +1251,7 @@ class DroneDaemonService:
             "radio_ready": bool(safety.get("radio_ready")),
             "pose_ready": bool(safety.get("pose_ready")),
             "can_arm": bool(safety.get("can_arm")),
+            "telemetry_healthy": bool(telemetry.get("healthy")),
             "active_mission_id": state.get("active_mission_id"),
             "queue_depth": state.get("queue_depth"),
             "accepting_new_missions": state.get("accepting_new_missions"),
@@ -1021,6 +1263,7 @@ class DroneDaemonService:
 
     def state_payload(self) -> dict[str, object]:
         _radio_snapshot, pose_snapshot, safety = self._evaluate_safety(force_refresh=False)
+        telemetry_snapshot = self._sync_telemetry_snapshot(force_refresh=False)
         with self._lock:
             active_mission_id = self._active_mission_id
             queue_depth = sum(
@@ -1046,6 +1289,11 @@ class DroneDaemonService:
             "accepting_new_missions": accepting_new_missions,
             "pose": pose_snapshot.value.to_payload(),
             "safety": safety.to_payload(),
+            "telemetry": (
+                telemetry_snapshot.value
+                if telemetry_snapshot is not None
+                else _telemetry_failure_payload("telemetry_provider_unconfigured", collected_at=_utc_now_iso())
+            ),
         }
 
     def _assert_accepting_new_missions(self) -> None:
@@ -1218,7 +1466,29 @@ class DroneDaemonService:
                 max_duration_s=min(max_duration_s, 60.0),
                 return_policy=return_policy,
             )
-        raise InputError("mission_type must currently be `inspect` or `hover_test`.")
+        if mission_type == "inspect_local_zone":
+            if not self._local_inspect_enabled():
+                raise ConflictError(
+                    "inspect_local_zone missions require the daemon to run in one of the bounded local-flight skill modes."
+                )
+            target_hint = str(payload.get("target_hint") or "local inspect zone").strip() or "local inspect zone"
+            capture_intent = str(payload.get("capture_intent") or "scene").strip().lower() or "scene"
+            if capture_intent not in {"scene", "object_check", "look_closer"}:
+                raise InputError("capture_intent must be one of: scene, object_check, look_closer.")
+            return_policy = str(payload.get("return_policy") or "return_and_land").strip().lower() or "return_and_land"
+            if return_policy not in {"return_and_land"}:
+                raise InputError("return_policy must currently be `return_and_land`.")
+            max_duration_s = _safe_float(payload.get("max_duration_s"), default=35.0, minimum=15.0)
+            return ValidatedMissionRequest(
+                mission_type=mission_type,
+                target_hint=target_hint,
+                capture_intent=capture_intent,
+                max_duration_s=min(max_duration_s, 90.0),
+                return_policy=return_policy,
+            )
+        raise InputError(
+            "mission_type must currently be `inspect`, `hover_test`, or `inspect_local_zone`."
+        )
 
     def _with_queue_position_locked(self, mission: MissionRecord) -> MissionRecord:
         if mission.state != "queued":
@@ -1351,6 +1621,13 @@ class DroneDaemonService:
                 artifact_name = self._run_hover_test_mission(mission)
                 if self._is_cancel_requested(mission.mission_id):
                     raise MissionCancelled("Mission cancelled during bounded hover test.", artifact_name=artifact_name)
+            elif mission.mission_type == "inspect_local_zone":
+                artifact_name = self._run_local_inspect_mission(mission)
+                if self._is_cancel_requested(mission.mission_id):
+                    raise MissionCancelled(
+                        "Mission cancelled during bounded local inspect.",
+                        artifact_name=artifact_name,
+                    )
             else:
                 artifact_name = self._run_stationary_inspection_mission(mission)
                 if self._is_cancel_requested(mission.mission_id):
@@ -1879,6 +2156,279 @@ class DroneDaemonService:
         normalized_error = (stderr or "").strip() or (stdout or "").strip() or "hover_test_worker_no_output"
         return {"report": None, "failures": [normalized_error]}
 
+    def _run_local_inspect_mission(self, mission: MissionRecord) -> str:
+        self._artifact_root.mkdir(parents=True, exist_ok=True)
+        _safe_dir_permissions(self._artifact_root)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        worker_result = self._run_local_inspect_worker(mission, stamp=stamp)
+        artifact_payload = {
+            "mission": mission.to_payload(),
+            "completed_at": _utc_now_iso(),
+            "summary": "Bounded local inspect mission completed and landed.",
+            "local_inspect": worker_result.report,
+            "local_inspect_worker_diagnostics": {
+                "trace_file": worker_result.trace_file,
+                "trace_events": list(worker_result.trace_events),
+                "trace_event_count": len(worker_result.trace_events),
+                "last_trace_phase": (
+                    str(worker_result.trace_events[-1].get("phase")) if worker_result.trace_events else None
+                ),
+                "last_trace_status": (
+                    str(worker_result.trace_events[-1].get("status")) if worker_result.trace_events else None
+                ),
+                "return_code": worker_result.return_code,
+                "stdout_tail": _tail_text(worker_result.stdout),
+                "stderr_tail": _tail_text(worker_result.stderr),
+            },
+        }
+        report_name = f"{mission.mission_id.lower()}-{stamp}.json"
+        _atomic_write_json(self._artifact_root / report_name, artifact_payload)
+        return report_name
+
+    def _persist_local_inspect_worker_partial_artifact(
+        self,
+        mission: MissionRecord,
+        *,
+        stamp: str,
+        summary: str,
+        command: list[str],
+        trace_path: Path,
+        stdout: str,
+        stderr: str,
+        return_code: int | None,
+        parsed_payload: dict[str, object],
+        cancellation_requested: bool,
+        deadline_exceeded: bool,
+    ) -> str:
+        trace_events = self._read_hover_worker_trace(trace_path)
+        artifact_payload = {
+            "mission": mission.to_payload(),
+            "completed_at": _utc_now_iso(),
+            "summary": summary,
+            "partial": True,
+            "local_inspect": parsed_payload.get("report") if isinstance(parsed_payload.get("report"), dict) else None,
+            "local_inspect_worker_diagnostics": {
+                "command": command,
+                "trace_file": trace_path.name,
+                "trace_events": list(trace_events),
+                "trace_event_count": len(trace_events),
+                "last_trace_phase": str(trace_events[-1].get("phase")) if trace_events else None,
+                "last_trace_status": str(trace_events[-1].get("status")) if trace_events else None,
+                "return_code": return_code,
+                "cancellation_requested": cancellation_requested,
+                "deadline_exceeded": deadline_exceeded,
+                "stdout_tail": _tail_text(stdout),
+                "stderr_tail": _tail_text(stderr),
+                "failures": parsed_payload.get("failures") if isinstance(parsed_payload.get("failures"), list) else [],
+            },
+        }
+        report_name = f"{mission.mission_id.lower()}-{stamp}.partial.json"
+        _atomic_write_json(self._artifact_root / report_name, artifact_payload)
+        return report_name
+
+    def _run_local_inspect_worker(
+        self,
+        mission: MissionRecord,
+        *,
+        stamp: str,
+    ) -> LocalInspectWorkerRunResult:
+        worker_python = _normalize_executable_path(Path(sys.executable))
+        script_path = self.repo_root / "hardware" / "bitcraze" / "run_local_inspect_mission.py"
+        if not worker_python.exists():
+            raise RuntimeError(f"local_inspect_worker_missing_python:{worker_python}")
+        if not script_path.exists():
+            raise RuntimeError(f"local_inspect_worker_missing_script:{script_path}")
+
+        trace_path = self._artifact_root / f"{mission.mission_id.lower()}-{stamp}.inspect-trace.jsonl"
+        image_name = f"{mission.mission_id.lower()}-{stamp}.png"
+        command = [
+            str(worker_python),
+            str(script_path),
+            "--repo-root",
+            str(self.repo_root),
+            "--workspace",
+            str(self.radio_provider.workspace),
+            "--bitcraze-python",
+            str(self.radio_provider.bitcraze_python),
+            "--artifact-root",
+            str(self._artifact_root),
+            "--image-name",
+            image_name,
+            "--target-hint",
+            mission.target_hint,
+            "--capture-intent",
+            mission.capture_intent,
+            "--height-m",
+            f"{self.local_inspect_config.height_m:.3f}",
+            "--takeoff-velocity-mps",
+            f"{self.local_inspect_config.takeoff_velocity_mps:.3f}",
+            "--land-velocity-mps",
+            f"{self.local_inspect_config.land_velocity_mps:.3f}",
+            "--translation-velocity-mps",
+            f"{self.local_inspect_config.translation_velocity_mps:.3f}",
+            "--nominal-translation-m",
+            f"{self.local_inspect_config.nominal_translation_m:.3f}",
+            "--min-translation-m",
+            f"{self.local_inspect_config.min_translation_m:.3f}",
+            "--max-translation-m",
+            f"{self.local_inspect_config.max_translation_m:.3f}",
+            "--hover-settle-s",
+            f"{self.local_inspect_config.hover_settle_s:.3f}",
+            "--capture-dwell-s",
+            f"{self.local_inspect_config.capture_dwell_s:.3f}",
+            "--min-vbat-v",
+            f"{self.local_inspect_config.min_vbat_v:.3f}",
+            "--min-battery-level",
+            str(self.local_inspect_config.min_battery_level),
+            "--min-clearance-m",
+            f"{self.local_inspect_config.min_clearance_m:.3f}",
+            "--trace-file",
+            str(trace_path),
+            "--json",
+        ]
+        if self.env_file is not None:
+            command.extend(["--env-file", str(self.env_file)])
+
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            start_new_session=True,
+        )
+        with self._lock:
+            self._active_process = process
+            self._active_process_kind = "inspect_local_zone"
+
+        stdout_chunks, stdout_collector = _start_process_stream_collector(
+            process.stdout,
+            name="local-inspect-worker-stdout",
+        )
+        stderr_chunks, stderr_collector = _start_process_stream_collector(
+            process.stderr,
+            name="local-inspect-worker-stderr",
+        )
+
+        cancellation_requested = False
+        deadline_exceeded = False
+        cancel_summary: str | None = None
+        return_code: int | None = None
+        deadline = time.monotonic() + max(5.0, mission.max_duration_s)
+
+        while True:
+            try:
+                return_code = process.wait(timeout=0.1)
+                break
+            except subprocess.TimeoutExpired:
+                if self._is_cancel_requested(mission.mission_id):
+                    cancellation_requested = True
+                    _interrupt_subprocess(process)
+                    cancel_summary = "Local inspect mission cancelled. Landing requested."
+                    break
+                if time.monotonic() > deadline:
+                    cancellation_requested = True
+                    deadline_exceeded = True
+                    _interrupt_subprocess(process)
+                    cancel_summary = "Local inspect mission exceeded its bounded runtime. Landing requested."
+                    break
+
+        stdout = _finish_process_stream_collector(stdout_chunks, stdout_collector)
+        stderr = _finish_process_stream_collector(stderr_chunks, stderr_collector)
+        return_code = int(process.returncode) if process.returncode is not None else return_code
+        payload = self._parse_local_inspect_worker_payload(stdout=stdout, stderr=stderr)
+        trace_events = self._read_hover_worker_trace(trace_path)
+        report = payload.get("report")
+
+        if cancel_summary is not None:
+            artifact_name = self._persist_local_inspect_worker_partial_artifact(
+                mission,
+                stamp=stamp,
+                summary=cancel_summary,
+                command=command,
+                trace_path=trace_path,
+                stdout=stdout,
+                stderr=stderr,
+                return_code=return_code,
+                parsed_payload=payload,
+                cancellation_requested=cancellation_requested,
+                deadline_exceeded=deadline_exceeded,
+            )
+            raise MissionCancelled(cancel_summary, artifact_name=artifact_name)
+
+        if return_code == 130:
+            summary = "Local inspect mission interrupted. Landing requested."
+            artifact_name = self._persist_local_inspect_worker_partial_artifact(
+                mission,
+                stamp=stamp,
+                summary=summary,
+                command=command,
+                trace_path=trace_path,
+                stdout=stdout,
+                stderr=stderr,
+                return_code=return_code,
+                parsed_payload=payload,
+                cancellation_requested=True,
+                deadline_exceeded=False,
+            )
+            raise MissionCancelled(summary, artifact_name=artifact_name)
+
+        if return_code != 0:
+            failures = payload.get("failures")
+            if isinstance(failures, list) and failures:
+                summary = "; ".join(str(item) for item in failures if str(item).strip())
+            else:
+                summary = (stderr or stdout).strip() or f"local_inspect_worker_failed:{return_code}"
+            artifact_name = self._persist_local_inspect_worker_partial_artifact(
+                mission,
+                stamp=stamp,
+                summary=summary,
+                command=command,
+                trace_path=trace_path,
+                stdout=stdout,
+                stderr=stderr,
+                return_code=return_code,
+                parsed_payload=payload,
+                cancellation_requested=False,
+                deadline_exceeded=False,
+            )
+            raise MissionExecutionError(summary, artifact_name=artifact_name)
+
+        if not isinstance(report, dict):
+            summary = "local_inspect_worker_missing_report"
+            artifact_name = self._persist_local_inspect_worker_partial_artifact(
+                mission,
+                stamp=stamp,
+                summary=summary,
+                command=command,
+                trace_path=trace_path,
+                stdout=stdout,
+                stderr=stderr,
+                return_code=return_code,
+                parsed_payload=payload,
+                cancellation_requested=False,
+                deadline_exceeded=False,
+            )
+            raise MissionExecutionError(summary, artifact_name=artifact_name)
+
+        return LocalInspectWorkerRunResult(
+            report=report,
+            trace_file=trace_path.name,
+            trace_events=trace_events,
+            stdout=stdout,
+            stderr=stderr,
+            return_code=return_code,
+        )
+
+    @staticmethod
+    def _parse_local_inspect_worker_payload(*, stdout: str, stderr: str) -> dict[str, object]:
+        payload = _extract_last_json_object(stdout)
+        if payload is not None:
+            return payload
+        normalized_error = (stderr or "").strip() or (stdout or "").strip() or "local_inspect_worker_no_output"
+        return {"report": None, "failures": [normalized_error]}
+
     def _capture_multiranger_payload(self) -> dict[str, object] | None:
         return _capture_multiranger_payload_static(
             repo_root=self.repo_root,
@@ -1891,7 +2441,7 @@ class DroneDaemonService:
 class MissionCreateRequestModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
 
-    mission_type: Literal["inspect", "hover_test"]
+    mission_type: Literal["inspect", "hover_test", "inspect_local_zone"]
     target_hint: str | None = None
     capture_intent: Literal["scene", "object_check", "look_closer"] | None = None
     max_duration_s: float | None = None
@@ -2015,9 +2565,9 @@ class BodySizeLimitMiddleware:
 
     async def __call__(
         self,
-        scope: dict[str, object],
-        receive: Callable[[], Any],
-        send: Callable[[dict[str, object]], Any],
+        scope: Scope,
+        receive: Receive,
+        send: Send,
     ) -> None:
         if scope.get("type") != "http":
             await self.app(scope, receive, send)
@@ -2028,7 +2578,10 @@ class BodySizeLimitMiddleware:
             await self.app(scope, receive, send)
             return
 
-        headers = {bytes(k).lower(): bytes(v) for k, v in scope.get("headers", [])}
+        headers = {
+            bytes(key).lower(): bytes(value)
+            for key, value in cast(list[tuple[bytes, bytes]], scope.get("headers", []))
+        }
         raw_length = headers.get(b"content-length")
         if raw_length is not None:
             try:
@@ -2056,7 +2609,7 @@ class BodySizeLimitMiddleware:
 
         seen = 0
 
-        async def limited_receive() -> dict[str, object]:
+        async def limited_receive() -> Message:
             nonlocal seen
             message = await receive()
             if message.get("type") == "http.request":
@@ -2474,7 +3027,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--skill-layer-mode",
         default="stationary_observe_only",
-        help="Reported skill-layer mode; use `stationary_observe_only` by default or `bounded_hover_test_only` to allow hover-test missions.",
+        help=(
+            "Reported skill-layer mode; use `stationary_observe_only` by default or one of "
+            "`bounded_hover_test_only`, `bounded_test_primitives_only`, `bounded_local_navigation_only`, "
+            "or `bounded_autonomous_inspect_only` to allow bounded flight missions."
+        ),
     )
     parser.add_argument(
         "--allow-remote-reads",
@@ -2546,6 +3103,78 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=_DEFAULT_HOVER_TEST_MIN_BATTERY_LEVEL,
         help="Minimum battery percentage gate for hover-test missions.",
+    )
+    parser.add_argument(
+        "--local-inspect-height-m",
+        type=float,
+        default=_DEFAULT_LOCAL_INSPECT_HEIGHT_M,
+        help="Hover height in meters for bounded local inspect missions.",
+    )
+    parser.add_argument(
+        "--local-inspect-takeoff-velocity-mps",
+        type=float,
+        default=_DEFAULT_HOVER_TEST_VELOCITY_MPS,
+        help="Takeoff velocity for bounded local inspect missions.",
+    )
+    parser.add_argument(
+        "--local-inspect-land-velocity-mps",
+        type=float,
+        default=_DEFAULT_HOVER_TEST_VELOCITY_MPS,
+        help="Landing velocity for bounded local inspect missions.",
+    )
+    parser.add_argument(
+        "--local-inspect-translation-velocity-mps",
+        type=float,
+        default=_DEFAULT_LOCAL_INSPECT_TRANSLATION_VELOCITY_MPS,
+        help="Horizontal translation velocity for bounded local inspect missions.",
+    )
+    parser.add_argument(
+        "--local-inspect-nominal-translation-m",
+        type=float,
+        default=_DEFAULT_LOCAL_INSPECT_NOMINAL_TRANSLATION_M,
+        help="Preferred translation distance for bounded local inspect missions.",
+    )
+    parser.add_argument(
+        "--local-inspect-min-translation-m",
+        type=float,
+        default=_DEFAULT_LOCAL_INSPECT_MIN_TRANSLATION_M,
+        help="Minimum accepted translation distance for bounded local inspect missions.",
+    )
+    parser.add_argument(
+        "--local-inspect-max-translation-m",
+        type=float,
+        default=_DEFAULT_LOCAL_INSPECT_MAX_TRANSLATION_M,
+        help="Maximum translation distance for bounded local inspect missions.",
+    )
+    parser.add_argument(
+        "--local-inspect-hover-settle-s",
+        type=float,
+        default=_DEFAULT_LOCAL_INSPECT_SETTLE_S,
+        help="Hover settle time after takeoff or translation for bounded local inspect missions.",
+    )
+    parser.add_argument(
+        "--local-inspect-capture-dwell-s",
+        type=float,
+        default=_DEFAULT_LOCAL_INSPECT_CAPTURE_DWELL_S,
+        help="Hover dwell time immediately before still capture for bounded local inspect missions.",
+    )
+    parser.add_argument(
+        "--local-inspect-min-vbat-v",
+        type=float,
+        default=_DEFAULT_LOCAL_INSPECT_MIN_VBAT_V,
+        help="Minimum battery voltage gate for bounded local inspect missions.",
+    )
+    parser.add_argument(
+        "--local-inspect-min-battery-level",
+        type=int,
+        default=_DEFAULT_LOCAL_INSPECT_MIN_BATTERY_LEVEL,
+        help="Minimum battery percentage gate for bounded local inspect missions.",
+    )
+    parser.add_argument(
+        "--local-inspect-min-clearance-m",
+        type=float,
+        default=_DEFAULT_LOCAL_INSPECT_MIN_CLEARANCE_M,
+        help="Required post-move clearance contract for bounded local inspect missions.",
     )
     parser.add_argument(
         "--max-outstanding-missions",
@@ -2670,6 +3299,69 @@ def main() -> int:
                 default=_DEFAULT_HOVER_TEST_MIN_BATTERY_LEVEL,
                 minimum=0,
                 maximum=100,
+            ),
+        ),
+        local_inspect_config=LocalInspectSkillConfig(
+            height_m=_safe_float(
+                args.local_inspect_height_m,
+                default=_DEFAULT_LOCAL_INSPECT_HEIGHT_M,
+                minimum=0.1,
+            ),
+            takeoff_velocity_mps=_safe_float(
+                args.local_inspect_takeoff_velocity_mps,
+                default=_DEFAULT_HOVER_TEST_VELOCITY_MPS,
+                minimum=0.05,
+            ),
+            land_velocity_mps=_safe_float(
+                args.local_inspect_land_velocity_mps,
+                default=_DEFAULT_HOVER_TEST_VELOCITY_MPS,
+                minimum=0.05,
+            ),
+            translation_velocity_mps=_safe_float(
+                args.local_inspect_translation_velocity_mps,
+                default=_DEFAULT_LOCAL_INSPECT_TRANSLATION_VELOCITY_MPS,
+                minimum=0.05,
+            ),
+            nominal_translation_m=_safe_float(
+                args.local_inspect_nominal_translation_m,
+                default=_DEFAULT_LOCAL_INSPECT_NOMINAL_TRANSLATION_M,
+                minimum=0.05,
+            ),
+            min_translation_m=_safe_float(
+                args.local_inspect_min_translation_m,
+                default=_DEFAULT_LOCAL_INSPECT_MIN_TRANSLATION_M,
+                minimum=0.05,
+            ),
+            max_translation_m=_safe_float(
+                args.local_inspect_max_translation_m,
+                default=_DEFAULT_LOCAL_INSPECT_MAX_TRANSLATION_M,
+                minimum=0.05,
+            ),
+            hover_settle_s=_safe_float(
+                args.local_inspect_hover_settle_s,
+                default=_DEFAULT_LOCAL_INSPECT_SETTLE_S,
+                minimum=0.0,
+            ),
+            capture_dwell_s=_safe_float(
+                args.local_inspect_capture_dwell_s,
+                default=_DEFAULT_LOCAL_INSPECT_CAPTURE_DWELL_S,
+                minimum=0.0,
+            ),
+            min_vbat_v=_safe_float(
+                args.local_inspect_min_vbat_v,
+                default=_DEFAULT_LOCAL_INSPECT_MIN_VBAT_V,
+                minimum=0.0,
+            ),
+            min_battery_level=_safe_int(
+                args.local_inspect_min_battery_level,
+                default=_DEFAULT_LOCAL_INSPECT_MIN_BATTERY_LEVEL,
+                minimum=0,
+                maximum=100,
+            ),
+            min_clearance_m=_safe_float(
+                args.local_inspect_min_clearance_m,
+                default=_DEFAULT_LOCAL_INSPECT_MIN_CLEARANCE_M,
+                minimum=0.0,
             ),
         ),
         pose_cache_ttl_s=_safe_float(

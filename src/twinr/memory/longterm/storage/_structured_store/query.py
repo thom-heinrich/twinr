@@ -9,6 +9,8 @@ from twinr.memory.fulltext import FullTextDocument, FullTextSelector
 from twinr.memory.longterm.core.models import LongTermMemoryConflictV1, LongTermMemoryObjectV1, LongTermMemoryReviewItemV1
 from twinr.memory.longterm.reasoning.conversation_recall import (
     conversation_episode_recall_hints,
+    conversation_recap_query_variants,
+    conversation_recap_specific_terms,
     is_conversation_episode_object,
     query_has_conversation_recap_semantics,
 )
@@ -27,6 +29,12 @@ from .shared import (
 
 class StructuredStoreQueryMixin:
     """Own shared parsing, merge, ranking, and query-overlap helpers."""
+
+    def _candidate_window_limit(self, *, limit: int, minimum: int = 12) -> int:
+        """Return a bounded pre-ranking candidate window for noisy mixed corpora."""
+
+        bounded_limit = max(1, int(limit))
+        return max(int(minimum), bounded_limit * 4)
 
     def _load_memory_objects_from_payload(
         self,
@@ -260,10 +268,13 @@ class StructuredStoreQueryMixin:
         return tuple(item for _index, item in ranked[:bounded_limit])
 
     def _object_search_text(self, item: LongTermMemoryObjectV1) -> str:
+        episode_text = self._episode_search_text(item)
+        pattern_aliases = self._pattern_search_text(item)
         parts = [
             item.kind,
             item.summary,
-            item.details or "",
+            episode_text or (item.details or ""),
+            pattern_aliases,
             f"status {item.status}",
             self._object_state_search_text(item),
         ]
@@ -284,6 +295,77 @@ class StructuredStoreQueryMixin:
             )
         )
         return _normalize_text(" ".join(part for part in parts if part))
+
+    def _episode_search_text(self, item: LongTermMemoryObjectV1) -> str:
+        """Return one content-bearing retrieval text for true conversation episodes."""
+
+        attributes = item.attributes if isinstance(item.attributes, Mapping) else None
+        if not is_conversation_episode_object(kind=item.kind, attributes=attributes):
+            return ""
+        parts: list[str] = []
+        if isinstance(item.summary, str):
+            parts.append(item.summary)
+        if isinstance(attributes, Mapping):
+            for key in ("raw_transcript", "raw_response", "topic", "subject"):
+                value = attributes.get(key)
+                if isinstance(value, str):
+                    parts.append(value)
+        if not parts and isinstance(item.details, str):
+            parts.append(item.details)
+        return _normalize_text(" ".join(part for part in parts if part))
+
+    def _pattern_search_text(self, item: LongTermMemoryObjectV1) -> str:
+        """Return bounded implicit aliases for device-local multimodal patterns."""
+
+        attributes = item.attributes if isinstance(item.attributes, Mapping) else None
+        if not isinstance(attributes, Mapping):
+            return ""
+        kind = _normalize_text(item.kind).lower()
+        pattern_type = _normalize_text(attributes.get("pattern_type")).lower()
+        memory_domain = _normalize_text(attributes.get("memory_domain")).lower()
+        routine_type = _normalize_text(attributes.get("routine_type")).lower()
+        interaction_type = _normalize_text(attributes.get("interaction_type")).lower()
+        button = _normalize_text(attributes.get("button_label") or attributes.get("button")).lower()
+        action = _normalize_text(attributes.get("action")).lower()
+        request_source = _normalize_text(
+            attributes.get("request_source_label") or attributes.get("request_source")
+        ).lower()
+        purpose = _normalize_text(attributes.get("purpose_label") or attributes.get("purpose")).lower()
+        daypart = _normalize_text(attributes.get("daypart")).lower()
+        if kind not in {"pattern", "summary"} and not pattern_type and not interaction_type and not routine_type:
+            return ""
+
+        aliases: list[str] = []
+        if pattern_type or interaction_type or memory_domain in {"interaction", "sensor_routine"}:
+            aliases.extend(("twinr", "device"))
+        if pattern_type == "presence":
+            aliases.extend(("presence near twinr", "near twinr", "near the device"))
+        if button:
+            aliases.extend((button, f"{button} button"))
+        if action == "start_listening" or interaction_type in {"conversation_start", "conversation_start_audio"}:
+            aliases.extend(("start conversation", "start a conversation", "conversation with twinr"))
+        if action == "print_request" or interaction_type == "print":
+            aliases.extend(("print request", "printed answer", "printed twinr output"))
+        if interaction_type in {"camera_use", "camera_showing"}:
+            aliases.extend(("camera", "camera use", "camera interaction"))
+        if request_source:
+            aliases.append(request_source)
+        if purpose:
+            aliases.extend((purpose, purpose.replace("_", " ")))
+        if memory_domain == "sensor_routine":
+            aliases.extend(("routine", "usual routine", "typical routine"))
+            if routine_type == "presence":
+                aliases.extend(("usually near the device", "usual presence near twinr"))
+            if interaction_type == "conversation_start":
+                aliases.extend(("usually start a conversation", "habitual conversation start"))
+            if interaction_type == "print":
+                aliases.extend(("usually print answers", "habitual printing"))
+            if interaction_type in {"camera_use", "camera_showing"}:
+                aliases.extend(("usually use the camera", "habitual camera interaction"))
+        if daypart:
+            aliases.append(daypart)
+        deduped = tuple(dict.fromkeys(alias for alias in aliases if alias))
+        return _normalize_text(" ".join(deduped))
 
     def _object_state_search_text(self, item: LongTermMemoryObjectV1) -> str:
         parts = [item.status]
@@ -398,6 +480,75 @@ class StructuredStoreQueryMixin:
         object_terms = set(retrieval_terms(self._object_search_text(item)))
         return len(match_terms.intersection(object_terms))
 
+    def _object_focus_attribute_search_text(self, item: LongTermMemoryObjectV1) -> str:
+        """Return query-relevant structured labels that signal object specificity."""
+
+        attributes = item.attributes if isinstance(item.attributes, Mapping) else None
+        parts: list[str] = []
+        if isinstance(attributes, Mapping):
+            for key in (
+                "memory_domain",
+                "routine_type",
+                "interaction_type",
+                "pattern_type",
+                "button",
+                "button_label",
+                "action",
+                "action_label",
+                "request_source",
+                "request_source_label",
+                "purpose",
+                "purpose_label",
+                "daypart",
+            ):
+                value = attributes.get(key)
+                if isinstance(value, str):
+                    parts.append(value)
+                    parts.append(value.replace("_", " "))
+        if item.kind in {"pattern", "summary"}:
+            parts.append(item.memory_id.replace(":", " ").replace("_", " "))
+        return _normalize_text(" ".join(part for part in parts if part))
+
+    def _object_focus_overlap_score(
+        self,
+        *,
+        item: LongTermMemoryObjectV1,
+        query_terms: set[str],
+    ) -> int:
+        """Return overlap against structured multimodal attributes."""
+
+        match_terms = self._query_match_terms(query_terms)
+        if not match_terms:
+            return 0
+        focus_terms = set(retrieval_terms(self._object_focus_attribute_search_text(item)))
+        if not focus_terms:
+            return 0
+        return len(match_terms.intersection(focus_terms))
+
+    def _object_specificity_priority(self, item: LongTermMemoryObjectV1) -> int:
+        """Prefer concrete multimodal patterns over generic aggregated routines."""
+
+        attributes = item.attributes if isinstance(item.attributes, Mapping) else None
+        if not isinstance(attributes, Mapping):
+            return 0
+        memory_domain = _normalize_text(attributes.get("memory_domain")).lower()
+        if memory_domain == "sensor_routine":
+            return 0
+        if item.kind not in {"pattern", "summary"}:
+            return 0
+        for key in (
+            "pattern_type",
+            "interaction_type",
+            "button",
+            "button_label",
+            "action",
+            "request_source",
+            "purpose",
+        ):
+            if _normalize_text(attributes.get(key)).strip():
+                return 2
+        return 1
+
     def _object_status_priority(self, status: str) -> int:
         if status == "active":
             return 4
@@ -416,15 +567,34 @@ class StructuredStoreQueryMixin:
         query_terms: set[str],
         original_index: int,
     ) -> tuple[object, ...]:
+        focus_overlap = self._object_focus_overlap_score(item=item, query_terms=query_terms)
+        specificity_priority = self._object_specificity_priority(item) if focus_overlap > 0 else 0
         return (
+            focus_overlap,
+            specificity_priority,
             self._object_query_overlap_score(item=item, query_terms=query_terms),
             1 if item.confirmed_by_user else 0,
             self._object_status_priority(item.status),
+            -original_index,
             _coerce_aware_utc(item.updated_at),
             _coerce_aware_utc(item.created_at),
             item.confidence,
-            -original_index,
         )
+
+    def _query_variants_for_loaded_objects(
+        self,
+        *,
+        query_text: str,
+        include_episodes: bool,
+    ) -> tuple[str, ...]:
+        """Return bounded query variants for one in-memory selector pass."""
+
+        clean_query = _normalize_text(query_text)
+        if not clean_query:
+            return ()
+        if include_episodes:
+            return conversation_recap_query_variants(clean_query)
+        return (clean_query,)
 
     def _filter_query_relevant_objects(
         self,
@@ -433,7 +603,7 @@ class StructuredStoreQueryMixin:
         selected: list[LongTermMemoryObjectV1],
         limit: int,
     ) -> tuple[LongTermMemoryObjectV1, ...]:
-        if query_has_conversation_recap_semantics(query_text):
+        if query_has_conversation_recap_semantics(query_text) and not conversation_recap_specific_terms(query_text):
             conversation_matches = [
                 item
                 for item in selected
@@ -491,7 +661,16 @@ class StructuredStoreQueryMixin:
     def _object_semantic_search_text(self, item: LongTermMemoryObjectV1) -> str:
         """Return one retrieval text stripped of synthetic state-only terms."""
 
-        return _normalize_text(" ".join(part for part in (item.summary, item.details or "") if part))
+        episode_text = self._episode_search_text(item)
+        if episode_text:
+            return episode_text
+        return _normalize_text(
+            " ".join(
+                part
+                for part in (item.summary, item.details or "", self._pattern_search_text(item))
+                if part
+            )
+        )
 
     def _filter_query_relevant_conflicts(
         self,

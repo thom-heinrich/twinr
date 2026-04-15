@@ -238,6 +238,11 @@ class RemoteCatalogSearchMixin(RemoteCatalogMixinBase):
                     )
                     break
                 candidate_count = 0
+                payloads_by_item_id = {
+                    item["memory_id"]: dict(item)
+                    for item in selected_payloads
+                    if isinstance(item.get("memory_id"), str) and item["memory_id"]
+                }
                 for candidate in candidates:
                     candidate_count += 1
                     entry = self._candidate_catalog_entry(definition=definition, payload=candidate)
@@ -245,24 +250,68 @@ class RemoteCatalogSearchMixin(RemoteCatalogMixinBase):
                         continue
                     if eligible is not None and not eligible(entry):
                         continue
+                    seen_item_ids.add(entry.item_id)
+                    selected_entries.append(entry)
                     payload = self._extract_item_payload(
                         definition=definition,
                         item_id=entry.item_id,
                         payload=candidate,
                     )
-                    if not isinstance(payload, Mapping):
-                        continue
-                    payload_dict = dict(payload)
-                    self._store_item_payload(
-                        snapshot_kind=snapshot_kind,
-                        item_id=entry.item_id,
-                        payload=payload_dict,
-                    )
-                    selected_payloads.append(payload_dict)
-                    selected_entries.append(entry)
-                    seen_item_ids.add(entry.item_id)
-                    if len(selected_payloads) >= bounded_limit:
+                    if isinstance(payload, Mapping):
+                        payload_dict = dict(payload)
+                        self._store_item_payload(
+                            snapshot_kind=snapshot_kind,
+                            item_id=entry.item_id,
+                            payload=payload_dict,
+                        )
+                        payloads_by_item_id[entry.item_id] = payload_dict
+                    if len(selected_entries) >= bounded_limit:
                         break
+                unresolved_entries = tuple(
+                    entry
+                    for entry in selected_entries
+                    if entry.item_id not in payloads_by_item_id
+                )
+                if unresolved_entries:
+                    hydrated_payloads = _run_timed_workflow_step(
+                        name="longterm_remote_catalog_scope_entry_hydrate",
+                        kind="retrieval",
+                        details={
+                            **_trace_search_details(
+                                snapshot_kind=snapshot_kind,
+                                query_text=clean_query,
+                                result_limit=bounded_limit,
+                                candidate_limit=request_limit,
+                                scope_ref=scope_ref,
+                                namespace=namespace,
+                            ),
+                            "entry_count": len(unresolved_entries),
+                        },
+                        operation=lambda: self._load_selection_item_payloads_from_entries(
+                            snapshot_kind=snapshot_kind,
+                            entries=unresolved_entries,
+                        ),
+                    )
+                    for entry, hydrated_payload in zip(unresolved_entries, hydrated_payloads, strict=False):
+                        if not isinstance(hydrated_payload, Mapping):
+                            continue
+                        payload_dict = dict(hydrated_payload)
+                        self._store_item_payload(
+                            snapshot_kind=snapshot_kind,
+                            item_id=entry.item_id,
+                            payload=payload_dict,
+                        )
+                        payloads_by_item_id[entry.item_id] = payload_dict
+                selected_payloads = [
+                    dict(payloads_by_item_id[entry.item_id])
+                    for entry in selected_entries
+                    if entry.item_id in payloads_by_item_id
+                ]
+                selected_entries = [
+                    entry
+                    for entry in selected_entries
+                    if entry.item_id in payloads_by_item_id
+                ]
                 if len(selected_payloads) >= bounded_limit:
                     break
                 if candidate_count < request_limit or request_limit >= max_request_limit:
@@ -458,9 +507,15 @@ class RemoteCatalogSearchMixin(RemoteCatalogMixinBase):
                 "rescue_trigger": str(failure_details.get("classification") or "unknown"),
             },
         ):
-            payloads = self.load_selection_item_payloads(
+            # Keep required fast-topic rescue on the already-proven current
+            # catalog entries. Re-entering the generic selection loader here can
+            # cold-load the current head again and trigger a second remote
+            # hydration cascade after the authoritative scope read already
+            # failed.
+            payloads = self._load_selection_item_payloads_from_entries(
                 snapshot_kind=snapshot_kind,
-                item_ids=(entry.item_id for entry in selected_entries),
+                entries=tuple(selected_entries),
+                allow_retrieve_fallback=False,
             )
         workflow_event(
             kind="branch",
@@ -739,12 +794,37 @@ class RemoteCatalogSearchMixin(RemoteCatalogMixinBase):
     ) -> tuple[LongTermRemoteCatalogEntry, ...]:
         """Search one loaded catalog locally against the current remote projection."""
 
-        all_entries = self.load_catalog_entries(snapshot_kind=snapshot_kind)
+        include_selection_projection = eligible is not None
+        all_entries = _run_timed_workflow_step(
+            name="longterm_remote_catalog_load_catalog_entries",
+            kind="retrieval",
+            details=_trace_search_details(
+                snapshot_kind=snapshot_kind,
+                query_text=query_text,
+                result_limit=limit,
+            ),
+            operation=lambda: self.load_catalog_entries(
+                snapshot_kind=snapshot_kind,
+                include_selection_projection=include_selection_projection,
+            ),
+        )
         if not all_entries:
             return ()
         entries = tuple(entry for entry in all_entries if eligible is None or eligible(entry))
         if not entries:
             return ()
+        local_fallback_entries: tuple[LongTermRemoteCatalogEntry, ...] | None = all_entries
+
+        def _resolved_local_fallback_entries() -> tuple[LongTermRemoteCatalogEntry, ...]:
+            nonlocal local_fallback_entries
+            if local_fallback_entries is None:
+                local_fallback_entries = self.load_catalog_entries(
+                    snapshot_kind=snapshot_kind,
+                    include_selection_projection=True,
+                    bypass_cache=True,
+                )
+            return local_fallback_entries
+
         result_limit = max(1, int(limit))
         if len(entries) <= result_limit:
             return tuple(entries[:result_limit])
@@ -792,7 +872,7 @@ class RemoteCatalogSearchMixin(RemoteCatalogMixinBase):
         except Exception:
             return self._local_search_catalog_entries(
                 snapshot_kind=snapshot_kind,
-                entries=all_entries,
+                entries=_resolved_local_fallback_entries(),
                 query_text=query_text,
                 limit=result_limit,
                 eligible=eligible,
@@ -800,7 +880,7 @@ class RemoteCatalogSearchMixin(RemoteCatalogMixinBase):
         if not candidates:
             return self._local_search_catalog_entries(
                 snapshot_kind=snapshot_kind,
-                entries=all_entries,
+                entries=_resolved_local_fallback_entries(),
                 query_text=query_text,
                 limit=result_limit,
                 eligible=eligible,
@@ -836,7 +916,7 @@ class RemoteCatalogSearchMixin(RemoteCatalogMixinBase):
         if not selected:
             return self._local_search_catalog_entries(
                 snapshot_kind=snapshot_kind,
-                entries=all_entries,
+                entries=_resolved_local_fallback_entries(),
                 query_text=query_text,
                 limit=result_limit,
                 eligible=eligible,

@@ -1,14 +1,14 @@
 # CHANGELOG: 2026-03-27
 # BUG-1: Avoid remote personality/state reads when closure evaluation is disabled or
 #        follow-up listening is disallowed for the current request source.
-# BUG-2: Preserve steering behavior when the closure evaluator fails by using a
-#        conservative local topic matcher instead of dropping all matched-topic context.
+# BUG-2: Closure and steering failures now surface immediately instead of being
+#        replaced by local substitute decisions.
 # BUG-3: Telemetry side effects are now best-effort so emit/_record_event failures do not
 #        crash the voice runtime after a user-visible answer has already been produced.
 # SEC-1: Telemetry no longer emits raw matched topic titles by default; hashes/counts are
 #        recorded unless config.follow_up_telemetry_include_raw_topics=True.
-# IMP-1: Add a short version-aware steering-cue cache with stale-cache fallback for
-#        low-latency Raspberry-Pi deployments and flaky remote-state backends.
+# IMP-1: Add a short version-aware steering-cue cache for low-latency Raspberry-Pi
+#        deployments without re-reading remote state on every turn.
 # IMP-2: Forward optional structured cue payloads and hybrid conversation signals to
 #        evaluators that can consume richer 2026 turn-taking context.
 
@@ -20,11 +20,11 @@ structured personality layer, passes them into the closure evaluator as
 machine-readable context, and applies the resulting matched topics back onto
 the runtime follow-up decision.
 
-The runtime is intentionally defensive: follow-up orchestration sits on the
-live voice path, so telemetry/export failures must not break the user-facing
-turn. When the model-side closure evaluator is unavailable, Twinr falls back
-to a conservative local topic matcher so strong steering cues such as
-"answer briefly then release" still influence the runtime safely.
+The runtime is intentionally defensive only around telemetry/export side
+effects: follow-up orchestration sits on the live voice path, so diagnostic
+emission must not break a turn after the authoritative decision already
+exists. Steering and closure decisions themselves stay single-lane and fail
+closed when their required path cannot produce an answer.
 """
 
 from __future__ import annotations
@@ -183,15 +183,10 @@ class FollowUpSteeringRuntime:
                 remote_state=self._remote_state(),
             )
         except Exception as exc:
-            if cache is not None and cache.cues:
-                self._safe_emit(
-                    f"conversation_follow_up_steering_cues=stale_cache:{type(exc).__name__}"
-                )
-                return cache.cues
             self._safe_emit(
-                f"conversation_follow_up_steering_cues=fallback:{type(exc).__name__}"
+                f"conversation_follow_up_steering_cues_failed={type(exc).__name__}"
             )
-            return ()
+            raise
 
         normalized_cues = self._normalize_cues(cues)
         ttl_seconds = self._steering_cue_cache_ttl_seconds()
@@ -257,50 +252,29 @@ class FollowUpSteeringRuntime:
                 turn_steering_cues=self.load_turn_steering_cues(allow_remote=False)
             )
 
+        fast_path_evaluation = self._reply_expected_fast_path_evaluation(
+            user_transcript=user_transcript,
+            assistant_response=assistant_response,
+            request_source=request_source,
+            proactive_trigger=proactive_trigger,
+            follow_up_context_hint=follow_up_context_hint,
+            heuristic_assistant_expects_reply=heuristic_assistant_expects_reply,
+        )
+        if fast_path_evaluation is not None:
+            return fast_path_evaluation
+
         steering_cues = self.load_turn_steering_cues(
             force_refresh=force_refresh_steering_cues
         )
-        try:
-            decision = self._evaluate_with_optional_context(
-                evaluator=evaluator,
-                user_transcript=user_transcript,
-                assistant_response=assistant_response,
-                request_source=request_source,
-                proactive_trigger=proactive_trigger,
-                steering_cues=steering_cues,
-                conversation_signals=conversation_signals,
-            )
-        except Exception as exc:
-            fallback_decision = self._build_local_fallback_decision(
-                user_transcript=user_transcript,
-                assistant_response=assistant_response,
-                steering_cues=steering_cues,
-                error_type=type(exc).__name__,
-            )
-            if fallback_decision is not None:
-                self._safe_emit(
-                    f"conversation_closure_local_fallback={type(exc).__name__}"
-                )
-                return ConversationClosureEvaluation(
-                    decision=fallback_decision,
-                    assistant_expects_reply=self._assistant_expects_reply_from_action(
-                        self._coerce_follow_up_action(
-                            getattr(fallback_decision, "follow_up_action", None)
-                        ),
-                        default=heuristic_assistant_expects_reply,
-                    ),
-                    follow_up_action=self._coerce_follow_up_action(
-                        getattr(fallback_decision, "follow_up_action", None)
-                    ),
-                    follow_up_context_hint=follow_up_context_hint,
-                    turn_steering_cues=steering_cues,
-                )
-            return ConversationClosureEvaluation(
-                error_type=type(exc).__name__,
-                assistant_expects_reply=heuristic_assistant_expects_reply,
-                follow_up_context_hint=follow_up_context_hint,
-                turn_steering_cues=steering_cues,
-            )
+        decision = self._evaluate_with_optional_context(
+            evaluator=evaluator,
+            user_transcript=user_transcript,
+            assistant_response=assistant_response,
+            request_source=request_source,
+            proactive_trigger=proactive_trigger,
+            steering_cues=steering_cues,
+            conversation_signals=conversation_signals,
+        )
         follow_up_action = self._coerce_follow_up_action(
             getattr(decision, "follow_up_action", None)
         )
@@ -311,6 +285,51 @@ class FollowUpSteeringRuntime:
                 default=heuristic_assistant_expects_reply,
             ),
             follow_up_action=follow_up_action,
+            follow_up_context_hint=follow_up_context_hint,
+            turn_steering_cues=steering_cues,
+        )
+
+    def _reply_expected_fast_path_evaluation(
+        self,
+        *,
+        user_transcript: str,
+        assistant_response: str,
+        request_source: str,
+        proactive_trigger: str | None,
+        follow_up_context_hint: str | None,
+        heuristic_assistant_expects_reply: bool,
+    ) -> ConversationClosureEvaluation | None:
+        """Return an immediate keep-open decision for obvious reply-expected turns."""
+
+        if not heuristic_assistant_expects_reply:
+            return None
+
+        steering_cues = self.load_turn_steering_cues(allow_remote=False)
+        matched_topics = self._match_topics_locally(
+            user_transcript=user_transcript,
+            assistant_response=assistant_response,
+            steering_cues=steering_cues,
+        )
+        self._safe_trace_event(
+            "conversation_closure_fast_continue",
+            kind="branch",
+            details={
+                "request_source": self._normalized_label(request_source, default="unknown"),
+                "proactive_trigger": self._normalized_label(proactive_trigger, default="none"),
+                "matched_topic_count": len(matched_topics),
+                "steering_cache_cues": len(steering_cues),
+            },
+        )
+        return ConversationClosureEvaluation(
+            decision=ConversationClosureDecision(
+                close_now=False,
+                confidence=0.94,
+                reason="assistant_expects_reply",
+                follow_up_action=_FOLLOW_UP_ACTION_CONTINUE,
+                matched_topics=matched_topics,
+            ),
+            assistant_expects_reply=True,
+            follow_up_action=_FOLLOW_UP_ACTION_CONTINUE,
             follow_up_context_hint=follow_up_context_hint,
             turn_steering_cues=steering_cues,
         )
@@ -410,16 +429,14 @@ class FollowUpSteeringRuntime:
             )
 
         if evaluation.error_type:
-            _update_follow_up_context(force_close=False)
-            self._safe_emit(f"conversation_closure_fallback={evaluation.error_type}")
-            return FollowUpRuntimeDecision()
+            raise RuntimeError(f"conversation_closure_error:{evaluation.error_type}")
         decision = evaluation.decision
         if decision is None:
             _update_follow_up_context(force_close=False)
             return FollowUpRuntimeDecision()
 
         self._safe_emit_closure_decision(decision)
-        steering = self._resolve_follow_up_steering_safe(
+        steering = self._resolve_follow_up_steering(
             evaluation.turn_steering_cues,
             matched_topics=getattr(decision, "matched_topics", ()),
         )
@@ -584,36 +601,6 @@ class FollowUpSteeringRuntime:
                     kwargs["closure_signals"] = bounded_signals
         return evaluator.evaluate(**kwargs)
 
-    def _build_local_fallback_decision(
-        self,
-        *,
-        user_transcript: str,
-        assistant_response: str,
-        steering_cues: Sequence[ConversationTurnSteeringCue],
-        error_type: str,
-    ) -> ConversationClosureDecision | None:
-        """Build a conservative local fallback when model-side closure fails.
-
-        The fallback never forces closure on its own. It only recovers
-        ``matched_topics`` so deterministic steering policy can still decide
-        whether follow-up listening should stay open or release after the
-        current answer.
-        """
-
-        matched_topics = self._match_topics_locally(
-            user_transcript=user_transcript,
-            assistant_response=assistant_response,
-            steering_cues=steering_cues,
-        )
-        if not matched_topics:
-            return None
-        return ConversationClosureDecision(
-            close_now=False,
-            confidence=0.0,
-            reason=f"local_fallback_{self._normalized_label(error_type, default='error', max_chars=24)}",
-            matched_topics=matched_topics,
-        )
-
     def _match_topics_locally(
         self,
         *,
@@ -663,24 +650,18 @@ class FollowUpSteeringRuntime:
                 break
         return tuple(matched)
 
-    def _resolve_follow_up_steering_safe(
+    def _resolve_follow_up_steering(
         self,
         cues: Sequence[ConversationTurnSteeringCue],
         *,
         matched_topics: Sequence[str],
     ) -> FollowUpSteeringDecision:
-        """Resolve steering robustly so malformed data degrades safely."""
+        """Resolve steering from the authoritative cue set."""
 
-        try:
-            return resolve_follow_up_steering(
-                tuple(self._normalize_cues(cues)),
-                matched_topics=self._coerce_topics(matched_topics),
-            )
-        except Exception as exc:
-            self._safe_emit(
-                f"conversation_follow_up_steering_fallback={type(exc).__name__}"
-            )
-            return FollowUpSteeringDecision(matched_topics=self._coerce_topics(matched_topics))
+        return resolve_follow_up_steering(
+            tuple(self._normalize_cues(cues)),
+            matched_topics=self._coerce_topics(matched_topics),
+        )
 
     def _closure_decision_passes_threshold(self, decision) -> bool:
         """Return whether the closure evaluator clearly asked to close now."""

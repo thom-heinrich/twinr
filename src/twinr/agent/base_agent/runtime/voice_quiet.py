@@ -1,8 +1,11 @@
 # CHANGELOG: 2026-03-27
 # BUG-1: Quiet-window expiry no longer depends on wall-clock arithmetic alone; a monotonic runtime deadline now prevents early/late expiry after NTP/manual clock jumps.
 # BUG-2: Datetime restore/state parsing now rejects malformed or naive values and normalizes every accepted deadline to UTC, preventing crashes and non-UTC until_utc output.
-# BUG-3: Expired/corrupt quiet windows now self-heal persistently instead of being cleared only in memory and reappearing from stale snapshots after restart.
-# SEC-1: restore_voice_quiet now re-enforces the bounded max quiet duration and clamps tampered/corrupt far-future deadlines, closing a practical long-lived voice-wake suppression DoS path.
+# BUG-3: Expired/corrupt quiet windows now surface malformed persisted state instead of
+#        silently mutating it on read.
+# SEC-1: restore_voice_quiet re-enforces the bounded max quiet duration and rejects
+#        tampered/corrupt far-future deadlines, closing a practical long-lived
+#        voice-wake suppression DoS path.
 # IMP-1: voice_quiet_active() now uses a monotonic fast path for hot wake-suppression checks on Pi-class hardware.
 # IMP-2: Quiet reasons are normalized to a single bounded printable line before storage/exposure, reducing cross-layer log/UI/prompt poisoning and keeping snapshots stable.
 # IMP-3: Added explicit host-runtime typing contracts plus configurable VOICE_QUIET_MAX_MINUTES / VOICE_QUIET_REASON_LIMIT knobs without breaking the public API.
@@ -18,7 +21,7 @@ state out of the workflow/orchestrator layers and exposes one small API:
 - report whether the quiet window is currently active
 
 The quiet window only suppresses transcript-first voice wake and automatic
-follow-up reopening. It does not invent fallback wake paths, and it does not
+follow-up reopening. It does not create additional wake paths, and it does not
 remove the explicit button/manual path.
 """
 
@@ -248,10 +251,8 @@ class TwinrRuntimeVoiceQuietMixin:
         owner = getattr(self, "_voice_quiet_deadline_monotonic_owner", None)
         raw_deadline = getattr(self, "_voice_quiet_deadline_monotonic_ns", None)
         if owner != _PROCESS_TOKEN:
-            self._set_voice_quiet_cache_unlocked(deadline_monotonic_ns=None)
             return None
         if not isinstance(raw_deadline, int) or raw_deadline <= 0:
-            self._set_voice_quiet_cache_unlocked(deadline_monotonic_ns=None)
             return None
         return raw_deadline
 
@@ -263,27 +264,17 @@ class TwinrRuntimeVoiceQuietMixin:
     ) -> tuple[bool, datetime | None, str | None, int, bool]:
         """Return the fully normalized quiet status while the runtime lock is held."""
 
-        persist_needed = False
-
         raw_reason = getattr(self, "_voice_quiet_reason", None)
         reason = self._normalize_voice_quiet_reason(raw_reason)
-        if reason != raw_reason:
-            setattr(self, "_voice_quiet_reason", reason)
-            if raw_reason is not None or reason is not None:
-                persist_needed = True
+        if raw_reason is not None and reason != raw_reason:
+            raise ValueError("voice quiet reason is malformed")
 
         raw_until_utc = getattr(self, "_voice_quiet_until_utc", None)
+        if raw_until_utc is None:
+            return False, None, None, 0, False
         stored_deadline_utc = self._normalize_voice_quiet_deadline_utc(raw_until_utc)
         if stored_deadline_utc is None:
-            if self._voice_quiet_has_persisted_fields_unlocked():
-                persist_needed = True
-            self._clear_voice_quiet_unlocked()
-            return False, None, None, 0, persist_needed
-
-        normalized_until_utc = self._voice_quiet_isoformat_utc(stored_deadline_utc)
-        if raw_until_utc != normalized_until_utc:
-            self._set_voice_quiet_persisted_unlocked(until_utc=normalized_until_utc, reason=reason)
-            persist_needed = True
+            raise ValueError("voice quiet deadline is malformed")
 
         monotonic_deadline_ns = self._trusted_voice_quiet_deadline_monotonic_ns_unlocked()
         max_duration_ns = self._voice_quiet_max_duration_ns()
@@ -291,42 +282,21 @@ class TwinrRuntimeVoiceQuietMixin:
         if monotonic_deadline_ns is None:
             remaining_ns = self._timedelta_to_ns(stored_deadline_utc - now_utc)
             if remaining_ns <= 0:
-                if self._voice_quiet_has_persisted_fields_unlocked():
-                    persist_needed = True
-                self._clear_voice_quiet_unlocked()
-                return False, None, None, 0, persist_needed
+                return False, None, None, 0, False
 
             if remaining_ns > max_duration_ns:
-                remaining_ns = max_duration_ns
-                stored_deadline_utc = now_utc + self._ns_to_timedelta(remaining_ns)
-                self._set_voice_quiet_persisted_unlocked(
-                    until_utc=self._voice_quiet_isoformat_utc(stored_deadline_utc),
-                    reason=reason,
-                )
-                persist_needed = True
+                raise ValueError("voice quiet deadline exceeds the configured maximum duration")
 
             monotonic_deadline_ns = now_monotonic_ns + remaining_ns
             self._set_voice_quiet_cache_unlocked(deadline_monotonic_ns=monotonic_deadline_ns)
         else:
             remaining_ns = monotonic_deadline_ns - now_monotonic_ns
             if remaining_ns <= 0:
-                if self._voice_quiet_has_persisted_fields_unlocked():
-                    persist_needed = True
-                self._clear_voice_quiet_unlocked()
-                return False, None, None, 0, persist_needed
-
-            rebased_deadline_utc = now_utc + self._ns_to_timedelta(remaining_ns)
-            if self._voice_quiet_deadlines_differ_materially(rebased_deadline_utc, stored_deadline_utc):
-                stored_deadline_utc = rebased_deadline_utc
-                self._set_voice_quiet_persisted_unlocked(
-                    until_utc=self._voice_quiet_isoformat_utc(stored_deadline_utc),
-                    reason=reason,
-                )
-                persist_needed = True
+                return False, None, None, 0, False
 
         remaining_ns = max(0, monotonic_deadline_ns - now_monotonic_ns)
         remaining_seconds = max(1, (remaining_ns + _REMAINING_SECONDS_ROUND_UP_NS) // _NS_PER_SECOND)
-        return True, stored_deadline_utc, reason, int(remaining_seconds), persist_needed
+        return True, stored_deadline_utc, reason, int(remaining_seconds), False
 
     def _voice_quiet_active_fast_unlocked(
         self,
@@ -340,16 +310,13 @@ class TwinrRuntimeVoiceQuietMixin:
             return None, False
         if monotonic_deadline_ns > now_monotonic_ns:
             return True, False
-        persist_needed = self._voice_quiet_has_persisted_fields_unlocked()
-        self._clear_voice_quiet_unlocked()
-        return False, persist_needed
+        return False, False
 
     def voice_quiet_state(self) -> VoiceQuietState:
         """Return the current temporary voice-quiet state."""
 
-        persist_needed = False
         with self._voice_quiet_runtime_lock():
-            active, deadline_utc, reason, remaining_seconds, persist_needed = self._voice_quiet_status_unlocked(
+            active, deadline_utc, reason, remaining_seconds, _persist_needed = self._voice_quiet_status_unlocked(
                 now_utc=self._voice_quiet_now_utc(),
                 now_monotonic_ns=self._voice_quiet_now_monotonic_ns(),
             )
@@ -362,40 +329,32 @@ class TwinrRuntimeVoiceQuietMixin:
                     reason=reason,
                     remaining_seconds=remaining_seconds,
                 )
-        if persist_needed:
-            self._persist_voice_quiet_snapshot()
         return state
 
     def voice_quiet_active(self) -> bool:
         """Return whether transcript-first wake should currently stay quiet."""
 
-        persist_needed = False
         with self._voice_quiet_runtime_lock():
             now_monotonic_ns = self._voice_quiet_now_monotonic_ns()
-            active, persist_needed = self._voice_quiet_active_fast_unlocked(
+            active, _persist_needed = self._voice_quiet_active_fast_unlocked(
                 now_monotonic_ns=now_monotonic_ns,
             )
             if active is None:
-                active, _, _, _, persist_needed = self._voice_quiet_status_unlocked(
+                active, _, _, _, _persist_needed = self._voice_quiet_status_unlocked(
                     now_utc=self._voice_quiet_now_utc(),
                     now_monotonic_ns=now_monotonic_ns,
                 )
-        if persist_needed:
-            self._persist_voice_quiet_snapshot()
         return bool(active)
 
     def voice_quiet_until_utc(self) -> str | None:
         """Return the current quiet deadline as UTC ISO-8601 text when active."""
 
-        persist_needed = False
         with self._voice_quiet_runtime_lock():
-            active, deadline_utc, _, _, persist_needed = self._voice_quiet_status_unlocked(
+            active, deadline_utc, _, _, _persist_needed = self._voice_quiet_status_unlocked(
                 now_utc=self._voice_quiet_now_utc(),
                 now_monotonic_ns=self._voice_quiet_now_monotonic_ns(),
             )
             until_utc = self._voice_quiet_isoformat_utc(deadline_utc) if active and deadline_utc is not None else None
-        if persist_needed:
-            self._persist_voice_quiet_snapshot()
         return until_utc
 
     def set_voice_quiet_minutes(
@@ -449,36 +408,28 @@ class TwinrRuntimeVoiceQuietMixin:
 
         now_utc = self._voice_quiet_now_utc()
         now_monotonic_ns = self._voice_quiet_now_monotonic_ns()
-        persist_needed = False
 
         with self._voice_quiet_runtime_lock():
             restored_deadline_utc = self._normalize_voice_quiet_deadline_utc(until_utc)
             normalized_reason = self._normalize_voice_quiet_reason(reason)
+            if reason is not None and normalized_reason != reason:
+                raise ValueError("voice quiet reason is malformed")
 
             if restored_deadline_utc is None:
-                persist_needed = until_utc is not None or reason is not None
+                if until_utc is not None:
+                    raise ValueError("voice quiet deadline is malformed")
                 self._clear_voice_quiet_unlocked()
             else:
                 remaining_ns = self._timedelta_to_ns(restored_deadline_utc - now_utc)
                 if remaining_ns <= 0:
-                    persist_needed = True
                     self._clear_voice_quiet_unlocked()
                 else:
                     max_duration_ns = self._voice_quiet_max_duration_ns()
                     if remaining_ns > max_duration_ns:
-                        remaining_ns = max_duration_ns
-                        restored_deadline_utc = now_utc + self._ns_to_timedelta(remaining_ns)
-                        persist_needed = True
-
-                    normalized_until_utc = self._voice_quiet_isoformat_utc(restored_deadline_utc)
-                    if normalized_until_utc != until_utc or normalized_reason != reason:
-                        persist_needed = True
+                        raise ValueError("voice quiet deadline exceeds the configured maximum duration")
 
                     self._set_voice_quiet_unlocked(
-                        until_utc=normalized_until_utc,
+                        until_utc=self._voice_quiet_isoformat_utc(restored_deadline_utc),
                         reason=normalized_reason,
                         deadline_monotonic_ns=now_monotonic_ns + remaining_ns,
                     )
-
-        if persist_needed:
-            self._persist_voice_quiet_snapshot()

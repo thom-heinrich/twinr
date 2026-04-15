@@ -4,6 +4,7 @@
 # BUG-6: Split the first fullscreen Wayland render into explicit memory-attribution subphases so Pi forensics can distinguish RGBA upload, showFullScreen visibility, frame upload, and Qt event processing instead of blaming one coarse "presented" phase.
 # BUG-7: Disabled HDMI Wayland idle waiting animation because repeated fullscreen waiting rerenders on the Pi still accumulate hundreds of MB of anonymous RSS within seconds even after the QRasterWindow rewrite.
 # BUG-8: Disable all time-driven status animation on hdmi_wayland because active listening/processing/answering repaints still drive Pi RSS into the 0.9-1.6 GB range under the QRasterWindow path, which then stalls live voice turns.
+# BUG-9: Add opt-in per-render runtime trace boundaries for show_status/render_status_image/show_image/processEvents so Pi probes can split snapshot pickup delay from the internal Qt/Wayland path.
 # CHANGELOG: 2026-03-28
 # BUG-1: close() and tick() now share the same lock as show_image() to remove teardown/render races.
 # BUG-2: tick() no longer swallows every Qt exception; display freezes now fail loudly instead of silently.
@@ -24,6 +25,7 @@ import re
 import stat
 import sys
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -212,6 +214,12 @@ def _screen_match_score(*, screen: Any, requested_width: int, requested_height: 
     )
 
 
+def _monotonic_ns() -> int:
+    """Return the current monotonic clock in nanoseconds."""
+
+    return time.monotonic_ns()
+
+
 def _select_best_screen(app: Any | None, *, requested_size: tuple[int, int]) -> Any | None:
     if app is None:
         return None
@@ -394,6 +402,7 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
     wayland_display: str = "wayland-0"
     wayland_runtime_dir: str | None = None
     qt_api: str = "auto"
+    runtime_trace_enabled: bool = False
     memory_snapshot_path: Path | None = None
     _qt_binding_name: str | None = field(default=None, init=False, repr=False)
     _qt_modules: tuple[Any, Any, Any] | None = field(default=None, init=False, repr=False)
@@ -409,6 +418,11 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
     _surface_host: Any | None = field(default=None, init=False, repr=False)
     _memory_first_frame_recorded: bool = field(default=False, init=False, repr=False)
     _memory_last_growth_anonymous_kb: int | None = field(default=None, init=False, repr=False)
+    _trace_surface_source: str = field(default="image", init=False, repr=False)
+    _trace_surface_status: str = field(default="image", init=False, repr=False)
+    _trace_surface_headline: str | None = field(default=None, init=False, repr=False)
+    _active_runtime_trace: dict[str, object] | None = field(default=None, init=False, repr=False)
+    _last_runtime_trace: dict[str, object] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.framebuffer_path = Path(self.framebuffer_path).expanduser()
@@ -451,6 +465,7 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
             wayland_display=getattr(config, "display_wayland_display", "wayland-0") or "wayland-0",
             wayland_runtime_dir=getattr(config, "display_wayland_runtime_dir", None),
             qt_api=getattr(config, "display_qt_api", "auto") or "auto",
+            runtime_trace_enabled=bool(getattr(config, "display_runtime_trace_enabled", False)),
             memory_snapshot_path=resolve_ops_paths_for_config(config).ops_store_root / "streaming_memory_segments.json",
             emit=emit,
         )
@@ -510,18 +525,94 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
 
         return False
 
+    def show_status(
+        self,
+        status: str,
+        *,
+        headline: str | None = None,
+        ticker_text: str | None = None,
+        details: tuple[str, ...] = (),
+        state_fields: tuple[tuple[str, str], ...] = (),
+        log_sections: tuple[tuple[str, tuple[str, ...]], ...] = (),
+        debug_signals: tuple[Any, ...] = (),
+        animation_frame: int = 0,
+        face_cue: Any | None = None,
+        wake_cue: Any | None = None,
+        emoji_cue: Any | None = None,
+        ambient_impulse_cue: Any | None = None,
+        service_connect_cue: Any | None = None,
+        presentation_cue: Any | None = None,
+    ) -> None:
+        """Render one status frame and retain per-phase Wayland trace metadata."""
+
+        safe_status = self._normalise_text(status, fallback="status").lower() or "status"
+        safe_headline = self._normalise_text(headline, fallback=safe_status.title())
+        self._set_trace_surface_context(source="status", status=safe_status, headline=safe_headline)
+        trace = self._begin_runtime_trace(status=safe_status)
+        trace["show_status_started_monotonic_ns"] = _monotonic_ns()
+        try:
+            trace["render_status_image_started_monotonic_ns"] = _monotonic_ns()
+            image = self.render_status_image(
+                status=status,
+                headline=headline,
+                ticker_text=ticker_text,
+                details=details,
+                state_fields=state_fields,
+                log_sections=log_sections,
+                debug_signals=debug_signals,
+                animation_frame=animation_frame,
+                face_cue=face_cue,
+                wake_cue=wake_cue,
+                emoji_cue=emoji_cue,
+                ambient_impulse_cue=ambient_impulse_cue,
+                service_connect_cue=service_connect_cue,
+                presentation_cue=presentation_cue,
+            )
+            trace["render_status_image_completed_monotonic_ns"] = _monotonic_ns()
+            self._active_runtime_trace = trace
+            self.show_image(image)
+            trace["show_status_completed_monotonic_ns"] = _monotonic_ns()
+            self._last_rendered_status = safe_status
+            self._store_runtime_trace(trace)
+        except Exception as exc:
+            trace["show_status_completed_monotonic_ns"] = _monotonic_ns()
+            trace["error"] = type(exc).__name__
+            self._store_runtime_trace(trace)
+            raise
+        finally:
+            self._active_runtime_trace = None
+
+    def consume_runtime_trace(self) -> dict[str, object] | None:
+        """Return the latest runtime trace payload and clear it."""
+
+        payload = self._last_runtime_trace
+        self._last_runtime_trace = None
+        return None if payload is None else dict(payload)
+
     def show_image(self, image: object) -> None:
         """Blit one prepared frame into the fullscreen Wayland window."""
 
         with cast(Any, self._lock):
+            trace = self._active_runtime_trace
+            if trace is not None:
+                trace["show_image_started_monotonic_ns"] = _monotonic_ns()
             self._assert_gui_thread("HdmiWaylandDisplay.show_image")
             prepared = self._prepare_image(image)
             width, height = prepared.size
             rgba_bytes = prepared.tobytes("raw", "RGBA")
             first_render = not self._memory_first_frame_recorded
             qt_core, qt_gui, qt_widgets = self._load_qt()
+            if trace is not None:
+                trace["qt_binding"] = self._qt_binding_name or "unknown"
+                trace["frame_size"] = f"{width}x{height}"
+                trace["first_render"] = first_render
             if self._qt_image_bytes == rgba_bytes and self._last_frame_size == (width, height):
                 self.tick()
+                if trace is not None:
+                    trace["skipped_unchanged_frame"] = True
+                    completed_ns = _monotonic_ns()
+                    trace["show_image_completed_monotonic_ns"] = completed_ns
+                    trace["backend_presented_monotonic_ns"] = completed_ns
                 return
             if not _supports_native_raster_window(qt_gui, qt_widgets):
                 socket_path = Path(self._prepare_wayland_socket())
@@ -549,8 +640,16 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
                 self._qt_image_bytes = rgba_bytes
                 self._last_frame_size = (width, height)
                 self.tick()
+                if trace is not None:
+                    trace["native_raster_window"] = False
+                    trace["surface_host"] = True
+                    trace["window_telemetry"] = "surface_host"
+                    trace["show_image_completed_monotonic_ns"] = _monotonic_ns()
                 return
             window = self._ensure_qt_window()
+            if trace is not None:
+                trace["native_raster_window"] = True
+                trace["surface_host"] = False
             if first_render:
                 self._record_first_render_phase(
                     label="display.hdmi_wayland.first_frame.rgba_bytes_ready",
@@ -560,7 +659,11 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
                         f"frame_px={width}x{height} bytes={len(rgba_bytes)}"
                     ),
                 )
+            if trace is not None:
+                trace["ensure_visible_started_monotonic_ns"] = _monotonic_ns()
             window.ensure_visible()
+            if trace is not None:
+                trace["ensure_visible_completed_monotonic_ns"] = _monotonic_ns()
             if first_render:
                 self._record_first_render_phase(
                     label="display.hdmi_wayland.first_frame.window_visible",
@@ -571,7 +674,11 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
                     ),
                 )
 
+            if trace is not None:
+                trace["set_frame_started_monotonic_ns"] = _monotonic_ns()
             window.set_frame(rgba_bytes, width, height)
+            if trace is not None:
+                trace["set_frame_completed_monotonic_ns"] = _monotonic_ns()
             if first_render:
                 self._record_first_render_phase(
                     label="display.hdmi_wayland.first_frame.frame_uploaded",
@@ -604,6 +711,9 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
                 owner_detail=owner_detail,
                 replace=True,
             )
+            if trace is not None:
+                trace["window_telemetry"] = window_detail or "qrasterwindow"
+                trace["show_image_completed_monotonic_ns"] = _monotonic_ns()
 
     def tick(self) -> None:
         """Keep the Wayland event queue responsive between rerenders."""
@@ -613,11 +723,33 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
             if app is None:
                 return
             self._assert_gui_thread("HdmiWaylandDisplay.tick")
+            trace = self._active_runtime_trace
+            if trace is not None:
+                trace["process_events_started_monotonic_ns"] = _monotonic_ns()
             try:
                 app.processEvents()
             except Exception as exc:  # pragma: no cover - requires Qt runtime
+                if trace is not None:
+                    trace["process_events_completed_monotonic_ns"] = _monotonic_ns()
+                    trace["process_events_error"] = type(exc).__name__
                 self._emit_message(f"hdmi_wayland tick failed: {exc}")
                 raise
+            if trace is not None:
+                completed_ns = _monotonic_ns()
+                trace["process_events_completed_monotonic_ns"] = completed_ns
+                trace["backend_presented_monotonic_ns"] = completed_ns
+                window = self._qt_window
+                is_exposed_getter = cast(
+                    Callable[[], object] | None,
+                    getattr(window, "isExposed", None),
+                )
+                exposed: bool | None = None
+                if is_exposed_getter is not None:
+                    try:
+                        exposed = bool(is_exposed_getter())
+                    except Exception:
+                        exposed = None
+                trace["window_exposed_after_process_events"] = exposed
 
     def close(self) -> None:
         """Release the Wayland window cleanly."""
@@ -650,6 +782,8 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
                 self._qt_modules = None
                 self._qt_binding_name = None
                 self._qt_window_class = None
+                self._active_runtime_trace = None
+                self._last_runtime_trace = None
                 HdmiFramebufferDisplay.close(self)
         if error is not None:
             raise error
@@ -849,6 +983,34 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
             emit(message)
         except Exception:
             return
+
+    def _set_trace_surface_context(self, *, source: str, status: str, headline: str | None) -> None:
+        """Remember the semantic surface currently being rendered."""
+
+        self._trace_surface_source = self._normalise_text(source, fallback="image").lower() or "image"
+        self._trace_surface_status = self._normalise_text(status, fallback="image").lower() or "image"
+        normalized_headline = self._normalise_text(headline, fallback="")
+        self._trace_surface_headline = normalized_headline or None
+
+    def _begin_runtime_trace(self, *, status: str) -> dict[str, object]:
+        """Return one mutable runtime trace payload for the active render."""
+
+        previous_status = self._normalise_text(self._last_rendered_status, fallback="none").lower() or "none"
+        return {
+            "driver": self.driver,
+            "surface_source": self._trace_surface_source,
+            "status": status,
+            "prev_status": previous_status,
+            "headline": self._trace_surface_headline,
+        }
+
+    def _store_runtime_trace(self, trace: dict[str, object]) -> None:
+        """Persist one completed runtime trace if tracing is enabled."""
+
+        if not self.runtime_trace_enabled:
+            self._last_runtime_trace = None
+            return
+        self._last_runtime_trace = dict(trace)
 
     def _record_render_memory_phase(
         self,

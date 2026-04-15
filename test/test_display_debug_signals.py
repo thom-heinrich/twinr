@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -237,6 +238,30 @@ class DisplayDebugSignalPublisherTests(unittest.TestCase):
         self.assertEqual(unchanged_snapshot.updated_at, first_snapshot.updated_at)
         self.assertNotEqual(refreshed_snapshot.updated_at, first_snapshot.updated_at)
         self.assertEqual(refreshed_snapshot.signature(), first_snapshot.signature())
+
+    def test_store_save_writes_operator_readable_artifact_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(project_root=temp_dir)
+            store = DisplayDebugSignalStore.from_config(config)
+            publisher = DisplayDebugSignalPublisher.from_config(config)
+            now = datetime(2026, 4, 7, 16, 30, tzinfo=timezone.utc)
+
+            publisher.publish_from_camera_facts(
+                camera_facts={
+                    "person_visible": True,
+                    "person_visible_unknown": False,
+                    "person_count": 1,
+                    "person_count_unknown": False,
+                    "looking_toward_device": True,
+                    "looking_toward_device_unknown": False,
+                    "looking_signal_state": "confirmed",
+                },
+                now=now,
+            )
+
+            file_mode = os.stat(store.path).st_mode & 0o777
+
+        self.assertEqual(file_mode, 0o644)
 
 
 if __name__ == "__main__":

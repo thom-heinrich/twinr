@@ -13,13 +13,14 @@ results.
 # SEC-2: Pending remote tool waiters could remain blocked after transport failure/disconnect; fail_all_pending() now releases them deterministically.
 # IMP-1: Tool schemas are upgraded toward explicit strict structured outputs (closed objects + nullable optionals) so behavior is less provider/API-mode dependent.
 # IMP-2: Static schemas/instructions are precomputed per session, tool-call latency is observable, and max rounds / payload budgets are env-configurable for Pi deployments.
+# IMP-3: The orchestrator server can now reuse one shared OpenAI backend/provider bundle across websocket sessions so repeated Pi probe turns do not cold-boot a fresh client and transport pool every time.
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from threading import Event, Lock
 from time import monotonic
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Sequence, cast
 import asyncio
 import json
 import logging
@@ -27,8 +28,17 @@ import os
 from collections.abc import Mapping
 
 from twinr.agent.base_agent.config import TwinrConfig
-from twinr.agent.base_agent.contracts import AgentToolCall, ConversationLike, ToolCallingAgentProvider
-from twinr.agent.base_agent.prompting.personality import load_supervisor_loop_instructions
+from twinr.agent.base_agent.contracts import (
+    AgentToolCall,
+    ConversationLike,
+    SupervisorDecision,
+    ToolCallingAgentProvider,
+)
+from twinr.agent.base_agent.prompting.personality import (
+    load_supervisor_loop_instructions,
+    load_tool_loop_instructions,
+    merge_instructions,
+)
 from twinr.agent.tools import (
     DualLaneToolLoop,
     build_agent_tool_schemas,
@@ -63,9 +73,6 @@ _REMOTE_TOOL_CALL_ID_MAX_CHARS_ENV = "TWINR_REMOTE_TOOL_CALL_ID_MAX_CHARS"
 
 _DEFAULT_TOOL_NAME_MAX_CHARS = 128
 
-_TURN_FAILURE_TEXT_ENV = "TWINR_ORCHESTRATOR_FAILURE_TEXT"
-_DEFAULT_TURN_FAILURE_TEXT = "Sorry, I had trouble finishing that. Please try again."
-
 _DEFAULT_MAX_ROUNDS = 6
 _MAX_ROUNDS_ENV = "TWINR_ORCHESTRATOR_MAX_ROUNDS"
 
@@ -85,13 +92,6 @@ def _read_positive_int_env(name: str, default: int) -> int:
         LOGGER.warning("Non-positive %s=%r; using default %d", name, raw_value, default)
         return default
     return parsed
-
-
-def _read_turn_failure_text() -> str:
-    """Read the senior-facing fallback phrase for orchestrator failures."""
-
-    text = os.getenv(_TURN_FAILURE_TEXT_ENV, _DEFAULT_TURN_FAILURE_TEXT).strip()
-    return text or _DEFAULT_TURN_FAILURE_TEXT
 
 
 def _json_size_bytes(payload: Any, *, context: str) -> int:
@@ -147,6 +147,26 @@ def _normalize_tool_names(tool_names: Sequence[str] | None) -> tuple[str, ...]:
     return tuple(normalized)
 
 
+def _normalize_transport_token_usage(value: object | None) -> dict[str, Any] | None:
+    """Convert provider token-usage objects into transport-safe mappings."""
+
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        return dict(value)
+
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        try:
+            payload = to_dict()
+        except Exception:
+            LOGGER.debug("Failed to normalize transport token usage.", exc_info=True)
+            return None
+        if isinstance(payload, Mapping):
+            return dict(payload)
+    return None
+
+
 def _assert_not_running_on_event_loop_thread() -> None:
     """Refuse blocking bridge execution on an active asyncio event-loop thread."""
 
@@ -156,33 +176,6 @@ def _assert_not_running_on_event_loop_thread() -> None:
         return
     raise RuntimeError(
         "EdgeOrchestratorSession.run_turn() must execute off the asyncio event-loop thread because remote tool waits are blocking"
-    )
-
-
-def _compose_failure_text(streamed_chunks: Sequence[str], fallback_text: str) -> str:
-    """Append the fallback phrase to any already-streamed partial text."""
-
-    streamed_text = "".join(streamed_chunks)
-    if not streamed_text:
-        return fallback_text
-    if streamed_text.endswith((" ", "\n")):
-        return f"{streamed_text}{fallback_text}"
-    return f"{streamed_text} {fallback_text}"
-
-
-def _build_error_turn_complete_event(text: str) -> OrchestratorTurnCompleteEvent:
-    """Build a well-formed completion event for a failed turn."""
-
-    return OrchestratorTurnCompleteEvent(
-        text=text,
-        rounds=0,
-        used_web_search=False,
-        response_id="",
-        request_id="",
-        model="",
-        token_usage={},
-        tool_calls=[],
-        tool_results=[],
     )
 
 
@@ -343,6 +336,9 @@ def _upgrade_tool_schemas_for_frontier(tool_schemas: Sequence[Any]) -> list[Any]
 
 class _UnusedSupervisorProvider:
     """Guard the dual-lane loop from calling the wrong supervisor API."""
+
+    def __init__(self, config: TwinrConfig) -> None:
+        self.config = config
 
     def start_turn_streaming(self, *args, **kwargs):  # pragma: no cover - should not run
         """Reject streaming supervisor calls on the structured decision path."""
@@ -587,35 +583,50 @@ class EdgeOrchestratorSession:
         supervisor_decision_provider=None,
         specialist_provider: ToolCallingAgentProvider | None = None,
         tool_names: Sequence[str] | None = None,
+        tool_schemas: Sequence[Any] | None = None,
+        supervisor_instructions: str | None = None,
     ) -> None:
         self.config = config
-        backend = OpenAIBackend(config=config)
+        backend: OpenAIBackend | None = None
+        if supervisor_decision_provider is None or specialist_provider is None:
+            backend = OpenAIBackend(config=config)
         self.supervisor_decision_provider = supervisor_decision_provider or OpenAISupervisorDecisionProvider(
-            backend,
+            cast(OpenAIBackend, backend),
             model_override=config.streaming_supervisor_model,
             reasoning_effort_override=config.streaming_supervisor_reasoning_effort,
             base_instructions_override=load_supervisor_loop_instructions(config),
             replace_base_instructions=True,
         )
         self.specialist_provider = specialist_provider or OpenAIToolCallingAgentProvider(
-            backend,
+            cast(OpenAIBackend, backend),
             model_override=config.streaming_specialist_model,
             reasoning_effort_override=config.streaming_specialist_reasoning_effort,
         )
         self.tool_names = _normalize_tool_names(tool_names)
-        self._turn_failure_text = _read_turn_failure_text()
         self._turn_lock = Lock()
         self._max_rounds = _read_positive_int_env(_MAX_ROUNDS_ENV, _DEFAULT_MAX_ROUNDS)
 
-        # Frontier-upgrade: these values are static for the lifetime of a session, so precompute them once for lower Pi-side CPU/memory churn.
-        self._tool_schemas = _upgrade_tool_schemas_for_frontier(build_agent_tool_schemas(self.tool_names))
-        self._supervisor_instructions = build_supervisor_decision_instructions(
+        # Keep only the truly static prompt/schema pieces cached across turns.
+        # The specialist lane must refresh its prompt-memory-backed tool bundle
+        # per turn so an explicit remember_memory write is visible immediately
+        # on the next websocket turn.
+        self._tool_schemas = tuple(tool_schemas) if tool_schemas is not None else tuple(
+            _upgrade_tool_schemas_for_frontier(build_agent_tool_schemas(self.tool_names))
+        )
+        self._supervisor_instructions = supervisor_instructions or build_supervisor_decision_instructions(
             self.config,
             extra_instructions=self.config.openai_realtime_instructions,
         )
-        self._specialist_instructions = build_specialist_tool_agent_instructions(
+
+    def _specialist_turn_instructions(self) -> str:
+        """Build one fresh specialist prompt bundle for the current turn."""
+
+        return build_specialist_tool_agent_instructions(
             self.config,
-            extra_instructions=self.config.openai_realtime_instructions,
+            extra_instructions=merge_instructions(
+                self.config.openai_realtime_instructions,
+                load_tool_loop_instructions(self.config),
+            ),
         )
 
     def run_turn(
@@ -624,6 +635,7 @@ class EdgeOrchestratorSession:
         *,
         conversation: ConversationLike | None,
         supervisor_conversation: ConversationLike | None,
+        prefetched_decision: Any | None = None,
         emit_event: Callable[[dict[str, Any]], None],
         tool_bridge: RemoteToolBridge,
     ) -> OrchestratorTurnCompleteEvent:
@@ -676,13 +688,13 @@ class EdgeOrchestratorSession:
             try:
                 remote_handlers = tool_bridge.build_handlers(self.tool_names)
                 tool_loop = DualLaneToolLoop(
-                    supervisor_provider=_UnusedSupervisorProvider(),
-                    specialist_provider=self.specialist_provider,
+                    supervisor_provider=cast(ToolCallingAgentProvider, _UnusedSupervisorProvider(self.config)),
+                    specialist_provider=cast(ToolCallingAgentProvider, self.specialist_provider),
                     supervisor_decision_provider=self.supervisor_decision_provider,
-                    tool_handlers=remote_handlers,
+                    tool_handlers=cast(dict[str, Callable[[dict[str, Any] | AgentToolCall], Any]], remote_handlers),
                     tool_schemas=self._tool_schemas,
                     supervisor_instructions=self._supervisor_instructions,
-                    specialist_instructions=self._specialist_instructions,
+                    specialist_instructions=self._specialist_turn_instructions(),
                     max_rounds=self._max_rounds,
                 )
 
@@ -690,6 +702,7 @@ class EdgeOrchestratorSession:
                     prompt,
                     conversation=conversation,
                     supervisor_conversation=supervisor_conversation,
+                    prefetched_decision=prefetched_decision,
                     instructions=None,
                     allow_web_search=False,
                     on_text_delta=on_text_delta,
@@ -707,17 +720,77 @@ class EdgeOrchestratorSession:
                     response_id=result.response_id,
                     request_id=result.request_id,
                     model=result.model,
-                    token_usage=result.token_usage,
+                    token_usage=_normalize_transport_token_usage(result.token_usage),
                     tool_calls=result.tool_calls,
                     tool_results=result.tool_results,
                 )
             except Exception as exc:
-                tool_bridge.fail_all_pending("Orchestrator turn aborted before tool results completed")
-                LOGGER.error("Edge orchestrator turn failed (%s)", type(exc).__name__)
-                try:
-                    emit_event(OrchestratorTextDeltaEvent(delta=self._turn_failure_text).to_payload())
-                except Exception as fallback_exc:
-                    LOGGER.debug("Unable to emit fallback failure text (%s)", type(fallback_exc).__name__)
-                return _build_error_turn_complete_event(
-                    _compose_failure_text(streamed_chunks, self._turn_failure_text)
+                released = tool_bridge.fail_all_pending(
+                    f"Orchestrator turn aborted before tool results completed ({type(exc).__name__})"
                 )
+                LOGGER.exception(
+                    "Edge orchestrator turn failed prompt_chars=%d streamed_chunks=%d released_waiters=%d",
+                    len(prompt),
+                    len(streamed_chunks),
+                    released,
+                )
+                raise
+
+
+def coerce_prefetched_supervisor_decision(payload: Mapping[str, Any] | None) -> SupervisorDecision | None:
+    """Build one validated prefetched supervisor decision from transport payload."""
+
+    if not isinstance(payload, Mapping):
+        return None
+    try:
+        return SupervisorDecision(**dict(payload))
+    except Exception:
+        LOGGER.warning("Ignoring invalid prefetched supervisor decision payload", exc_info=True)
+        return None
+
+
+class EdgeOrchestratorSessionFactory:
+    """Build per-connection sessions while reusing shared OpenAI transport state."""
+
+    def __init__(
+        self,
+        config: TwinrConfig,
+        *,
+        tool_names: Sequence[str] | None = None,
+    ) -> None:
+        self._config = config
+        self._tool_names = _normalize_tool_names(tool_names)
+        backend = OpenAIBackend(config=config)
+        self._supervisor_decision_provider = OpenAISupervisorDecisionProvider(
+            backend,
+            model_override=config.streaming_supervisor_model,
+            reasoning_effort_override=config.streaming_supervisor_reasoning_effort,
+            base_instructions_override=load_supervisor_loop_instructions(config),
+            replace_base_instructions=True,
+        )
+        self._specialist_provider = OpenAIToolCallingAgentProvider(
+            backend,
+            model_override=config.streaming_specialist_model,
+            reasoning_effort_override=config.streaming_specialist_reasoning_effort,
+        )
+        self._tool_schemas = tuple(
+            _upgrade_tool_schemas_for_frontier(build_agent_tool_schemas(self._tool_names))
+        )
+        self._supervisor_instructions = build_supervisor_decision_instructions(
+            config,
+            extra_instructions=config.openai_realtime_instructions,
+        )
+
+    def __call__(self, config: TwinrConfig) -> EdgeOrchestratorSession:
+        if config is not self._config:
+            raise ValueError(
+                "EdgeOrchestratorSessionFactory must be called with the config instance it was built for."
+            )
+        return EdgeOrchestratorSession(
+            self._config,
+            supervisor_decision_provider=self._supervisor_decision_provider,
+            specialist_provider=self._specialist_provider,
+            tool_names=self._tool_names,
+            tool_schemas=self._tool_schemas,
+            supervisor_instructions=self._supervisor_instructions,
+        )

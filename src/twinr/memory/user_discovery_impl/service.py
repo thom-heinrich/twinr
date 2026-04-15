@@ -92,6 +92,19 @@ class UserDiscoveryService(UserDiscoveryCommitMixin, UserDiscoveryQueryMixin):
         finally:
             self._invalidate_authoritative_coverage_cache()
 
+    def load_runtime_context_status(
+        self,
+        *,
+        topic_id: str | None = None,
+        now: datetime | None = None,
+    ) -> UserDiscoveryResult:
+        """Return one prompt-safe discovery status snapshot for live runtime context."""
+
+        del now
+        normalized_topic_id = self._normalize_topic_id(topic_id)
+        state = self.store.load()
+        return self.build_runtime_context_status_result(state, topic_id=normalized_topic_id)
+
     def manage(
         self,
         *,

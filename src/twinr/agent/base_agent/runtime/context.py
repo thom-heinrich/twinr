@@ -18,7 +18,7 @@ import math
 import threading
 import time
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from typing import cast
 
@@ -351,6 +351,8 @@ class TwinrRuntimeContextMixin:
         *,
         kind: str,
         details: dict[str, object],
+        reason: dict[str, object] | None,
+        kpi: dict[str, object] | None,
         level: str,
     ) -> None:
         """Call one runtime trace hook through a typed helper."""
@@ -359,15 +361,61 @@ class TwinrRuntimeContextMixin:
             message,
             kind=kind,
             details=details,
+            reason=reason,
+            kpi=kpi,
             level=level,
         )
 
-    def _safe_trace_runtime_context_event(
+    @staticmethod
+    def _invoke_trace_decision(
+        trace_decision: Callable[..., None],
+        message: str,
+        *,
+        question: str,
+        selected: dict[str, object],
+        options: list[dict[str, object]],
+        context: dict[str, object] | None,
+        confidence: object | None,
+        guardrails: list[str] | None,
+        kpi_impact_estimate: dict[str, object] | None,
+    ) -> None:
+        """Call one runtime decision hook through a typed helper."""
+
+        trace_decision(
+            message,
+            question=question,
+            selected=selected,
+            options=options,
+            context=context,
+            confidence=confidence,
+            guardrails=guardrails,
+            kpi_impact_estimate=kpi_impact_estimate,
+        )
+
+    @staticmethod
+    def _invoke_trace_span(
+        trace_span: Callable[..., object],
+        *,
+        name: str,
+        kind: str,
+        details: dict[str, object],
+    ) -> object:
+        """Call one runtime span hook through a typed helper."""
+
+        return trace_span(
+            name=name,
+            kind=kind,
+            details=details,
+        )
+
+    def _trace_runtime_context_event(
         self,
         message: str,
         *,
         kind: str,
         details: dict[str, object] | None = None,
+        reason: dict[str, object] | None = None,
+        kpi: dict[str, object] | None = None,
         level: str = "INFO",
     ) -> None:
         """Emit one bounded runtime-context trace event when tracing is available."""
@@ -376,16 +424,123 @@ class TwinrRuntimeContextMixin:
         if not callable(tracer):
             return
         trace_event = cast(Callable[..., None], tracer)
-        try:
-            self._invoke_trace_event(
-                trace_event,
-                message,
-                kind=kind,
-                details=dict(details or {}),
-                level=level,
-            )
-        except Exception:
+        self._invoke_trace_event(
+            trace_event,
+            message,
+            kind=kind,
+            details=dict(details or {}),
+            reason=dict(reason or {}) if reason is not None else None,
+            kpi=dict(kpi or {}) if kpi is not None else None,
+            level=level,
+        )
+
+    def _trace_runtime_context_decision(
+        self,
+        message: str,
+        *,
+        question: str,
+        selected: dict[str, object],
+        options: list[dict[str, object]],
+        context: dict[str, object] | None = None,
+        confidence: object | None = None,
+        guardrails: list[str] | None = None,
+        kpi_impact_estimate: dict[str, object] | None = None,
+    ) -> None:
+        """Emit one runtime-context decision when decision tracing is available."""
+
+        tracer = getattr(self, "_trace_decision", None)
+        if not callable(tracer):
             return
+        trace_decision = cast(Callable[..., None], tracer)
+        self._invoke_trace_decision(
+            trace_decision,
+            message,
+            question=question,
+            selected=dict(selected),
+            options=[dict(option) for option in options],
+            context=dict(context or {}) if context is not None else None,
+            confidence=confidence,
+            guardrails=list(guardrails or ()) if guardrails is not None else None,
+            kpi_impact_estimate=dict(kpi_impact_estimate or {}) if kpi_impact_estimate is not None else None,
+        )
+
+    def _runtime_context_span(
+        self,
+        *,
+        name: str,
+        kind: str,
+        details: dict[str, object] | None = None,
+    ):
+        """Return one workflow span bridge when the runtime has a bound tracer."""
+
+        tracer = getattr(self, "_trace_span", None)
+        if not callable(tracer):
+            return nullcontext()
+        trace_span = cast(Callable[..., object], tracer)
+        return self._invoke_trace_span(
+            trace_span,
+            name=name,
+            kind=kind,
+            details=dict(details or {}),
+        )
+
+    @contextmanager
+    def _profile_provider_context_stage(
+        self,
+        *,
+        context_builder: str,
+        stage: str,
+        tool_context: bool,
+        details: dict[str, object] | None = None,
+    ):
+        """Emit one bounded duration record for a provider-context stage."""
+
+        stage_details = {
+            "context_builder": context_builder,
+            "stage": stage,
+            "tool_context": tool_context,
+            **dict(details or {}),
+        }
+        started_at = time.perf_counter()
+        with self._runtime_context_span(
+            name=f"runtime_context.{context_builder}.{stage}",
+            kind="workflow",
+            details=stage_details,
+        ):
+            try:
+                yield stage_details
+            except Exception as exc:
+                self._trace_runtime_context_event(
+                    "provider_context_stage_failed",
+                    kind="exception",
+                    details={
+                        **stage_details,
+                        "error_type": type(exc).__name__,
+                    },
+                    kpi={"duration_ms": round((time.perf_counter() - started_at) * 1000.0, 3)},
+                    level="ERROR",
+                )
+                raise
+        self._trace_runtime_context_event(
+            "provider_context_stage_complete",
+            kind="metric",
+            details=stage_details,
+            kpi={"duration_ms": round((time.perf_counter() - started_at) * 1000.0, 3)},
+        )
+
+    @staticmethod
+    def _provider_context_builder_name(
+        *,
+        tool_context: bool,
+        include_conversation_system_turns: bool,
+    ) -> str:
+        if tool_context and include_conversation_system_turns:
+            return "tool_provider_conversation_context"
+        if tool_context and not include_conversation_system_turns:
+            return "tool_provider_text_surface_conversation_context"
+        if not tool_context and include_conversation_system_turns:
+            return "provider_conversation_context"
+        return "provider_text_surface_conversation_context"
 
     def _append_follow_up_carryover_message(
         self,
@@ -401,7 +556,7 @@ class TwinrRuntimeContextMixin:
         if not text:
             return
         messages.append(("system", text))
-        self._safe_trace_runtime_context_event(
+        self._trace_runtime_context_event(
             "provider_context_follow_up_carryover_injected",
             kind="workflow",
             details={
@@ -763,57 +918,201 @@ class TwinrRuntimeContextMixin:
         query_text: str | None = None,
         include_conversation_system_turns: bool = True,
     ) -> tuple[tuple[str, str], ...]:
+        context_builder = self._provider_context_builder_name(
+            tool_context=tool_context,
+            include_conversation_system_turns=include_conversation_system_turns,
+        )
         with self._runtime_context_lock():
-            language = getattr(self.config, "openai_realtime_language", None)
-            guidance = self._voice_guidance_message()
-            follow_up_carryover = pending_conversation_follow_up_system_message(self)
+            with self._profile_provider_context_stage(
+                context_builder=context_builder,
+                stage="lock_snapshot",
+                tool_context=tool_context,
+                details={"include_conversation_system_turns": include_conversation_system_turns},
+            ) as lock_stage:
+                language = getattr(self.config, "openai_realtime_language", None)
+                with self._profile_provider_context_stage(
+                    context_builder=context_builder,
+                    stage="voice_guidance",
+                    tool_context=tool_context,
+                ):
+                    guidance = self._voice_guidance_message()
+                with self._profile_provider_context_stage(
+                    context_builder=context_builder,
+                    stage="follow_up_carryover",
+                    tool_context=tool_context,
+                ):
+                    follow_up_carryover = pending_conversation_follow_up_system_message(self)
+                with self._profile_provider_context_stage(
+                    context_builder=context_builder,
+                    stage="self_coding_guidance",
+                    tool_context=tool_context,
+                ):
+                    self_coding_guidance = self._self_coding_guidance_message(tool_context=tool_context)
+                with self._profile_provider_context_stage(
+                    context_builder=context_builder,
+                    stage="display_grounding",
+                    tool_context=tool_context,
+                ):
+                    display_grounding = self._safe_active_display_grounding_message(
+                        self.config,
+                        event_prefix="provider_context",
+                    )
+                with self._profile_provider_context_stage(
+                    context_builder=context_builder,
+                    stage="retrieval_query",
+                    tool_context=tool_context,
+                ) as query_stage:
+                    retrieval_query = self._normalized_retrieval_query(
+                        query_text if query_text is not None else getattr(self, "last_transcript", "") or ""
+                    )
+                    query_stage["query_present"] = bool(retrieval_query)
+                    query_stage["retrieval_query_chars"] = len(retrieval_query)
+                with self._profile_provider_context_stage(
+                    context_builder=context_builder,
+                    stage="conversation_context",
+                    tool_context=tool_context,
+                ) as conversation_stage:
+                    conversation_context = self._conversation_context_unlocked(
+                        include_system_turns=include_conversation_system_turns,
+                    )
+                    conversation_stage["messages"] = len(conversation_context)
+                long_term_memory = getattr(self, "long_term_memory", None)
+                graph_memory = getattr(self, "graph_memory", None)
+                fatal_remote = self._remote_long_term_failure_is_fatal()
+                with self._profile_provider_context_stage(
+                    context_builder=context_builder,
+                    stage="runtime_resource_pin",
+                    tool_context=tool_context,
+                ) as pin_stage:
+                    pinned_resources = self._pin_runtime_resources_unlocked(long_term_memory, graph_memory)
+                    pin_stage["pinned_resources"] = len(pinned_resources)
+                lock_stage["query_present"] = bool(retrieval_query)
+                lock_stage["conversation_messages"] = len(conversation_context)
+                lock_stage["fatal_remote"] = fatal_remote
+
+        with self._profile_provider_context_stage(
+            context_builder=context_builder,
+            stage="discovery_guidance",
+            tool_context=tool_context,
+        ) as discovery_stage:
             discovery_guidance = self._discovery_guidance_message(tool_context=tool_context)
-            self_coding_guidance = self._self_coding_guidance_message(tool_context=tool_context)
-            display_grounding = self._safe_active_display_grounding_message(self.config, event_prefix="provider_context")
-            retrieval_query = self._normalized_retrieval_query(
-                query_text if query_text is not None else getattr(self, "last_transcript", "") or ""
-            )
-            conversation_context = self._conversation_context_unlocked(
-                include_system_turns=include_conversation_system_turns,
-            )
-            long_term_memory = getattr(self, "long_term_memory", None)
-            graph_memory = getattr(self, "graph_memory", None)
-            fatal_remote = self._remote_long_term_failure_is_fatal()
-            pinned_resources = self._pin_runtime_resources_unlocked(long_term_memory, graph_memory)
+            discovery_stage["message_present"] = discovery_guidance is not None
+
+        long_term_plan_selected = "skip_remote_context"
+        if retrieval_query and long_term_memory is not None:
+            long_term_plan_selected = "load_remote_context"
+        elif retrieval_query and long_term_memory is None and fatal_remote:
+            long_term_plan_selected = "fail_missing_remote_context"
+        self._trace_runtime_context_decision(
+            "provider_context_long_term_plan",
+            question="Should this provider context load remote long-term memory for this turn?",
+            selected={
+                "id": long_term_plan_selected,
+                "justification": (
+                    "A normalized retrieval query and a bound long-term memory service are both available."
+                    if long_term_plan_selected == "load_remote_context"
+                    else "The turn has no eligible remote context load on the runtime side."
+                ),
+                "expected_outcome": (
+                    "Build the provider-facing long-term memory overlay."
+                    if long_term_plan_selected == "load_remote_context"
+                    else "Skip remote long-term retrieval and keep only local prompt context."
+                ),
+            },
+            options=[
+                {
+                    "id": "load_remote_context",
+                    "summary": "Load long-term memory context from the runtime-owned remote service.",
+                    "score_components": {
+                        "query_present": bool(retrieval_query),
+                        "service_bound": long_term_memory is not None,
+                    },
+                    "constraints_violated": [] if retrieval_query and long_term_memory is not None else ["missing_query_or_service"],
+                },
+                {
+                    "id": "skip_remote_context",
+                    "summary": "Do not load remote long-term memory for this turn.",
+                    "score_components": {
+                        "query_present": bool(retrieval_query),
+                        "service_bound": long_term_memory is not None,
+                    },
+                    "constraints_violated": [] if not retrieval_query or long_term_memory is None else ["remote_read_omitted"],
+                },
+                {
+                    "id": "fail_missing_remote_context",
+                    "summary": "Surface a required-remote contract error instead of silently skipping.",
+                    "score_components": {
+                        "fatal_remote": fatal_remote,
+                        "service_bound": long_term_memory is not None,
+                    },
+                    "constraints_violated": [] if fatal_remote and long_term_memory is None else ["remote_service_present_or_not_required"],
+                },
+            ],
+            context={
+                "context_builder": context_builder,
+                "tool_context": tool_context,
+                "query_present": bool(retrieval_query),
+                "fatal_remote": fatal_remote,
+                "long_term_memory_bound": long_term_memory is not None,
+            },
+            confidence="high",
+            guardrails=[
+                "Required remote memory must fail closed when the service is missing.",
+                "Blank retrieval queries must not trigger broad accidental recall.",
+            ],
+            kpi_impact_estimate={
+                "remote_read_expected": long_term_plan_selected == "load_remote_context",
+            },
+        )
 
         try:
-            long_term_messages = self._load_long_term_context_messages(
-                long_term_memory=long_term_memory,
-                retrieval_query=retrieval_query,
+            with self._profile_provider_context_stage(
+                context_builder=context_builder,
+                stage="long_term_context_load",
                 tool_context=tool_context,
-                event_prefix="provider_context",
-                fatal_remote=fatal_remote,
-            )
+                details={"query_present": bool(retrieval_query)},
+            ) as memory_stage:
+                long_term_messages = self._load_long_term_context_messages(
+                    long_term_memory=long_term_memory,
+                    retrieval_query=retrieval_query,
+                    tool_context=tool_context,
+                    event_prefix="provider_context",
+                    fatal_remote=fatal_remote,
+                )
+                memory_stage["messages"] = len(long_term_messages)
         finally:
             self._unpin_runtime_resources(*pinned_resources)
 
         messages: list[tuple[str, str]] = []
-        self._append_contract_message(
-            messages,
-            language=language,
-            event="provider_context_contract_failed",
-            failure_message="Twinr could not build the base language contract and continued with reduced context.",
-        )
-        self._append_optional_system_message(messages, guidance)
-        self._append_follow_up_carryover_message(
-            messages,
-            follow_up_carryover,
-            context_builder="provider_conversation_context",
+        with self._profile_provider_context_stage(
+            context_builder=context_builder,
+            stage="message_assembly",
             tool_context=tool_context,
-        )
-        self._append_optional_system_message(messages, discovery_guidance)
-        self._append_optional_system_message(messages, self_coding_guidance)
-        self._append_optional_system_message(messages, display_grounding)
-        if long_term_messages:
-            self._append_optional_system_message(messages, _LONG_TERM_MEMORY_TRUST_ENVELOPE, limit=2000)
-            for context_message in long_term_messages:
-                messages.append(("system", context_message))
-        messages.extend(conversation_context)
+        ) as assembly_stage:
+            self._append_contract_message(
+                messages,
+                language=language,
+                event="provider_context_contract_failed",
+                failure_message="Twinr could not build the base language contract and continued with reduced context.",
+            )
+            self._append_optional_system_message(messages, guidance)
+            self._append_follow_up_carryover_message(
+                messages,
+                follow_up_carryover,
+                context_builder=context_builder,
+                tool_context=tool_context,
+            )
+            self._append_optional_system_message(messages, discovery_guidance)
+            self._append_optional_system_message(messages, self_coding_guidance)
+            self._append_optional_system_message(messages, display_grounding)
+            if long_term_messages:
+                self._append_optional_system_message(messages, _LONG_TERM_MEMORY_TRUST_ENVELOPE, limit=2000)
+                for context_message in long_term_messages:
+                    messages.append(("system", context_message))
+            messages.extend(conversation_context)
+            assembly_stage["message_count"] = len(messages)
+            assembly_stage["long_term_messages"] = len(long_term_messages)
+            assembly_stage["conversation_messages"] = len(conversation_context)
         return tuple(messages)
 
     def _discovery_guidance_message(self, *, tool_context: bool) -> str | None:
@@ -821,14 +1120,11 @@ class TwinrRuntimeContextMixin:
 
         if not tool_context:
             return None
-        manage_discovery = getattr(self, "manage_user_discovery", None)
-        if not callable(manage_discovery):
+        runtime_context_status = getattr(self, "runtime_context_user_discovery_status", None)
+        if not callable(runtime_context_status):
             return None
-        assert callable(manage_discovery)
-        try:
-            status = manage_discovery(action="status")  # pylint: disable=not-callable
-        except Exception:
-            return None
+        assert callable(runtime_context_status)
+        status = runtime_context_status()  # pylint: disable=not-callable
 
         session_state_raw = self._compact_runtime_guidance_text(getattr(status, "session_state", None), limit=32)
         response_mode_raw = self._compact_runtime_guidance_text(getattr(status, "response_mode", None), limit=32)

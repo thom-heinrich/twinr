@@ -10,6 +10,7 @@ from twinr.agent.base_agent.conversation.decision_core import normalize_turn_tex
 from twinr.agent.base_agent.conversation.turn_controller import (
     StreamingTurnController,
     ToolCallingTurnDecisionEvaluator,
+    TurnControllerEvaluationError,
     TurnEvaluationCandidate,
     _normalize_turn_text,
 )
@@ -242,7 +243,7 @@ class TurnControllerTests(unittest.TestCase):
         self.assertIn("turn_controller_reason=utterance_end_fast_path", lines)
         self.assertIn("turn_controller_label=complete", lines)
 
-    def test_text_fallback_can_parse_backchannel_label(self) -> None:
+    def test_text_only_provider_output_fails_closed(self) -> None:
         config = TwinrConfig(
             openai_api_key="test-key",
             project_root=".",
@@ -258,17 +259,17 @@ class TurnControllerTests(unittest.TestCase):
 
         evaluator = ToolCallingTurnDecisionEvaluator(config=config, provider=BackchannelProvider(config))
 
-        decision = evaluator.evaluate(
-            candidate=TurnEvaluationCandidate(
-                transcript="ja",
-                event_type="speech_final",
-                speech_final=True,
-            ),
-            conversation=(("assistant", "Moechtest du, dass ich es drucke?"),),
-        )
+        with self.assertRaises(TurnControllerEvaluationError) as raised:
+            evaluator.evaluate(
+                candidate=TurnEvaluationCandidate(
+                    transcript="ja",
+                    event_type="speech_final",
+                    speech_final=True,
+                ),
+                conversation=(("assistant", "Moechtest du, dass ich es drucke?"),),
+            )
 
-        self.assertEqual(decision.decision, "end_turn")
-        self.assertEqual(decision.label, "backchannel")
+        self.assertEqual(str(raised.exception), "turn_controller_invalid_provider_output")
 
     def test_turn_controller_only_passes_lane_specific_instructions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

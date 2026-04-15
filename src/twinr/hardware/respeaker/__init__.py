@@ -56,6 +56,12 @@ from twinr.hardware.respeaker.scheduled_provider import (
     ScheduledReSpeakerSignalProvider,
 )
 from twinr.hardware.respeaker.transport import ReSpeakerLibusbTransport
+from twinr.hardware.respeaker.voice_capture import (
+    ReSpeakerVoiceCaptureContract,
+    extract_pcm16_channel,
+    project_respeaker_capture_frame,
+    resolve_respeaker_voice_capture_contract,
+)
 from twinr.hardware.respeaker.write_specs import LED_COLOR_PARAMETER, LED_EFFECT_PARAMETER, REBOOT_PARAMETER
 
 __all__ = [
@@ -91,15 +97,19 @@ __all__ = [
     "ReSpeakerTransportAvailability",
     "ReSpeakerUsbDevice",
     "ScheduledReSpeakerSignalProvider",
+    "ReSpeakerVoiceCaptureContract",
     "build_respeaker_claim_payloads",
     "build_respeaker_signal_claim_contract",
     "capture_respeaker_primitive_snapshot",
     "claim_contract_to_payload",
     "config_targets_respeaker",
     "derive_respeaker_signal_state",
+    "extract_pcm16_channel",
     "optional_respeaker_led_companion",
+    "project_respeaker_capture_frame",
     "probe_respeaker_xvf3800",
     "read_default_respeaker_parameters",
+    "resolve_respeaker_voice_capture_contract",
     "resolve_respeaker_led_profile",
     "resolve_respeaker_indicator_state",
 ]

@@ -356,13 +356,14 @@ class TwinrRealtimeTurnExecutionMixin:
         play_initial_beep: bool,
     ) -> bool:
         turn_started = time.monotonic()
-        if listen_source == "button":
-            self.runtime.press_green_button()
-        else:
-            self.runtime.begin_listening(
-                request_source=listen_source,
-                proactive_trigger=proactive_trigger,
-            )
+        self._ensure_live_audio_turn_supported(
+            initial_source=initial_source,
+            listen_source=listen_source,
+        )
+        self._begin_audio_turn_listening(
+            listen_source=listen_source,
+            proactive_trigger=proactive_trigger,
+        )
         self._emit_status(force=True)
         if play_initial_beep:
             self._play_listen_beep()
@@ -380,6 +381,7 @@ class TwinrRealtimeTurnExecutionMixin:
                     "listening",
                     detail=listen_source,
                     follow_up_allowed=follow_up,
+                    wait_id=wait_handle.wait_id,
                 )
                 committed = self._wait_for_remote_transcript_commit(
                     wait_handle=wait_handle,
@@ -440,16 +442,10 @@ class TwinrRealtimeTurnExecutionMixin:
                     except RuntimeError:
                         raise
                     except Exception as exc:
-                        self.emit(f"turn_controller_fallback={type(exc).__name__}")
-                        capture_result = self.recorder.capture_pcm_until_pause_with_options(
-                            pause_ms=listening_window.speech_pause_ms,
-                            start_timeout_s=listening_window.start_timeout_s,
-                            speech_start_chunks=speech_start_chunks,
-                            ignore_initial_ms=ignore_initial_ms,
-                            pause_grace_ms=listening_window.pause_grace_ms,
-                            should_stop=self._active_turn_stop_requested,
-                        )
-                        capture_ms = int((time.monotonic() - capture_started) * 1000)
+                        self.emit(f"turn_controller_capture_failed={type(exc).__name__}")
+                        raise RuntimeError(
+                            f"turn_controller_capture_failed:{type(exc).__name__}"
+                        ) from exc
                 else:
                     capture_result = self.recorder.capture_pcm_until_pause_with_options(
                         pause_ms=listening_window.speech_pause_ms,
@@ -576,6 +572,29 @@ class TwinrRealtimeTurnExecutionMixin:
                 kind="branch",
                 details={"listen_source": listen_source},
             )
+            return
+        self.runtime.begin_listening(
+            request_source=listen_source,
+            proactive_trigger=proactive_trigger,
+        )
+
+    def _begin_audio_turn_listening(
+        self,
+        *,
+        listen_source: str,
+        proactive_trigger: str | None,
+    ) -> None:
+        """Reuse an already-open listening window before audio turns."""
+
+        if getattr(self.runtime.status, "value", None) == "listening":
+            self._trace_event(
+                "audio_turn_reuse_listening_state",
+                kind="branch",
+                details={"listen_source": listen_source},
+            )
+            return
+        if listen_source == "button":
+            self.runtime.press_green_button()
             return
         self.runtime.begin_listening(
             request_source=listen_source,
@@ -955,19 +974,8 @@ class TwinrRealtimeTurnExecutionMixin:
 
             response_text = turn.response_text or ""
             if first_audio_at[0] is None and response_text.strip():
-                if not answer_started:
-                    begin_answering()
-                self.emit("realtime_audio_fallback=true")
-                self.emit("realtime_turn_tts_fallback_start=true")
-                fallback_tts_ms, fallback_first_audio_ms = self._play_streaming_tts_with_feedback(
-                    response_text,
-                    turn_started=turn_started,
-                    should_stop=interrupt_event.is_set,
-                )
-                self.emit("realtime_turn_tts_fallback_done=true")
-                self.emit(f"timing_tts_fallback_ms={fallback_tts_ms}")
-                if fallback_first_audio_ms is not None:
-                    first_audio_ms_override = fallback_first_audio_ms
+                self.emit("realtime_provider_audio_missing=true")
+                raise RuntimeError("Realtime turn returned text without provider audio.")
         finally:
             stop_answering_feedback()
             self._stop_working_feedback()
@@ -997,7 +1005,7 @@ class TwinrRealtimeTurnExecutionMixin:
             if response_text_for_runtime != response_text:
                 self.emit("assistant_response_context_trimmed=true")
                 if not provider_synced_interrupt:
-                    self.emit("assistant_response_context_trim_reason=local_interrupt_fallback")
+                    self.emit("assistant_response_context_trim_reason=local_interrupt_trim")
 
         force_close = True
         follow_up_mode = "disabled"
@@ -1113,6 +1121,7 @@ class TwinrRealtimeTurnExecutionMixin:
         if interrupt_event.is_set() and not force_close:
             return self._run_interrupt_follow_up_turn()
         if not force_close and follow_up_mode == "remote":
+            self._acknowledge_follow_up_open(request_source=listen_source)
             self._notify_voice_orchestrator_state(
                 "follow_up_open",
                 detail=listen_source,

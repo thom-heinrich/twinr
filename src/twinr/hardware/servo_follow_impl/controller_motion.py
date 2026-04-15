@@ -14,6 +14,64 @@ from .controller_state import ControllerStateMixin
 from .types import AttentionServoDecision
 
 class ControllerMotionMixin(ControllerStateMixin):
+    def _clear_visible_retarget_cooldown(self) -> None:
+        self._visible_retarget_cooldown_anchor_pulse_width_us = None
+        self._visible_retarget_cooldown_until_at = None
+
+    def _visible_retarget_cooldown_break_tolerance_us(self) -> int:
+        return max(
+            self.config.visible_retarget_tolerance_us,
+            self.config.min_command_delta_us,
+            self._release_tolerance_us(),
+        )
+
+    def _target_crosses_center_pulse_width(
+        self,
+        *,
+        reference_pulse_width_us: int,
+        target_pulse_width_us: int,
+    ) -> bool:
+        reference_offset = int(reference_pulse_width_us) - self.config.center_pulse_width_us
+        target_offset = int(target_pulse_width_us) - self.config.center_pulse_width_us
+        if reference_offset == 0 or target_offset == 0:
+            return False
+        return (reference_offset > 0) != (target_offset > 0)
+
+    def _visible_retarget_cooldown_active(self, *, observed_at: float | None) -> bool:
+        if observed_at is None or self._visible_retarget_cooldown_until_at is None:
+            return False
+        if observed_at >= self._visible_retarget_cooldown_until_at:
+            self._clear_visible_retarget_cooldown()
+            return False
+        return True
+
+    def _note_visible_tracking_command(
+        self,
+        *,
+        observed_at: float | None,
+        reason: str,
+        previous_commanded_pulse_width_us: int | None,
+        commanded_pulse_width_us: int,
+    ) -> None:
+        if reason != "following_target":
+            self._clear_visible_retarget_cooldown()
+            return
+        if self._continuous_planner is not None or observed_at is None:
+            return
+        cooldown_s = max(0.0, self.config.visible_retarget_cooldown_s)
+        if cooldown_s <= 0.0:
+            self._clear_visible_retarget_cooldown()
+            return
+        anchor_pulse_width_us = int(commanded_pulse_width_us)
+        if (
+            previous_commanded_pulse_width_us is not None
+            and anchor_pulse_width_us == int(previous_commanded_pulse_width_us)
+        ):
+            return
+        self._visible_retarget_cooldown_anchor_pulse_width_us = anchor_pulse_width_us
+        self._visible_target_pulse_width_us = anchor_pulse_width_us
+        self._visible_retarget_cooldown_until_at = float(observed_at) + cooldown_s
+
     def _write_target_pulse_width(
         self,
         *,
@@ -144,18 +202,40 @@ class ControllerMotionMixin(ControllerStateMixin):
             return previous_commanded_pulse_width_us
         return checked_target_us
 
-    def _stabilize_visible_target_pulse_width(self, *, target_pulse_width_us: int, reason: str) -> int:
+    def _stabilize_visible_target_pulse_width(
+        self,
+        *,
+        observed_at: float | None,
+        target_pulse_width_us: int,
+        reason: str,
+    ) -> int:
         """Latch visible targets so servo follow ignores millimeter re-justification."""
 
         checked_target_us = max(
             self.config.safe_min_pulse_width_us,
             min(self.config.safe_max_pulse_width_us, int(target_pulse_width_us)),
         )
-        if reason != "following_target":
+        if reason != "following_target" or self._continuous_planner is not None:
             self._visible_target_pulse_width_us = None
+            self._clear_visible_retarget_cooldown()
             return checked_target_us
         tolerance_us = max(0, self.config.visible_retarget_tolerance_us)
         latched_target_us = self._visible_target_pulse_width_us
+        cooldown_anchor_pulse_width_us = self._visible_retarget_cooldown_anchor_pulse_width_us
+        if (
+            cooldown_anchor_pulse_width_us is not None
+            and self._visible_retarget_cooldown_active(observed_at=observed_at)
+        ):
+            if not self._target_crosses_center_pulse_width(
+                reference_pulse_width_us=cooldown_anchor_pulse_width_us,
+                target_pulse_width_us=checked_target_us,
+            ) and (
+                abs(checked_target_us - cooldown_anchor_pulse_width_us)
+                <= self._visible_retarget_cooldown_break_tolerance_us()
+            ):
+                self._visible_target_pulse_width_us = cooldown_anchor_pulse_width_us
+                return cooldown_anchor_pulse_width_us
+            self._clear_visible_retarget_cooldown()
         if tolerance_us <= 0 or latched_target_us is None:
             self._visible_target_pulse_width_us = checked_target_us
             return checked_target_us

@@ -109,6 +109,12 @@ def apply_display_updates(config: "TwinrConfig", updates: Mapping[str, object]) 
         config, "display_face_cue_ttl_s", updates["normalized_display_face_cue_ttl_s"]
     )
     object.__setattr__(
+        config, "display_wake_cue_path", updates["normalized_display_wake_cue_path"]
+    )
+    object.__setattr__(
+        config, "display_wake_cue_ttl_s", updates["normalized_display_wake_cue_ttl_s"]
+    )
+    object.__setattr__(
         config, "display_emoji_cue_path", updates["normalized_display_emoji_cue_path"]
     )
     object.__setattr__(
@@ -464,6 +470,11 @@ def apply_attention_servo_updates(
         config,
         "attention_servo_visible_retarget_tolerance_us",
         updates["normalized_attention_servo_visible_retarget_tolerance_us"],
+    )
+    object.__setattr__(
+        config,
+        "attention_servo_visible_retarget_cooldown_s",
+        updates["normalized_attention_servo_visible_retarget_cooldown_s"],
     )
     object.__setattr__(
         config,

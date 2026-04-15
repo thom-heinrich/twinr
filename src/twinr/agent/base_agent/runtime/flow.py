@@ -2,6 +2,12 @@
 # BUG-1: Made workflow_event emission best-effort so telemetry failures no longer abort user turns or snapshot refreshes.
 # BUG-2: Added a dedicated printable-output path so proactive/reminder/automation prompts do not leave the yellow-button print flow pointing at a stale older answer.
 # BUG-3: Coalesced duplicate green/yellow button activations inside a short debounce window to survive real Raspberry Pi GPIO bounce / duplicated callbacks without invalid transitions or duplicate prints.
+# BUG-4: Allow follow-up reopen after `tts_finished` has already moved the
+#        runtime to `waiting`, so display-facing speech completion can clear
+#        immediately without blocking later legitimate re-entry to `listening`.
+# BUG-5: Add one atomic transcript-first follow-up reopen path so provisional
+#        remote follow-up turns do not persist an intermediate `waiting`
+#        snapshot before immediately returning to `listening`.
 # SEC-1: Bounded and sanitized all externally supplied strings (transcripts, answers, prompts, request metadata) to prevent control-character injection into operator surfaces and resource-exhaustion via oversized payloads.
 # IMP-1: Replaced the process-global runtime lock with a per-instance lock/state container, with a shared fallback only when instance attribute injection is unavailable.
 # IMP-2: Added per-turn correlation metadata (turn_id, parent_turn_id, event_id, event_seq, timestamps, status_before/status_after) to ops events for 2026-grade forensics and observability.
@@ -22,18 +28,6 @@ from twinr.agent.workflows.forensics import workflow_event
 from twinr.ops.events import compact_text
 
 _LOGGER = logging.getLogger(__name__)
-
-# Fallback only for runtimes that cannot accept dynamic instance attributes.
-_FALLBACK_RUNTIME_FLOW_STATE: dict[str, Any] = {
-    "lock": RLock(),
-    "event_sequence": 0,
-    "active_turn_id": None,
-    "active_parent_turn_id": None,
-    "last_printable_output": None,
-    "last_printable_turn_id": None,
-    "recent_actions_ns": {},
-}
-
 
 class TwinrRuntimeFlowMixin:
     """Provide serialized runtime flow mutations and user-turn helpers."""
@@ -69,8 +63,8 @@ class TwinrRuntimeFlowMixin:
         try:
             setattr(self, "_twinr_runtime_flow_state", state)
             return state
-        except Exception:
-            return _FALLBACK_RUNTIME_FLOW_STATE
+        except Exception as exc:
+            raise RuntimeError("Twinr runtime flow state could not be attached to the runtime instance.") from exc
 
     def _runtime_flow_lock(self) -> RLock:
         return cast(RLock, self._runtime_flow_state()["lock"])
@@ -860,17 +854,69 @@ class TwinrRuntimeFlowMixin:
         )
         return status
 
+    def finish_speaking_and_rearm_follow_up(
+        self,
+        *,
+        request_source: str = "follow_up",
+    ) -> TwinrStatus:
+        """Atomically clear speaking and reopen follow-up listening.
+
+        Transcript-first remote follow-up already keeps the authoritative
+        server-side window open while playback ends. Persisting `waiting`
+        immediately before reopening `listening` only adds Pi-side snapshot I/O
+        and visible lag, so this helper preserves the state-machine transitions
+        and ops events while persisting only the final reopened state.
+        """
+
+        normalized_request_source = self._require_text(request_source, field_name="request_source")
+
+        with self._runtime_flow_lock():
+            parent_turn_id = self._ensure_active_turn_id_locked()
+            status_before = self.state_machine.status.value
+            waiting_status = self.state_machine.transition(TwinrEvent.TTS_FINISHED)
+            waiting_event_data = self._ops_event_payload_locked(
+                status_before=status_before,
+                status_after=waiting_status.value,
+                turn_id=parent_turn_id,
+            )
+
+            turn_id = self._new_runtime_id()
+            listening_status = self.state_machine.transition(TwinrEvent.FOLLOW_UP_ARMED)
+            self._set_active_turn_locked(turn_id, parent_turn_id=parent_turn_id)
+            self.last_transcript = ""
+            self._persist_snapshot_safe()
+            follow_up_event_data = self._ops_event_payload_locked(
+                status_before=waiting_status.value,
+                status_after=listening_status.value,
+                turn_id=turn_id,
+                parent_turn_id=parent_turn_id,
+                request_source=normalized_request_source,
+            )
+
+        self._append_ops_event(
+            event="tts_finished",
+            message="Twinr finished speaking the response.",
+            data=waiting_event_data,
+        )
+        self._append_ops_event(
+            event="follow_up_rearmed",
+            message="Conversation follow-up listening window opened immediately after speech.",
+            data=follow_up_event_data,
+        )
+        return listening_status
+
     def rearm_follow_up(
         self,
         *,
         request_source: str = "follow_up",
     ) -> TwinrStatus:
-        """Re-open listening directly after speaking without a transient idle state.
+        """Re-open listening for a conversation follow-up turn.
 
-        This is used for conversation follow-up turns so the runtime can move
-        straight from ``answering`` back to ``listening`` and the operator
-        surfaces do not briefly show ``waiting`` between the spoken reply and
-        the reopened microphone window.
+        When the closure decision already finished during playback, the runtime
+        can move straight from ``answering`` back to ``listening``. If closure
+        evaluation is still running after audio drained, the coordinator may
+        first clear ``speaking`` via ``waiting`` and then re-open listening
+        once the follow-up gate resolves.
         """
 
         normalized_request_source = self._require_text(request_source, field_name="request_source")

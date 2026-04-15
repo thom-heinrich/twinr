@@ -14,6 +14,8 @@ _HTTP_HEADER_TOKEN_CHARS = set("!#$%&'*+-.^_`|~")
 _TEST_PATH_MARKERS = ("/test/", "/tests/", ".test.", "_test.")
 _PREFIX_METADATA_KEY_TOKENS = frozenset({"prefix", "namespace"})
 _PREFIX_METADATA_DELIMITERS = frozenset({":", "-", "_", "/", "."})
+_GIT_PATCH_FILE_MODE_DIGITS = frozenset("01234567")
+_SYMBOLIC_REFERENCE_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_")
 
 
 def _trim_excerpt(text: str, *, max_len: int = 120) -> str:
@@ -92,6 +94,27 @@ def _iter_token_like_fragments(text: str) -> tuple[str, ...]:
     if current:
         fragments.append("".join(current))
     return tuple(fragments)
+
+
+def _looks_like_git_object_id_fragment(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped or len(stripped) < 7:
+        return False
+    return all(character in "0123456789abcdef" for character in stripped.casefold())
+
+
+def _looks_like_git_patch_index_metadata(text: str) -> bool:
+    parts = text.strip().split()
+    if len(parts) != 3 or parts[0] != "index":
+        return False
+    object_range = parts[1]
+    if ".." not in object_range:
+        return False
+    before_text, after_text = object_range.split("..", maxsplit=1)
+    mode_text = parts[2]
+    if len(mode_text) != 6 or not all(character in _GIT_PATCH_FILE_MODE_DIGITS for character in mode_text):
+        return False
+    return _looks_like_git_object_id_fragment(before_text) and _looks_like_git_object_id_fragment(after_text)
 
 
 def _is_allowed_test_secret_placeholder(
@@ -331,6 +354,24 @@ def _is_prefix_metadata_assignment(key_text: str, value_text: str) -> bool:
     return all(character.isalnum() or character in _PREFIX_METADATA_DELIMITERS for character in normalized_value)
 
 
+def _is_symbolic_reference_assignment(key_text: str, value_text: str) -> bool:
+    normalized_key = _normalize_key(key_text)
+    key_tokens = tuple(token for token in normalized_key.split("_") if token)
+    if "token" not in key_tokens:
+        return False
+
+    literal_value = _unwrap_literal_value(value_text)
+    if literal_value is None:
+        return False
+    normalized_value = literal_value.strip()
+    if not normalized_value.startswith("@") or len(normalized_value) < 3:
+        return False
+    suffix = normalized_value[1:]
+    if not suffix or suffix[0] == "_" or suffix[-1] == "_":
+        return False
+    return all(character in _SYMBOLIC_REFERENCE_CHARS for character in suffix)
+
+
 def _looks_like_sensitive_literal_value(value_text: str, *, min_length: int) -> bool:
     unwrapped = _unwrap_literal_value(value_text)
     if unwrapped is None:
@@ -463,6 +504,8 @@ def _scan_added_line(added_line: AddedLine, policy: GuardPolicy, issues: list[Sc
                     return
                 if _is_prefix_metadata_assignment(key_text, value_text):
                     return
+                if _is_symbolic_reference_assignment(key_text, value_text):
+                    return
                 if _looks_like_sensitive_literal_value(value_text, min_length=policy.content.secret_min_length):
                     issues.append(
                         ScanIssue(
@@ -477,6 +520,8 @@ def _scan_added_line(added_line: AddedLine, policy: GuardPolicy, issues: list[Sc
                     return
 
     if not is_test_like_path:
+        if _looks_like_git_patch_index_metadata(added_line.text):
+            return
         phone_candidates = _iter_phone_candidates(
             added_line.text,
             min_digits=policy.phones.min_digits,

@@ -9,7 +9,7 @@ subscriptions that Twinr already follows for its world-intelligence layer.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import ipaddress
@@ -18,18 +18,29 @@ import socket
 from urllib.parse import urlsplit, urlunsplit
 
 from twinr.agent.base_agent.config import TwinrConfig
-from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
+from twinr.agent.personality._remote_state_utils import (
+    clone_remote_state_with_capped_read_timeout as _clone_remote_state_with_capped_read_timeout,
+)
+from twinr.agent.personality.intelligence.models import WorldFeedSubscription
+from twinr.agent.personality.intelligence.store import RemoteStateWorldIntelligenceStore
+from twinr.memory.longterm.storage._remote_current_records import LongTermRemoteCurrentRecordStore
+from twinr.memory.longterm.storage.remote_state import (
+    LongTermRemoteStateStore,
+    LongTermRemoteUnavailableError,
+)
 
 # CHANGELOG: 2026-03-28
 # BUG-1: Fixed incorrect recency ordering caused by lexicographic sorting of ISO timestamps with different UTC offsets.
 # BUG-2: Fixed repeated legacy re-migration when an authoritative snapshot existed but its items list was empty, which could resurrect removed feeds.
-# BUG-3: Fixed resolver crashes on malformed snapshots and remote-state read/write failures by degrading gracefully and salvaging valid items.
-# BUG-4: Fixed duplicate feed selection for semantically equivalent URLs (case/default-port/fragment variants).
+# BUG-3: Fixed duplicate feed selection for semantically equivalent URLs (case/default-port/fragment variants).
+# BUG-4: Stopped the HDMI ticker from reading subscription sources through the heavy legacy snapshot blob lane; it now uses bounded current-head reads only.
+# BUG-5: Deleted silent resolver fallbacks so remote-memory and migration failures surface instead of being masked behind stale in-process entries.
 # SEC-1: Reject non-http(s), credential-bearing, localhost/private/link-local/multicast/reserved feed URLs before returning or persisting them.
 # IMP-1: Added canonical URL normalization and typed resolved-feed metadata via resolve_feed_entries().
-# IMP-2: Added deterministic schema-aware normalization with in-process last-good caching for edge-resilient Raspberry Pi deployments.
+# IMP-2: Bounded HDMI ticker source-resolution reads with the same display refresh budget used for external feed fetches.
 
 _DEFAULT_MAX_FEED_URLS = 8
+_DEFAULT_REMOTE_READ_TIMEOUT_S = 4.0
 _WORLD_INTELLIGENCE_SUBSCRIPTIONS_KIND = "agent_world_intelligence_subscriptions_v1"
 
 _ALLOWED_FEED_URL_SCHEMES = frozenset({"http", "https"})
@@ -52,8 +63,6 @@ _LOCAL_HOST_SUFFIXES = (
 )
 _MAX_FEED_URL_LENGTH = 2048
 _MIN_RECENCY_EPOCH = float("-inf")
-_TRUE_TEXT = frozenset({"1", "true", "yes", "y", "on"})
-_FALSE_TEXT = frozenset({"0", "false", "no", "n", "off"})
 
 
 def _clean_text(value: object | None) -> str:
@@ -108,37 +117,30 @@ def _host_label(feed_url: str) -> str:
 def _normalize_float(value: object | None, *, default: float) -> float:
     """Normalize one optional numeric value into a finite float."""
 
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return default
+    if not isinstance(value, (int, float, str, bytes, bytearray)):
+        return default
     try:
-        candidate = float(value) if value is not None else default
+        candidate = float(value)
     except (TypeError, ValueError):
         return default
     return candidate if math.isfinite(candidate) else default
 
 
-def _normalize_bool(value: object | None, *, default: bool) -> bool:
-    """Normalize one optional truthy-ish value into a bool."""
-
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        if isinstance(value, float) and not math.isfinite(value):
-            return default
-        return bool(value)
-    text = _clean_text(value).casefold()
-    if text in _TRUE_TEXT:
-        return True
-    if text in _FALSE_TEXT:
-        return False
-    return default
-
-
 def _normalize_int(value: object | None, *, default: int, minimum: int) -> int:
     """Normalize one optional integer-ish value into a bounded int."""
 
+    if value is None:
+        return max(minimum, default)
+    if isinstance(value, bool):
+        return max(minimum, default)
+    if not isinstance(value, (int, float, str, bytes, bytearray)):
+        return max(minimum, default)
     try:
-        normalized = int(value) if value is not None else default
+        normalized = int(value)
     except (TypeError, ValueError):
         normalized = default
     return max(minimum, normalized)
@@ -298,13 +300,9 @@ class DisplayWorldIntelligenceTickerFeedResolver:
     config: TwinrConfig
     remote_state: LongTermRemoteStateStore | None = None
     max_feed_urls: int = _DEFAULT_MAX_FEED_URLS
+    remote_read_timeout_s: float = _DEFAULT_REMOTE_READ_TIMEOUT_S
     subscriptions_snapshot_kind: str = _WORLD_INTELLIGENCE_SUBSCRIPTIONS_KIND
     allow_private_hosts: bool = False
-    _last_good_entries: tuple[ResolvedWorldIntelligenceFeed, ...] = field(
-        default=(),
-        init=False,
-        repr=False,
-    )
 
     @classmethod
     def from_config(
@@ -319,6 +317,7 @@ class DisplayWorldIntelligenceTickerFeedResolver:
             config=config,
             remote_state=remote_state,
             max_feed_urls=_DEFAULT_MAX_FEED_URLS,
+            remote_read_timeout_s=getattr(config, "display_news_ticker_timeout_s", _DEFAULT_REMOTE_READ_TIMEOUT_S),
         )
 
     def resolve_feed_entries(self) -> tuple[ResolvedWorldIntelligenceFeed, ...]:
@@ -326,29 +325,40 @@ class DisplayWorldIntelligenceTickerFeedResolver:
 
         remote_state = self._get_remote_state()
         if remote_state is None or not getattr(remote_state, "enabled", False):
-            return self._last_good_entries
-
-        try:
-            payload = remote_state.load_snapshot(
-                snapshot_kind=self.subscriptions_snapshot_kind,
+            raise LongTermRemoteUnavailableError(
+                "Required remote long-term memory is unavailable for display news ticker sources."
             )
-        except Exception:
-            return self._last_good_entries
-
-        if payload is None:
-            migrated = self._maybe_migrate_legacy_feed_urls(remote_state=remote_state)
-            if migrated:
-                self._last_good_entries = migrated
-                return migrated
-            self._last_good_entries = ()
-            return ()
-
-        resolved, authoritative = self._resolve_entries_from_payload(payload)
-        if authoritative:
-            self._last_good_entries = resolved
-            return resolved
-
-        return self._last_good_entries
+        bounded_remote_state = self._bounded_remote_state(remote_state)
+        current_records = LongTermRemoteCurrentRecordStore(bounded_remote_state)
+        probe_status, head_payload = current_records.probe_current_head_result(
+            snapshot_kind=self.subscriptions_snapshot_kind,
+            fast_fail=True,
+        )
+        if probe_status == "found":
+            subscriptions = self._load_current_subscriptions(
+                current_records=current_records,
+                head_payload=head_payload,
+            )
+            return self._resolve_entries_from_subscriptions(subscriptions)
+        if probe_status == "not_found":
+            legacy_head = current_records.probe_legacy_collection_head(
+                snapshot_kind=self.subscriptions_snapshot_kind,
+                prefer_metadata_only=True,
+            )
+            if isinstance(legacy_head, Mapping):
+                raise LongTermRemoteUnavailableError(
+                    f"Display news ticker subscriptions current head {self.subscriptions_snapshot_kind!r} "
+                    "is missing while a legacy snapshot still exists; repair the authoritative current-head lane."
+                )
+            return self._maybe_migrate_legacy_feed_urls(remote_state=remote_state)
+        if probe_status == "invalid":
+            raise LongTermRemoteUnavailableError(
+                f"Display news ticker subscriptions current head {self.subscriptions_snapshot_kind!r} is invalid."
+            )
+        raise LongTermRemoteUnavailableError(
+            f"Display news ticker subscriptions current head {self.subscriptions_snapshot_kind!r} "
+            f"is unavailable (status={probe_status!r})."
+        )
 
     def resolve_feed_urls(self) -> tuple[str, ...]:
         """Return the bounded active feed URLs Twinr already follows."""
@@ -360,91 +370,125 @@ class DisplayWorldIntelligenceTickerFeedResolver:
 
         if self.remote_state is not None:
             return self.remote_state
-        try:
-            self.remote_state = LongTermRemoteStateStore.from_config(self.config)
-        except Exception:
-            self.remote_state = None
+        self.remote_state = LongTermRemoteStateStore.from_config(self.config)
         return self.remote_state
 
-    def _resolve_entries_from_payload(
+    def _bounded_remote_state(
         self,
-        payload: object,
-    ) -> tuple[tuple[ResolvedWorldIntelligenceFeed, ...], bool]:
-        """Normalize one snapshot payload into resolved feed entries."""
+        remote_state: LongTermRemoteStateStore,
+    ) -> LongTermRemoteStateStore:
+        """Clone the remote-state reader with a bounded read timeout for ticker reads."""
 
-        if not isinstance(payload, Mapping):
-            return (), False
+        timeout_s = max(
+            0.5,
+            _normalize_float(
+                self.remote_read_timeout_s,
+                default=_DEFAULT_REMOTE_READ_TIMEOUT_S,
+            ),
+        )
+        bounded = _clone_remote_state_with_capped_read_timeout(
+            config=self.config,
+            remote_state=remote_state,
+            timeout_s=timeout_s,
+        )
+        if bounded is None or not getattr(bounded, "enabled", False):
+            raise LongTermRemoteUnavailableError(
+                "Required remote long-term memory is unavailable for display news ticker sources."
+            )
+        return bounded
 
-        raw_items = payload.get("items")
-        if raw_items is None:
-            return (), False
-        if not isinstance(raw_items, Sequence) or isinstance(raw_items, (str, bytes, bytearray)):
-            return (), False
+    def _declared_item_count(self, payload: Mapping[str, object]) -> int | None:
+        """Return one declared current-head item count when present."""
+
+        raw_count = payload.get("items_count")
+        if raw_count is None:
+            raw_count = payload.get("item_count")
+        if isinstance(raw_count, bool):
+            return None
+        if isinstance(raw_count, int) and raw_count >= 0:
+            return raw_count
+        return None
+
+    def _load_current_subscriptions(
+        self,
+        *,
+        current_records: LongTermRemoteCurrentRecordStore,
+        head_payload: Mapping[str, object] | None,
+    ) -> tuple[WorldFeedSubscription, ...]:
+        """Load the authoritative current-head subscription items without legacy blob reads."""
+
+        if not isinstance(head_payload, Mapping):
+            raise LongTermRemoteUnavailableError(
+                f"Display news ticker subscriptions current head {self.subscriptions_snapshot_kind!r} "
+                "was reported as found but returned no payload."
+            )
+        payloads = current_records.load_collection_payloads(
+            snapshot_kind=self.subscriptions_snapshot_kind,
+            head_payload=head_payload,
+        )
+        declared_item_count = self._declared_item_count(head_payload)
+        if declared_item_count is not None and len(payloads) < declared_item_count:
+            raise LongTermRemoteUnavailableError(
+                f"Display news ticker subscriptions current head {self.subscriptions_snapshot_kind!r} "
+                f"declares {declared_item_count} item(s) but only {len(payloads)} hydrated."
+            )
+
+        subscriptions: list[WorldFeedSubscription] = []
+        for index, payload in enumerate(payloads):
+            if not isinstance(payload, Mapping):
+                raise ValueError(
+                    f"{self.subscriptions_snapshot_kind}.items[{index}] must be a mapping."
+                )
+            subscriptions.append(WorldFeedSubscription.from_payload(payload))
+        return tuple(subscriptions)
+
+    def _resolve_entries_from_subscriptions(
+        self,
+        subscriptions: Sequence[WorldFeedSubscription],
+    ) -> tuple[ResolvedWorldIntelligenceFeed, ...]:
+        """Normalize authoritative subscriptions into resolved feed entries."""
 
         active: list[ResolvedWorldIntelligenceFeed] = []
-        for raw_item in raw_items:
-            if not isinstance(raw_item, Mapping):
+        for subscription in subscriptions:
+            if not subscription.active:
                 continue
-            normalized = self._normalize_subscription(raw_item)
-            if normalized is None:
-                continue
-            active.append(normalized)
+            feed_url = _normalize_feed_url(
+                subscription.feed_url,
+                allow_private_hosts=self.allow_private_hosts,
+            )
+            active.append(
+                ResolvedWorldIntelligenceFeed(
+                    subscription_id=subscription.subscription_id,
+                    feed_url=feed_url,
+                    label=_clean_text(subscription.label) or _host_label(feed_url),
+                    priority=_normalize_float(subscription.priority, default=0.0),
+                    recency_epoch=_timestamp_epoch(
+                        subscription.last_refreshed_at,
+                        subscription.updated_at,
+                        subscription.created_at,
+                    ),
+                    refreshed_at=_first_timestamp_text(
+                        subscription.last_refreshed_at,
+                        subscription.updated_at,
+                        subscription.created_at,
+                    ),
+                )
+            )
 
         limit = _normalize_int(self.max_feed_urls, default=_DEFAULT_MAX_FEED_URLS, minimum=1)
         ordered: list[ResolvedWorldIntelligenceFeed] = []
         seen_urls: set[str] = set()
-        for subscription in sorted(
+        for entry in sorted(
             active,
             key=lambda item: (-item.priority, -item.recency_epoch, item.feed_url),
         ):
-            if subscription.feed_url in seen_urls:
+            if entry.feed_url in seen_urls:
                 continue
-            seen_urls.add(subscription.feed_url)
-            ordered.append(subscription)
+            seen_urls.add(entry.feed_url)
+            ordered.append(entry)
             if len(ordered) >= limit:
                 break
-        return tuple(ordered), True
-
-    def _normalize_subscription(
-        self,
-        subscription: Mapping[str, object],
-    ) -> ResolvedWorldIntelligenceFeed | None:
-        """Best-effort normalize one subscription mapping."""
-
-        if not _normalize_bool(subscription.get("active", True), default=True):
-            return None
-
-        try:
-            feed_url = _normalize_feed_url(
-                subscription.get("feed_url"),
-                allow_private_hosts=self.allow_private_hosts,
-            )
-        except ValueError:
-            return None
-        if not feed_url:
-            return None
-
-        refreshed_at = _first_timestamp_text(
-            subscription.get("last_refreshed_at"),
-            subscription.get("updated_at"),
-            subscription.get("created_at"),
-        )
-        recency_epoch = _timestamp_epoch(
-            subscription.get("last_refreshed_at"),
-            subscription.get("updated_at"),
-            subscription.get("created_at"),
-        )
-        label = _clean_text(subscription.get("label")) or _host_label(feed_url)
-        subscription_id = _clean_text(subscription.get("subscription_id")) or _subscription_id(feed_url)
-        priority = _normalize_float(subscription.get("priority"), default=0.0)
-        return ResolvedWorldIntelligenceFeed(
-            subscription_id=subscription_id,
-            feed_url=feed_url,
-            label=label,
-            priority=priority,
-            recency_epoch=recency_epoch,
-            refreshed_at=refreshed_at,
-        )
+        return tuple(ordered)
 
     def _normalized_legacy_feed_urls(self) -> tuple[str, ...]:
         """Return validated legacy ticker URLs in canonical form."""
@@ -485,45 +529,30 @@ class DisplayWorldIntelligenceTickerFeedResolver:
         if not legacy_urls:
             return ()
         now_iso = _utcnow_iso()
-        payload = {
-            "schema_version": 2,
-            "migrated_at": now_iso,
-            "items": [
-                {
-                    "subscription_id": _subscription_id(feed_url),
-                    "label": _host_label(feed_url),
-                    "feed_url": feed_url,
-                    "scope": "topic",
-                    "topics": [],
-                    "priority": 0.6,
-                    "base_priority": 0.6,
-                    "active": True,
-                    "refresh_interval_hours": 72,
-                    "base_refresh_interval_hours": 72,
-                    "created_by": "legacy_display_news_ticker",
-                    "created_at": now_iso,
-                    "updated_at": now_iso,
-                    "last_refreshed_at": now_iso,
-                    "last_item_ids": [],
-                }
-                for feed_url in legacy_urls
-            ],
-        }
-        try:
-            remote_state.save_snapshot(
-                snapshot_kind=self.subscriptions_snapshot_kind,
-                payload=payload,
-            )
-        except Exception:
-            pass
-        return tuple(
-            ResolvedWorldIntelligenceFeed(
+        subscriptions = tuple(
+            WorldFeedSubscription(
                 subscription_id=_subscription_id(feed_url),
-                feed_url=feed_url,
                 label=_host_label(feed_url),
+                feed_url=feed_url,
+                scope="topic",
+                topics=(),
                 priority=0.6,
-                recency_epoch=_timestamp_epoch(now_iso),
-                refreshed_at=now_iso,
+                base_priority=0.6,
+                active=True,
+                refresh_interval_hours=72,
+                base_refresh_interval_hours=72,
+                created_by="legacy_display_news_ticker",
+                created_at=now_iso,
+                updated_at=now_iso,
+                last_refreshed_at=now_iso,
             )
             for feed_url in legacy_urls
         )
+        RemoteStateWorldIntelligenceStore(
+            subscriptions_snapshot_kind=self.subscriptions_snapshot_kind,
+        ).save_subscriptions(
+            config=self.config,
+            subscriptions=subscriptions,
+            remote_state=remote_state,
+        )
+        return self._resolve_entries_from_subscriptions(subscriptions)

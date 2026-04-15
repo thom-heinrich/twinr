@@ -6,7 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from types import SimpleNamespace
 import math
 import shutil
@@ -15,7 +15,7 @@ import tempfile
 import time
 import unittest
 from unittest import mock
-from typing import cast
+from typing import Protocol, cast, runtime_checkable
 import wave
 from zoneinfo import ZoneInfo
 
@@ -50,6 +50,7 @@ from twinr.memory.longterm.storage.remote_state import (
 )
 from twinr.memory.reminders import now_in_timezone
 from twinr.orchestrator.voice_activation import VoiceActivationMatch
+from twinr.orchestrator.voice_contracts import OrchestratorVoiceWakeSpeculativeEvent
 from twinr.proactive import SocialTriggerDecision, SocialTriggerPriority
 from twinr.proactive.runtime.audio_policy import ReSpeakerAudioPolicySnapshot
 from twinr.proactive.runtime.gesture_wakeup_lane import GestureWakeupDecision
@@ -58,6 +59,8 @@ from twinr.providers.openai import OpenAITextResponse
 from twinr.providers.openai.core.types import OpenAISearchAttempt
 from twinr.providers.openai.realtime import OpenAIRealtimeTurn
 from twinr.agent.workflows.realtime_runner import TwinrRealtimeHardwareLoop
+import twinr.agent.workflows.realtime_runner_impl.bootstrap as realtime_bootstrap_module
+import twinr.agent.workflows.realtime_runtime.support as realtime_support_module
 from twinr.agent.base_agent import TwinrRuntime
 from twinr.agent.base_agent import TwinrStatus
 from twinr.agent.base_agent.conversation.closure import ConversationClosureDecision
@@ -749,6 +752,7 @@ class FakeAmbientAudioSampler:
 class FakeVoiceOrchestrator:
     def __init__(self, *, ready_backend: str = "remote_asr") -> None:
         self.states: list[tuple[str, str | None, bool]] = []
+        self.wait_ids: list[str | None] = []
         self.intent_contexts: list[dict[str, object | None]] = []
         self.paused: list[str] = []
         self.resumed: list[str] = []
@@ -781,6 +785,7 @@ class FakeVoiceOrchestrator:
         **_kwargs,
     ) -> None:
         self.states.append((state, detail, follow_up_allowed))
+        self.wait_ids.append(_kwargs.get("wait_id") if isinstance(_kwargs.get("wait_id"), str) else None)
         payload = {
             "attention_state": attention_state,
             "interaction_intent_state": interaction_intent_state,
@@ -955,10 +960,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
 
     @staticmethod
     def _cleanup_loop(loop: TwinrRealtimeHardwareLoop) -> None:
-        try:
-            loop.close(timeout_s=0.2)
-        except Exception:
-            pass
+        loop.close(timeout_s=0.2)
 
     def make_loop(
         self,
@@ -1137,10 +1139,10 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
 
         self.assertNotIn("list_smart_home_entities", loop._tool_handlers)
         self.assertNotIn("read_smart_home_sensor_stream", loop._tool_handlers)
-        self.assertNotIn("inspect_camera", loop._tool_handlers)
+        self.assertIn("inspect_camera", loop._tool_handlers)
         self.assertNotIn("list_smart_home_entities", loop.realtime_session._tool_handlers)
         self.assertNotIn("read_smart_home_sensor_stream", loop.realtime_session._tool_handlers)
-        self.assertNotIn("inspect_camera", loop.realtime_session._tool_handlers)
+        self.assertIn("inspect_camera", loop.realtime_session._tool_handlers)
 
         loop.authorize_realtime_sensitive_tools("test")
 
@@ -1689,7 +1691,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
 
         self.assertEqual(feedback_kinds[:2], ["processing", "answering"])
 
-    def test_green_button_falls_back_to_tts_when_realtime_returns_text_only(self) -> None:
+    def test_green_button_fails_closed_when_realtime_returns_text_only(self) -> None:
         class TextOnlyRealtimeSession(FakeRealtimeSession):
             def run_audio_turn(
                 self,
@@ -1724,16 +1726,17 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
 
         self.assertEqual(realtime_session.calls, [])
         self.assertEqual(loop.realtime_session.calls, [b"PCMINPUT"])
-        self.assertEqual(backend.synthesize_calls, ["Guten Tag"])
-        self.assertEqual(player.played, [b"PCM"])
-        self.assertIn("realtime_audio_fallback=true", lines)
+        self.assertEqual(backend.synthesize_calls, [])
+        self.assertEqual(player.played, [])
         self.assertIn("realtime_turn_provider_complete=true", lines)
         self.assertIn("realtime_turn_provider_audio_received=false", lines)
-        self.assertIn("realtime_turn_tts_fallback_start=true", lines)
-        self.assertIn("realtime_tts_playback_started=true", lines)
-        self.assertIn("realtime_tts_playback_completed=true", lines)
-        self.assertIn("realtime_turn_tts_fallback_done=true", lines)
-        self.assertTrue(any(line.startswith("timing_tts_fallback_ms=") for line in lines))
+        self.assertIn("realtime_provider_audio_missing=true", lines)
+        self.assertIn("status=error", lines)
+        self.assertNotIn("realtime_audio_fallback=true", lines)
+        self.assertNotIn("realtime_turn_tts_fallback_start=true", lines)
+        self.assertNotIn("realtime_tts_playback_started=true", lines)
+        self.assertNotIn("realtime_tts_playback_completed=true", lines)
+        self.assertNotIn("realtime_turn_tts_fallback_done=true", lines)
 
     def test_yellow_button_accepts_split_support_providers(self) -> None:
         backend = FakePrintBackend()
@@ -1779,9 +1782,60 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(loop.runtime.last_transcript, "")
         self._assert_redacted_text_observation(lines, key="transcript", raw_text="Hallo Twinr")
 
-    def test_voice_activation_without_remaining_text_opens_listening_window(self) -> None:
-        loop, lines, realtime_session, print_backend, recorder, player, _printer = self.make_loop()
-        print_backend.synthesize_result = _pcm_to_test_wav_bytes((b"\x08\x00" + b"\xf8\xff") * 800)
+    def test_voice_activation_without_remaining_text_fails_closed_without_voice_orchestrator(self) -> None:
+        loop, lines, realtime_session, _print_backend, recorder, player, _printer = self.make_loop()
+
+        handled = loop.handle_voice_activation(
+            VoiceActivationMatch(
+                detected=True,
+                transcript="Hey Twinr",
+                matched_phrase="hey twinr",
+                remaining_text="",
+                normalized_transcript="hey twinr",
+            )
+        )
+
+        self.assertFalse(handled)
+        self.assertEqual(realtime_session.calls, [])
+        self.assertEqual(realtime_session.text_calls, [])
+        self.assertEqual(recorder.pause_values, [])
+        self.assertEqual(player.tones, [])
+        self.assertEqual(player.played, [])
+        self.assertIn("voice_activation_mode=listen", lines)
+        self.assertIn("voice_orchestrator_live_audio_required=voice_activation", lines)
+        self.assertNotIn("voice_activation_ack=Ja?", lines)
+        self.assertEqual(loop.runtime.status.value, "waiting")
+        self.assertTrue(any(line.startswith("error=") for line in lines))
+
+    def test_voice_activation_ack_beeps_after_listening_state_is_visible(self) -> None:
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
+        beep_statuses: list[str] = []
+        loop._play_listen_beep = lambda: beep_statuses.append(loop.runtime.status.value)  # type: ignore[method-assign]
+
+        class _AutoCommitVoiceOrchestrator(FakeVoiceOrchestrator):
+            def notify_runtime_state(
+                self,
+                *,
+                state: str,
+                detail: str | None = None,
+                follow_up_allowed: bool = False,
+                **kwargs,
+            ) -> None:
+                super().notify_runtime_state(
+                    state=state,
+                    detail=detail,
+                    follow_up_allowed=follow_up_allowed,
+                    **kwargs,
+                )
+                if state == "listening":
+                    loop.handle_remote_transcript_committed(
+                        "wie geht es dir",
+                        "listening",
+                        kwargs.get("wait_id"),
+                        "item-listening-1",
+                    )
+
+        loop.voice_orchestrator = _AutoCommitVoiceOrchestrator()
 
         handled = loop.handle_voice_activation(
             VoiceActivationMatch(
@@ -1794,20 +1848,52 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         )
 
         self.assertTrue(handled)
-        self.assertEqual(realtime_session.calls, [b"PCMINPUT"])
-        self.assertEqual(realtime_session.text_calls, [])
-        self.assertEqual(recorder.pause_values, [1200])
-        self.assertEqual(recorder.start_timeouts, [loop.config.conversation_follow_up_timeout_s])
-        self.assertEqual(recorder.speech_start_chunks, [loop.config.audio_follow_up_speech_start_chunks])
-        self.assertEqual(recorder.ignore_initial_ms, [loop.config.audio_follow_up_ignore_ms])
-        self.assertEqual(recorder.pause_grace_values, [loop.config.adaptive_timing_pause_grace_ms])
-        self.assertGreaterEqual(len(player.tones), 1)
-        self.assertEqual(
-            player.played,
-            [_wav_frames(normalize_wav_playback_level(print_backend.synthesize_result)), b"PCM"],
-        )
-        self.assertIn("voice_activation_mode=listen", lines)
-        self.assertIn("voice_activation_ack=Ja?", lines)
+        self.assertEqual(beep_statuses, ["listening"])
+
+    def test_wake_confirmed_defers_speculative_display_clear_until_runtime_progress(self) -> None:
+        loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
+
+        class _FakeWakeCueController:
+            def __init__(self) -> None:
+                self.show_calls: list[dict[str, object]] = []
+                self.clear_calls = 0
+
+            def show_speculative_wake(self, **payload: object) -> None:
+                self.show_calls.append(dict(payload))
+
+            def clear(self) -> None:
+                self.clear_calls += 1
+
+        loop.display_wake_cue_controller = _FakeWakeCueController()
+
+        with mock.patch(
+            "twinr.agent.workflows.realtime_runner_impl.session.request_display_companion_wakeup",
+            return_value=True,
+        ):
+            loop._show_speculative_wake_display_cue(
+                OrchestratorVoiceWakeSpeculativeEvent(
+                    matched_phrase="twinr",
+                    backend="remote_asr",
+                    ttl_ms=2400,
+                    detector_label="stage1",
+                    score=0.91,
+                )
+            )
+            loop._clear_speculative_wake_display_cue("wake_confirmed")
+
+            self.assertEqual(loop.display_wake_cue_controller.clear_calls, 0)
+            self.assertIn(
+                "voice_orchestrator_speculative_wake_display_clear_deferred=wake_confirmed",
+                lines,
+            )
+
+            loop.runtime.begin_listening(request_source="voice_activation")
+            loop.runtime.submit_transcript("wie geht es dir")
+            loop._emit_status(force=True)
+
+        self.assertEqual(loop.display_wake_cue_controller.clear_calls, 1)
+        self.assertIn("voice_orchestrator_speculative_wake_display_cleared=wake_confirmed", lines)
+        self.assertIsNone(getattr(loop, "_pending_speculative_wake_display_clear_reason", None))
 
     def test_voice_activation_is_ignored_while_runtime_quiet_mode_is_active(self) -> None:
         loop, lines, realtime_session, _print_backend, recorder, player, _printer = self.make_loop()
@@ -1860,7 +1946,12 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                     **kwargs,
                 )
                 if state == "listening":
-                    loop.handle_remote_transcript_committed("wie geht es dir", "listening")
+                    loop.handle_remote_transcript_committed(
+                        "wie geht es dir",
+                        "listening",
+                        kwargs.get("wait_id"),
+                        "item-listening-1",
+                    )
 
         loop.voice_orchestrator = _AutoCommitVoiceOrchestrator()
 
@@ -2197,17 +2288,30 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             ],
         )
 
-    def test_prime_voice_orchestrator_waiting_state_defers_until_sensor_context_exists(self) -> None:
+    def test_prime_voice_orchestrator_waiting_state_attests_waiting_before_sensor_context_exists(self) -> None:
         loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
         fake_voice = FakeVoiceOrchestrator()
         loop.voice_orchestrator = fake_voice
 
         loop._prime_voice_orchestrator_waiting_state()
 
+        self.assertEqual(fake_voice.states, [("waiting", None, False)])
         self.assertEqual(loop._last_voice_orchestrator_runtime_state, ("waiting", None, False))
         self.assertIsNone(loop._last_voice_orchestrator_intent_context)
-        self.assertEqual(fake_voice.states, [])
-        self.assertEqual(fake_voice.intent_contexts, [])
+        self.assertEqual(
+            fake_voice.intent_contexts,
+            [
+                {
+                    "attention_state": None,
+                    "interaction_intent_state": None,
+                    "person_visible": None,
+                    "presence_active": None,
+                    "interaction_ready": None,
+                    "targeted_inference_blocked": None,
+                    "recommended_channel": None,
+                }
+            ],
+        )
 
         loop._latest_sensor_observation_facts = {
             "camera": {"person_visible": True},
@@ -2222,10 +2326,19 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
 
         loop._refresh_voice_orchestrator_sensor_context()
 
-        self.assertEqual(fake_voice.states, [("waiting", None, False)])
+        self.assertEqual(fake_voice.states, [("waiting", None, False), ("waiting", None, False)])
         self.assertEqual(
             fake_voice.intent_contexts,
             [
+                {
+                    "attention_state": None,
+                    "interaction_intent_state": None,
+                    "person_visible": None,
+                    "presence_active": None,
+                    "interaction_ready": None,
+                    "targeted_inference_blocked": None,
+                    "recommended_channel": None,
+                },
                 {
                     "attention_state": "attending_to_device",
                     "interaction_intent_state": "showing_intent",
@@ -2313,6 +2426,8 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         )
         fake_voice = FakeVoiceOrchestrator()
         loop.voice_orchestrator = fake_voice
+        beep_statuses: list[str] = []
+        loop._play_listen_beep = lambda: beep_statuses.append(loop.runtime.status.value)  # type: ignore[method-assign]
         realtime_session.turns = [
             OpenAIRealtimeTurn(
                 transcript="Wie spaet ist es?",
@@ -2333,6 +2448,8 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn(("thinking", "voice_activation", False), fake_voice.states)
         self.assertIn(("speaking", "voice_activation", True), fake_voice.states)
         self.assertIn(("follow_up_open", "voice_activation", True), fake_voice.states)
+        self.assertEqual(beep_statuses, ["listening"])
+        self.assertIn("conversation_follow_up_ack=earcon", lines)
         self.assertNotIn("conversation_follow_up_vetoed=closure", lines)
 
     def test_voice_orchestrator_keeps_follow_up_open_for_timezone_clarification_without_question_mark(self) -> None:
@@ -2421,6 +2538,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             config=TwinrConfig(conversation_follow_up_enabled=True)
         )
         loop.voice_orchestrator = FakeVoiceOrchestrator()
+        loop.runtime.begin_listening(request_source="follow_up")
         loop._last_voice_orchestrator_runtime_state = ("follow_up_open", "follow_up", True)
         captured_kwargs: dict[str, object] = {}
 
@@ -2429,8 +2547,16 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             return True
 
         loop._run_conversation_session = fake_run_conversation_session  # type: ignore[method-assign]
+        loop._required_remote_dependency_current_ready = lambda: True  # type: ignore[method-assign]
+        loop._request_required_remote_dependency_refresh = lambda: None  # type: ignore[method-assign]
+        loop._last_voice_orchestrator_runtime_wait_id = "wait-follow-up"
 
-        handled = loop.handle_remote_transcript_committed("wie geht es dir", "follow_up")
+        handled = loop.handle_remote_transcript_committed(
+            "wie geht es dir",
+            "follow_up",
+            "wait-follow-up",
+            "item-follow-up-1",
+        )
 
         self.assertTrue(handled)
         self.assertEqual(captured_kwargs["initial_source"], "follow_up")
@@ -2532,7 +2658,11 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         )
         self.assertIsNotNone(peek_pending_conversation_follow_up_hint(loop.runtime))
 
-        loop.handle_remote_follow_up_closed("timeout")
+        loop.handle_remote_follow_up_closed(
+            "timeout",
+            loop._last_voice_orchestrator_runtime_wait_id,
+            "item-follow-up-1",
+        )
 
         self.assertEqual(loop.runtime.status, TwinrStatus.WAITING)
         self.assertIsNone(peek_pending_conversation_follow_up_hint(loop.runtime))
@@ -2546,7 +2676,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         loop.runtime.begin_listening(request_source="voice_activation")
         loop._notify_voice_orchestrator_state("listening", detail="voice_activation", follow_up_allowed=False)
 
-        loop.handle_remote_follow_up_closed("timeout")
+        loop.handle_remote_follow_up_closed("timeout", "wait-follow-up-stale", "item-follow-up-stale")
 
         self.assertEqual(loop.runtime.status, TwinrStatus.LISTENING)
         self.assertEqual(loop._last_voice_orchestrator_runtime_state, ("listening", "voice_activation", False))
@@ -3401,6 +3531,35 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn("Arzttermin am Montag um 14 Uhr.", memory_text)
         self.assertEqual(loop.runtime.memory.ledger[-1].kind, "fact")
         self.assertIn("memory_tool_call=true", lines)
+
+    def test_review_saved_memories_tool_call_returns_explicit_memories(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+
+            loop._handle_remember_memory_tool_call(
+                {
+                    "kind": "fact",
+                    "summary": "The house key is in the blue box in the hallway.",
+                    "confirmed": True,
+                }
+            )
+            result = loop._handle_review_saved_memories_tool_call(
+                {
+                    "limit": 5,
+                    "confirmed": True,
+                }
+            )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["memory_count"], 1)
+        self.assertEqual(result["memories"][0]["summary"], "The house key is in the blue box in the hallway.")
+        self.assertIn("saved_memory_review_tool_call=true", lines)
 
     def test_schedule_reminder_tool_call_writes_reminder_store(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -6263,6 +6422,27 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertTrue(proactive_monitor.entered)
         self.assertTrue(proactive_monitor.exited)
 
+    def test_run_records_background_lane_memory_checkpoints(self) -> None:
+        button_monitor = FakeIdleButtonMonitor()
+        proactive_monitor = FakeProactiveMonitor()
+        voice_orchestrator = FakeVoiceOrchestrator()
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            button_monitor=button_monitor,
+            proactive_monitor=proactive_monitor,
+        )
+        loop.voice_orchestrator = voice_orchestrator
+
+        with mock.patch.object(loop, "_record_streaming_memory_probe") as record_probe:
+            result = loop.run(duration_s=0.01, poll_timeout=0.001)
+
+        self.assertEqual(result, 0)
+        labels = [call.kwargs["label"] for call in record_probe.call_args_list]
+        self.assertIn("realtime_runtime.required_remote_watch_started", labels)
+        self.assertIn("realtime_runtime.voice_orchestrator_opened", labels)
+        self.assertIn("realtime_runtime.proactive_monitor_opened", labels)
+        self.assertIn("realtime_runtime.housekeeping_started", labels)
+        self.assertIn("realtime_runtime.heartbeat", labels)
+
     def test_run_starts_boot_sound_once_when_runtime_is_not_in_error(self) -> None:
         button_monitor = FakeIdleButtonMonitor()
         loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
@@ -6277,6 +6457,39 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             config=loop.config,
             playback_coordinator=loop.playback_coordinator,
             emit=loop.emit,
+        )
+
+    def test_run_opens_voice_orchestrator_before_starting_boot_sound(self) -> None:
+        button_monitor = FakeIdleButtonMonitor()
+        events: list[str] = []
+
+        class _TrackingVoiceOrchestrator(FakeVoiceOrchestrator):
+            def __enter__(self):
+                events.append("voice_orchestrator_enter")
+                return super().__enter__()
+
+        voice_orchestrator = _TrackingVoiceOrchestrator()
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            button_monitor=button_monitor,
+        )
+        loop.voice_orchestrator = voice_orchestrator
+
+        def _record_boot_sound_start(**_kwargs) -> None:
+            events.append("boot_sound_start")
+            return None
+
+        with mock.patch(
+            "twinr.agent.workflows.realtime_runner.start_startup_boot_sound",
+            side_effect=_record_boot_sound_start,
+        ):
+            result = loop.run(duration_s=0.01, poll_timeout=0.001)
+
+        self.assertEqual(result, 0)
+        self.assertIn("voice_orchestrator_enter", events)
+        self.assertIn("boot_sound_start", events)
+        self.assertLess(
+            events.index("voice_orchestrator_enter"),
+            events.index("boot_sound_start"),
         )
 
     def test_run_holds_error_when_required_remote_dependency_is_unavailable(self) -> None:
@@ -6655,7 +6868,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(remote.deep_calls, 0)
         self.assertEqual(remote.attest_calls, 1)
 
-    def test_run_enters_error_when_external_watchdog_artifact_reports_failure(self) -> None:
+    def test_run_enters_error_when_external_watchdog_artifact_reports_distinct_fail_samples(self) -> None:
         button_monitor = FakeIdleButtonMonitor()
         startup_ready_assessment = SimpleNamespace(
             artifact_path="/tmp/remote_memory_watchdog.json",
@@ -6690,23 +6903,48 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
 
         loop.runtime.long_term_memory = _RemoteStillRequired()
 
-        failing_assessment = SimpleNamespace(
-            artifact_path="/tmp/remote_memory_watchdog.json",
-            detail="Remote memory watchdog snapshot is stale.",
-            sample_age_s=91.0,
-            max_sample_age_s=45.0,
-            pid_alive=False,
-            sample_status="fail",
-            sample_ready=False,
+        failing_assessments = (
+            SimpleNamespace(
+                artifact_path="/tmp/remote_memory_watchdog.json",
+                detail="Remote memory watchdog snapshot is stale.",
+                sample_age_s=91.0,
+                max_sample_age_s=45.0,
+                pid_alive=False,
+                sample_status="fail",
+                sample_ready=False,
+                sample_seq=101,
+                sample_captured_at="2026-04-06T18:46:23Z",
+                sample_captured_monotonic_ns=91752233980030,
+            ),
+            SimpleNamespace(
+                artifact_path="/tmp/remote_memory_watchdog.json",
+                detail="Remote memory watchdog snapshot is stale.",
+                sample_age_s=92.0,
+                max_sample_age_s=45.0,
+                pid_alive=False,
+                sample_status="fail",
+                sample_ready=False,
+                sample_seq=102,
+                sample_captured_at="2026-04-06T18:46:24Z",
+                sample_captured_monotonic_ns=91753233980030,
+            ),
         )
+        failure_index = {"value": -1}
+
+        def _ensure_watchdog_ready(*_args, **_kwargs):
+            failure_index["value"] = min(failure_index["value"] + 1, len(failing_assessments) - 1)
+            raise LongTermRemoteUnavailableError(failing_assessments[failure_index["value"]].detail)
+
+        def _assess_watchdog(*_args, **_kwargs):
+            return failing_assessments[max(0, failure_index["value"])]
 
         with mock.patch(
             "twinr.agent.workflows.realtime_runtime.support.ensure_required_remote_watchdog_snapshot_ready",
-            side_effect=LongTermRemoteUnavailableError(failing_assessment.detail),
+            side_effect=_ensure_watchdog_ready,
         ):
             with mock.patch(
                 "twinr.agent.workflows.realtime_runtime.support.assess_required_remote_watchdog_snapshot",
-                return_value=failing_assessment,
+                side_effect=_assess_watchdog,
             ):
                 result = loop.run(duration_s=0.05, poll_timeout=0.001)
 
@@ -6715,7 +6953,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn("status=error", lines)
         self.assertEqual(button_monitor.poll_calls, 0)
 
-    def test_watchdog_artifact_refresh_defers_first_failure_after_recent_ready_proof(self) -> None:
+    def test_watchdog_artifact_refresh_dedupes_same_failure_sample_before_error(self) -> None:
         startup_ready_assessment = SimpleNamespace(
             artifact_path="/tmp/remote_memory_watchdog.json",
             sample_age_s=0.0,
@@ -6754,7 +6992,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             max_sample_age_s=45.0,
             pid_alive=True,
         )
-        failing_assessment = SimpleNamespace(
+        failing_assessment_one = SimpleNamespace(
             artifact_path="/tmp/remote_memory_watchdog.json",
             detail="Remote memory watchdog snapshot is stale.",
             sample_age_s=91.0,
@@ -6762,6 +7000,21 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             pid_alive=False,
             sample_status="fail",
             sample_ready=False,
+            sample_seq=201,
+            sample_captured_at="2026-04-06T18:46:23Z",
+            sample_captured_monotonic_ns=91752233980030,
+        )
+        failing_assessment_two = SimpleNamespace(
+            artifact_path="/tmp/remote_memory_watchdog.json",
+            detail="Remote memory watchdog snapshot is stale.",
+            sample_age_s=92.0,
+            max_sample_age_s=45.0,
+            pid_alive=False,
+            sample_status="fail",
+            sample_ready=False,
+            sample_seq=202,
+            sample_captured_at="2026-04-06T18:46:24Z",
+            sample_captured_monotonic_ns=91753233980030,
         )
 
         with mock.patch(
@@ -6772,11 +7025,11 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
 
         with mock.patch(
             "twinr.agent.workflows.realtime_runtime.support.ensure_required_remote_watchdog_snapshot_ready",
-            side_effect=LongTermRemoteUnavailableError(failing_assessment.detail),
+            side_effect=LongTermRemoteUnavailableError(failing_assessment_one.detail),
         ):
             with mock.patch(
                 "twinr.agent.workflows.realtime_runtime.support.assess_required_remote_watchdog_snapshot",
-                return_value=failing_assessment,
+                return_value=failing_assessment_one,
             ):
                 first_refresh = loop._refresh_required_remote_dependency(force=True)
                 self.assertFalse(first_refresh)
@@ -6789,8 +7042,26 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 )
 
                 second_refresh = loop._refresh_required_remote_dependency(force=True)
+                self.assertFalse(second_refresh)
+                self.assertEqual(loop.runtime.status.value, "waiting")
+                self.assertTrue(loop._required_remote_dependency_current_ready())
+                self.assertFalse(loop._required_remote_dependency_error_active)
+                self.assertEqual(
+                    getattr(loop, "_required_remote_dependency_failure_streak", None),
+                    1,
+                )
 
-        self.assertFalse(second_refresh)
+        with mock.patch(
+            "twinr.agent.workflows.realtime_runtime.support.ensure_required_remote_watchdog_snapshot_ready",
+            side_effect=LongTermRemoteUnavailableError(failing_assessment_two.detail),
+        ):
+            with mock.patch(
+                "twinr.agent.workflows.realtime_runtime.support.assess_required_remote_watchdog_snapshot",
+                return_value=failing_assessment_two,
+            ):
+                third_refresh = loop._refresh_required_remote_dependency(force=True)
+
+        self.assertFalse(third_refresh)
         self.assertEqual(loop.runtime.status.value, "error")
         self.assertTrue(loop._required_remote_dependency_error_active)
         self.assertEqual(
@@ -6873,6 +7144,121 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(loop.runtime.status.value, "error")
         self.assertIn("status=error", lines)
         self.assertNotIn("required_remote_dependency_restored=true", lines)
+
+    def test_watchdog_artifact_direct_required_remote_error_defers_single_fail_sample(self) -> None:
+        button_monitor = FakeIdleButtonMonitor()
+        startup_ready_assessment = SimpleNamespace(
+            artifact_path="/tmp/remote_memory_watchdog.json",
+            sample_age_s=0.0,
+            max_sample_age_s=45.0,
+            pid_alive=True,
+        )
+        with mock.patch(
+            "twinr.agent.workflows.required_remote_snapshot.ensure_required_remote_watchdog_snapshot_ready",
+            return_value=startup_ready_assessment,
+        ):
+            loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+                config=TwinrConfig(
+                    long_term_memory_enabled=True,
+                    long_term_memory_mode="remote_primary",
+                    long_term_memory_remote_required=True,
+                    long_term_memory_remote_runtime_check_mode="watchdog_artifact",
+                    long_term_memory_remote_watchdog_interval_s=0.01,
+                    long_term_memory_remote_keepalive_interval_s=0.05,
+                ),
+                button_monitor=button_monitor,
+            )
+
+        class _RemoteStillRequired:
+            def remote_required(self):
+                return True
+
+            def ensure_remote_ready(self):
+                raise AssertionError("deep remote check must not run in watchdog_artifact mode")
+
+            def remote_status(self):
+                return LongTermRemoteStatus(mode="remote_primary", ready=True)
+
+        loop.runtime.long_term_memory = _RemoteStillRequired()
+        ready_assessment = SimpleNamespace(
+            artifact_path="/tmp/remote_memory_watchdog.json",
+            sample_age_s=1.0,
+            max_sample_age_s=45.0,
+            pid_alive=True,
+        )
+        failing_assessment_one = SimpleNamespace(
+            artifact_path="/tmp/remote_memory_watchdog.json",
+            detail="Remote memory watchdog snapshot is stale.",
+            sample_age_s=91.0,
+            max_sample_age_s=45.0,
+            pid_alive=False,
+            ready=False,
+            sample_status="fail",
+            sample_ready=False,
+            sample_seq=301,
+            sample_captured_at="2026-04-07T19:20:42Z",
+            sample_captured_monotonic_ns=180153026446764,
+        )
+        failing_assessment_two = SimpleNamespace(
+            artifact_path="/tmp/remote_memory_watchdog.json",
+            detail="Remote memory watchdog snapshot is stale.",
+            sample_age_s=92.0,
+            max_sample_age_s=45.0,
+            pid_alive=False,
+            ready=False,
+            sample_status="fail",
+            sample_ready=False,
+            sample_seq=302,
+            sample_captured_at="2026-04-07T19:20:53Z",
+            sample_captured_monotonic_ns=180164026446764,
+        )
+
+        with mock.patch(
+            "twinr.agent.workflows.realtime_runtime.support.ensure_required_remote_watchdog_snapshot_ready",
+            return_value=ready_assessment,
+        ):
+            self.assertTrue(loop._refresh_required_remote_dependency(force=True))
+
+        with mock.patch(
+            "twinr.agent.workflows.realtime_runtime.support.assess_required_remote_watchdog_snapshot",
+            return_value=failing_assessment_one,
+        ):
+            first_entered = loop._enter_required_remote_error(
+                LongTermRemoteUnavailableError("Required remote long-term fast-topic retrieval failed.")
+            )
+            second_entered = loop._enter_required_remote_error(
+                LongTermRemoteUnavailableError("Required remote long-term fast-topic retrieval failed.")
+            )
+
+        self.assertFalse(first_entered)
+        self.assertFalse(second_entered)
+        self.assertEqual(loop.runtime.status.value, "waiting")
+        self.assertTrue(loop._required_remote_dependency_current_ready())
+        self.assertFalse(loop._required_remote_dependency_error_active)
+        self.assertEqual(
+            getattr(loop, "_required_remote_dependency_failure_streak", None),
+            1,
+        )
+        self.assertNotIn("status=error", lines)
+        self.assertNotIn("required_remote_dependency=false", lines)
+
+        with mock.patch(
+            "twinr.agent.workflows.realtime_runtime.support.assess_required_remote_watchdog_snapshot",
+            return_value=failing_assessment_two,
+        ):
+            third_entered = loop._enter_required_remote_error(
+                LongTermRemoteUnavailableError("Required remote long-term fast-topic retrieval failed.")
+            )
+
+        self.assertTrue(third_entered)
+        self.assertEqual(loop.runtime.status.value, "error")
+        self.assertTrue(loop._required_remote_dependency_error_active)
+        self.assertEqual(
+            getattr(loop, "_required_remote_dependency_failure_streak", None),
+            2,
+        )
+        self.assertIn("status=error", lines)
+        self.assertIn("required_remote_dependency=false", lines)
 
     def test_run_watchdog_artifact_restores_after_stable_ready_window(self) -> None:
         button_monitor = FakeIdleButtonMonitor()
@@ -7047,6 +7433,130 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             loop._clear_active_turn_stop_event(stop_event)
 
         self.assertEqual(player.stop_calls, 1)
+
+    def test_bootstrap_notice_surfaces_emit_failures(self) -> None:
+        loop = object.__new__(TwinrRealtimeHardwareLoop)
+        loop._bootstrap_notice_once_codes = set()
+        loop.emit = mock.Mock(side_effect=RuntimeError("emit boom"))
+        loop._trace_event = mock.Mock()
+
+        with self.assertRaisesRegex(RuntimeError, "emit boom"):
+            loop._emit_bootstrap_notice("test_notice", "hello")
+
+        self.assertNotIn("test_notice", loop._bootstrap_notice_once_codes)
+        loop._trace_event.assert_not_called()
+
+    def test_coerce_provider_from_contract_accepts_runtime_checkable_protocol_match(self) -> None:
+        @runtime_checkable
+        class _RuntimeCheckableProvider(Protocol):
+            def run(self) -> None: ...
+
+        class _Provider:
+            def run(self) -> None:
+                return None
+
+        loop = object.__new__(TwinrRealtimeHardwareLoop)
+        provider = _Provider()
+
+        result = loop._coerce_provider_from_contract(provider, _RuntimeCheckableProvider)
+
+        self.assertIs(result, provider)
+
+    def test_coerce_provider_from_contract_surfaces_non_runtime_checkable_protocol(self) -> None:
+        class _NonRuntimeCheckableProvider(Protocol):
+            def run(self) -> None: ...
+
+        class _Provider:
+            def run(self) -> None:
+                return None
+
+        loop = object.__new__(TwinrRealtimeHardwareLoop)
+
+        with self.assertRaisesRegex(
+            TypeError,
+            "_NonRuntimeCheckableProvider must be @runtime_checkable",
+        ):
+            loop._coerce_provider_from_contract(_Provider(), _NonRuntimeCheckableProvider)
+
+    def test_close_raises_cleanup_errors_after_attempting_all_components(self) -> None:
+        loop = object.__new__(TwinrRealtimeHardwareLoop)
+        loop._close_lock = Lock()
+        loop._closed = False
+        calls: list[str] = []
+
+        def _fail(label: str):
+            def _callback(*args, **kwargs) -> None:
+                del args, kwargs
+                calls.append(label)
+                raise RuntimeError(f"{label} boom")
+
+            return _callback
+
+        loop.playback_coordinator = SimpleNamespace(close=_fail("playback"))
+        loop.realtime_session = SimpleNamespace(close=_fail("realtime"))
+        loop.runtime = SimpleNamespace(shutdown=_fail("runtime"))
+        loop.workflow_forensics = SimpleNamespace(close=_fail("forensics"))
+
+        with self.assertRaises(ExceptionGroup) as ctx:
+            loop.close(timeout_s=0.7)
+
+        self.assertEqual(calls, ["playback", "realtime", "runtime", "forensics"])
+        self.assertEqual(len(ctx.exception.exceptions), 4)
+        self.assertIn("playback_coordinator.close cleanup failed", str(ctx.exception.exceptions[0]))
+
+    def test_record_event_surfaces_super_failures(self) -> None:
+        loop = object.__new__(TwinrRealtimeHardwareLoop)
+        loop.emit = mock.Mock()
+
+        with mock.patch.object(
+            realtime_support_module.TwinrRealtimeSupportMixin,
+            "_record_event",
+            autospec=True,
+            side_effect=RuntimeError("event boom"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "event boom"):
+                loop._record_event("event_name", "message")
+
+        loop.emit.assert_called_once_with("record_event_failed=RuntimeError")
+
+    def test_record_usage_surfaces_super_failures(self) -> None:
+        loop = object.__new__(TwinrRealtimeHardwareLoop)
+        loop.emit = mock.Mock()
+
+        with mock.patch.object(
+            realtime_support_module.TwinrRealtimeSupportMixin,
+            "_record_usage",
+            autospec=True,
+            side_effect=RuntimeError("usage boom"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "usage boom"):
+                loop._record_usage(
+                    request_kind="turn",
+                    source="test",
+                    model=None,
+                    response_id=None,
+                    request_id=None,
+                    used_web_search=None,
+                    token_usage=None,
+                )
+
+        loop.emit.assert_called_once_with("record_usage_failed=RuntimeError")
+
+    def test_realtime_loop_del_logs_close_failure_during_gc(self) -> None:
+        loop = object.__new__(TwinrRealtimeHardwareLoop)
+        with (
+            mock.patch.object(
+                TwinrRealtimeHardwareLoop,
+                "close",
+                autospec=True,
+                side_effect=RuntimeError("close boom"),
+            ) as close,
+            mock.patch.object(realtime_bootstrap_module, "_LOGGER") as logger,
+        ):
+            TwinrRealtimeHardwareLoop.__del__(loop)
+
+        close.assert_called_once_with(loop, timeout_s=0.2)
+        logger.warning.assert_called_once()
 
 
 if __name__ == "__main__":

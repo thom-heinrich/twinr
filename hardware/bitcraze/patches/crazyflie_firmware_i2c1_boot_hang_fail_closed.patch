@@ -1,0 +1,193 @@
+diff --git a/src/drivers/interface/i2c_drv.h b/src/drivers/interface/i2c_drv.h
+index 8c82ceb..3f47d9d 100644
+--- a/src/drivers/interface/i2c_drv.h
++++ b/src/drivers/interface/i2c_drv.h
+@@ -83,7 +83,7 @@ extern I2cDrv sensorsBus;
+ /**
+  * Initialize i2c peripheral as defined by static I2cDef structs.
+  */
+-void i2cdrvInit(I2cDrv* i2c);
++bool i2cdrvInit(I2cDrv* i2c);
+ 
+ /**
+  * Send or receive a message over the I2C bus.
+diff --git a/src/drivers/src/i2c_drv.c b/src/drivers/src/i2c_drv.c
+index 6eab7ec..9295343 100644
+--- a/src/drivers/src/i2c_drv.c
++++ b/src/drivers/src/i2c_drv.c
+@@ -67,15 +67,19 @@
+ #define I2C_SLAVE_ADDRESS7      0x30
+ #define I2C_MAX_RETRIES         2
+ #define I2C_MESSAGE_TIMEOUT     M2T(1000)
++#define I2CDEV_LINE_HIGH_TIMEOUT_US (10 * 1000)
++#define I2CDEV_UNLOCK_MAX_CLOCK_PULSES 32
+ 
+ // Helpers to unlock bus
+ #define I2CDEV_CLK_TS (10)
+-static void gpioWaitForHigh(GPIO_TypeDef *gpio, uint16_t pin, uint16_t timeout_us)
++static bool gpioWaitForHigh(GPIO_TypeDef *gpio, uint16_t pin, uint16_t timeout_us)
+ {
+   uint64_t start = usecTimestamp();
+   while (GPIO_ReadInputDataBit(gpio, pin) == Bit_RESET && usecTimestamp() - start <= timeout_us)
+   {
+   }
++
++  return GPIO_ReadInputDataBit(gpio, pin) != Bit_RESET;
+ }
+ 
+ 
+@@ -89,7 +93,7 @@ uint32_t eventPos = 0;
+ /**
+  * Low level i2c init funciton
+  */
+-static void i2cdrvInitBus(I2cDrv* i2c);
++static bool i2cdrvInitBus(I2cDrv* i2c);
+ /**
+  * Low level dma init funciton
+  */
+@@ -101,11 +105,11 @@ static void i2cdrvStartTransfer(I2cDrv *i2c);
+ /**
+  * Try to restart a hanged buss
+  */
+-static void i2cdrvTryToRestartBus(I2cDrv* i2c);
++static bool i2cdrvTryToRestartBus(I2cDrv* i2c);
+ /**
+  * Unlocks the i2c bus if needed.
+  */
+-static void i2cdrvdevUnlockBus(GPIO_TypeDef* portSCL, GPIO_TypeDef* portSDA, uint16_t pinSCL, uint16_t pinSDA);
++static bool i2cdrvdevUnlockBus(GPIO_TypeDef* portSCL, GPIO_TypeDef* portSDA, uint16_t pinSCL, uint16_t pinSDA);
+ /**
+  * Clear DMA stream
+  */
+@@ -221,11 +225,12 @@ static void i2cNotifyClient(I2cDrv* i2c)
+   portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+ }
+ 
+-static void i2cdrvTryToRestartBus(I2cDrv* i2c)
++static bool i2cdrvTryToRestartBus(I2cDrv* i2c)
+ {
+   I2C_InitTypeDef I2C_InitStructure;
+   NVIC_InitTypeDef NVIC_InitStructure;
+   GPIO_InitTypeDef GPIO_InitStructure;
++  bool busUnlocked;
+ 
+   // Enable GPIOA clock
+   RCC_AHB1PeriphClockCmd(i2c->def->gpioSDAPerif, ENABLE);
+@@ -243,7 +248,7 @@ static void i2cdrvTryToRestartBus(I2cDrv* i2c)
+   GPIO_InitStructure.GPIO_Pin =  i2c->def->gpioSDAPin; // SDA
+   GPIO_Init(i2c->def->gpioSDAPort, &GPIO_InitStructure);
+ 
+-  i2cdrvdevUnlockBus(i2c->def->gpioSCLPort, i2c->def->gpioSDAPort, i2c->def->gpioSCLPin, i2c->def->gpioSDAPin);
++  busUnlocked = i2cdrvdevUnlockBus(i2c->def->gpioSCLPort, i2c->def->gpioSDAPort, i2c->def->gpioSCLPin, i2c->def->gpioSDAPin);
+ 
+   // Configure I2C_SENSORS pins for AF.
+   GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF;
+@@ -278,6 +283,8 @@ static void i2cdrvTryToRestartBus(I2cDrv* i2c)
+   NVIC_Init(&NVIC_InitStructure);
+ 
+   i2cdrvDmaSetupBus(i2c);
++
++  return busUnlocked;
+ }
+ 
+ static void i2cdrvDmaSetupBus(I2cDrv* i2c)
+@@ -311,24 +318,34 @@ static void i2cdrvDmaSetupBus(I2cDrv* i2c)
+   NVIC_Init(&NVIC_InitStructure);
+ }
+ 
+-static void i2cdrvInitBus(I2cDrv* i2c)
++static bool i2cdrvInitBus(I2cDrv* i2c)
+ {
+-  i2cdrvTryToRestartBus(i2c);
++  bool busUnlocked = i2cdrvTryToRestartBus(i2c);
+ 
+   i2c->isBusFreeSemaphore = xSemaphoreCreateBinaryStatic(&i2c->isBusFreeSemaphoreBuffer);
+   i2c->isBusFreeMutex = xSemaphoreCreateMutexStatic(&i2c->isBusFreeMutexBuffer);
++
++  return busUnlocked;
+ }
+ 
+-static void i2cdrvdevUnlockBus(GPIO_TypeDef* portSCL, GPIO_TypeDef* portSDA, uint16_t pinSCL, uint16_t pinSDA)
++static bool i2cdrvdevUnlockBus(GPIO_TypeDef* portSCL, GPIO_TypeDef* portSDA, uint16_t pinSCL, uint16_t pinSDA)
+ {
++  uint32_t clockPulses = 0;
++
+   GPIO_SetBits(portSDA, pinSDA);
+   /* Check SDA line to determine if slave is asserting bus and clock out if so */
+   while(GPIO_ReadInputDataBit(portSDA, pinSDA) == Bit_RESET)
+   {
++    if (clockPulses++ >= I2CDEV_UNLOCK_MAX_CLOCK_PULSES) {
++      return false;
++    }
++
+     /* Set clock high */
+     GPIO_SetBits(portSCL, pinSCL);
+     /* Wait for any clock stretching to finish. */
+-    gpioWaitForHigh(portSCL, pinSCL, 10 * 1000);
++    if (!gpioWaitForHigh(portSCL, pinSCL, I2CDEV_LINE_HIGH_TIMEOUT_US)) {
++      return false;
++    }
+     sleepus(I2CDEV_CLK_TS);
+ 
+     /* Generate a clock cycle */
+@@ -349,16 +366,22 @@ static void i2cdrvdevUnlockBus(GPIO_TypeDef* portSCL, GPIO_TypeDef* portSDA, uin
+   /* Set data and clock high and wait for any clock stretching to finish. */
+   GPIO_SetBits(portSDA, pinSDA);
+   GPIO_SetBits(portSCL, pinSCL);
+-  gpioWaitForHigh(portSCL, pinSCL, 10 * 1000);
++  if (!gpioWaitForHigh(portSCL, pinSCL, I2CDEV_LINE_HIGH_TIMEOUT_US)) {
++    return false;
++  }
+   /* Wait for data to be high */
+-  gpioWaitForHigh(portSDA, pinSDA, 10 * 1000);
++  if (!gpioWaitForHigh(portSDA, pinSDA, I2CDEV_LINE_HIGH_TIMEOUT_US)) {
++    return false;
++  }
++
++  return true;
+ }
+ 
+ //-----------------------------------------------------------
+ 
+-void i2cdrvInit(I2cDrv* i2c)
++bool i2cdrvInit(I2cDrv* i2c)
+ {
+-  i2cdrvInitBus(i2c);
++  return i2cdrvInitBus(i2c);
+ }
+ 
+ void i2cdrvCreateMessage(I2cMessage *message,
+diff --git a/src/drivers/src/i2cdev.c b/src/drivers/src/i2cdev.c
+index 3fa753b..120a663 100644
+--- a/src/drivers/src/i2cdev.c
++++ b/src/drivers/src/i2cdev.c
+@@ -41,7 +41,7 @@
+ 
+ int i2cdevInit(I2C_Dev *dev)
+ {
+-  i2cdrvInit(dev);
++  return i2cdrvInit(dev);
+ 
+   return true;
+ }
+diff --git a/src/modules/src/system.c b/src/modules/src/system.c
+index e1103eb..f96e1c3 100644
+--- a/src/modules/src/system.c
++++ b/src/modules/src/system.c
+@@ -179,8 +179,14 @@ void systemTask(void *arg)
+ #endif
+ 
+   usecTimerInit();
+-  i2cdevInit(I2C3_DEV);
+-  i2cdevInit(I2C1_DEV);
++  if (!i2cdevInit(I2C3_DEV)) {
++    pass = false;
++    DEBUG_PRINT("i2c3 [FAIL]\n");
++  }
++  if (!i2cdevInit(I2C1_DEV)) {
++    pass = false;
++    DEBUG_PRINT("i2c1 [FAIL]\n");
++  }
+   passthroughInit();
+ 
+   //Init the high-levels modules

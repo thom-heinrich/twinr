@@ -14,8 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent import TwinrConfig
 from twinr.memory.chonkydb.personal_graph import TwinrPersonalGraphStore
-from twinr.memory.chonkydb.schema import TwinrGraphDocumentV1, TwinrGraphNodeV1
-from twinr.memory.context_store import PromptContextStore
+from twinr.memory.chonkydb.schema import TwinrGraphDocumentV1, TwinrGraphEdgeV1, TwinrGraphNodeV1
+from twinr.memory.context_store import PersistentMemoryEntry, PromptContextStore
 from twinr.memory.longterm import (
     LongTermConflictResolver,
     LongTermConflictOptionV1,
@@ -98,6 +98,83 @@ class LongTermRetrieverTests(unittest.TestCase):
             adaptive_policy_builder=adaptive_policy_builder,
         )
         return retriever, object_store, prompt_context_store, graph_store, midterm_store
+
+    def _conversation_episode(
+        self,
+        *,
+        memory_id: str,
+        transcript: str,
+        response: str,
+        attributes: dict[str, object] | None = None,
+    ) -> LongTermMemoryObjectV1:
+        episode_attributes = {
+            "raw_transcript": transcript,
+            "raw_response": response,
+        }
+        if attributes:
+            episode_attributes.update(attributes)
+        return LongTermMemoryObjectV1(
+            memory_id=memory_id,
+            kind="episode",
+            summary="Conversation turn recorded for long-term memory.",
+            details=f'User said: "{transcript}" Assistant answered: "{response}"',
+            source=_source(memory_id),
+            status="active",
+            confidence=1.0,
+            attributes=episode_attributes,
+        )
+
+    def _durable_pattern(
+        self,
+        *,
+        memory_id: str,
+        summary: str,
+        details: str,
+        slot_key: str,
+        value_key: str,
+        attributes: dict[str, object],
+    ) -> LongTermMemoryObjectV1:
+        return LongTermMemoryObjectV1(
+            memory_id=memory_id,
+            kind="pattern",
+            summary=summary,
+            details=details,
+            source=_source(memory_id),
+            status="active",
+            confidence=0.82,
+            slot_key=slot_key,
+            value_key=value_key,
+            attributes=attributes,
+        )
+
+    def _sensor_routine(
+        self,
+        *,
+        memory_id: str,
+        summary: str,
+        daypart: str,
+        routine_type: str,
+        interaction_type: str | None = None,
+    ) -> LongTermMemoryObjectV1:
+        attributes: dict[str, object] = {
+            "memory_domain": "sensor_routine",
+            "routine_type": routine_type,
+            "daypart": daypart,
+        }
+        if interaction_type is not None:
+            attributes["interaction_type"] = interaction_type
+        return LongTermMemoryObjectV1(
+            memory_id=memory_id,
+            kind="pattern",
+            summary=summary,
+            details="Derived from repeated multimodal interaction signals in the bounded sensor-memory window.",
+            source=_source(memory_id),
+            status="active",
+            confidence=0.91,
+            slot_key=memory_id,
+            value_key="sensor_routine",
+            attributes=attributes,
+        )
 
     def test_build_context_assembles_structured_memory_packet(self) -> None:
         episode = LongTermMemoryObjectV1(
@@ -627,6 +704,558 @@ class LongTermRetrieverTests(unittest.TestCase):
             ["episodic", "graph"],
         )
 
+    def test_unified_retrieval_selection_prefers_anchored_episode_over_anchorless_distractor_for_phone_query(self) -> None:
+        related_object = LongTermMemoryObjectV1(
+            memory_id="episode:corinna_called",
+            kind="episode",
+            summary='Conversation about "Corinna called earlier today."',
+            details="Use the phone number from Corinna's confirmed contact entry.",
+            source=_source("turn:corinna"),
+            status="active",
+            confidence=1.0,
+            attributes={"person_ref": "person:corinna_maier"},
+        )
+        distractor_object = LongTermMemoryObjectV1(
+            memory_id="episode:distractor",
+            kind="episode",
+            summary="Current number reminder for later today.",
+            details="Remember the current number before you leave.",
+            source=_source("turn:distractor"),
+            status="active",
+            confidence=1.0,
+            attributes={},
+        )
+        related_midterm = LongTermMidtermPacketV1(
+            packet_id="midterm:corinna_today",
+            kind="recent_contact_bundle",
+            summary="Corinna Maier is a recent practical contact for today's phone questions.",
+            details="Use when a phone-number question for Corinna comes up.",
+            source_memory_ids=("episode:corinna_called",),
+            attributes={"person_ref": "person:corinna_maier"},
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, _object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            related_entry = retriever._episodic_entry_from_object(related_object)
+            distractor_entry = retriever._episodic_entry_from_object(distractor_object)
+            self.assertIsNotNone(related_entry)
+            self.assertIsNotNone(distractor_entry)
+            graph_selection = UnifiedGraphSelectionInput(
+                document=TwinrGraphDocumentV1(
+                    subject_node_id="user:main",
+                    graph_id="graph:user_main",
+                    created_at="2026-04-08T09:00:00Z",
+                    updated_at="2026-04-08T09:00:00Z",
+                    nodes=(
+                        TwinrGraphNodeV1(
+                            node_id="user:main",
+                            node_type="user",
+                            label="Erika",
+                        ),
+                        TwinrGraphNodeV1(
+                            node_id="person:corinna_maier",
+                            node_type="person",
+                            label="Corinna Maier",
+                        ),
+                    ),
+                    edges=(),
+                    metadata={"kind": "personal_graph"},
+                ),
+                query_plan={
+                    "mode": "remote_query_first_subgraph",
+                    "matched_node_ids": ["person:corinna_maier"],
+                    "selected_node_ids": ["person:corinna_maier"],
+                    "selected_edge_ids": [],
+                    "access_path": ["graph_neighbors_query"],
+                },
+            )
+
+            selection = build_unified_retrieval_selection(
+                query_texts=("Which phone number should I use for Corinna Maier?",),
+                episodic_entries=(
+                    build_episodic_selection_input(entry=distractor_entry, source_object=distractor_object),
+                    build_episodic_selection_input(entry=related_entry, source_object=related_object),
+                ),
+                durable_objects=(),
+                conflict_queue=(),
+                conflict_supporting_objects=(),
+                midterm_packets=(related_midterm,),
+                graph_selection=graph_selection,
+            )
+
+        self.assertEqual(
+            selection.query_plan["selected"]["episodic_entry_ids"],
+            ["episode:corinna_called"],
+        )
+        kept_episodic_candidates = {
+            candidate["id"]: candidate
+            for candidate in selection.query_plan["candidates"]
+            if candidate["source"] == "episodic"
+        }
+        dropped_episodic_candidates = {
+            candidate["id"]: candidate
+            for candidate in selection.query_plan["dropped_candidates"]
+            if candidate["source"] == "episodic"
+        }
+        self.assertEqual(
+            tuple(kept_episodic_candidates),
+            ("episode:corinna_called",),
+        )
+        self.assertEqual(
+            dropped_episodic_candidates["episode:distractor"]["drop_reason"],
+            "vetoed_by_exact_graph_precision_gate",
+        )
+        join_anchors = {
+            item["anchor"]: item["sources"]
+            for item in selection.query_plan["join_anchors"]
+        }
+        self.assertEqual(
+            join_anchors["person_ref:person:corinna_maier"],
+            ["episodic", "graph", "midterm"],
+        )
+
+    def test_unified_retrieval_selection_drops_unanchored_episodic_support_when_no_anchor_match_exists(self) -> None:
+        distractor_object = LongTermMemoryObjectV1(
+            memory_id="episode:distractor",
+            kind="episode",
+            summary="Current number reminder for later today.",
+            details="Remember the current number before you leave.",
+            source=_source("turn:distractor"),
+            status="active",
+            confidence=1.0,
+            attributes={},
+        )
+        related_midterm = LongTermMidtermPacketV1(
+            packet_id="midterm:corinna_today",
+            kind="recent_contact_bundle",
+            summary="Corinna Maier is a recent practical contact for today's phone questions.",
+            details="Use when a phone-number question for Corinna comes up.",
+            source_memory_ids=(),
+            attributes={"person_ref": "person:corinna_maier"},
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, _object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            distractor_entry = retriever._episodic_entry_from_object(distractor_object)
+            self.assertIsNotNone(distractor_entry)
+            graph_selection = UnifiedGraphSelectionInput(
+                document=TwinrGraphDocumentV1(
+                    subject_node_id="user:main",
+                    graph_id="graph:user_main",
+                    created_at="2026-04-08T09:00:00Z",
+                    updated_at="2026-04-08T09:00:00Z",
+                    nodes=(
+                        TwinrGraphNodeV1(
+                            node_id="user:main",
+                            node_type="user",
+                            label="Erika",
+                        ),
+                        TwinrGraphNodeV1(
+                            node_id="person:corinna_maier",
+                            node_type="person",
+                            label="Corinna Maier",
+                        ),
+                    ),
+                    edges=(),
+                    metadata={"kind": "personal_graph"},
+                ),
+                query_plan={
+                    "mode": "remote_query_first_subgraph",
+                    "matched_node_ids": ["person:corinna_maier"],
+                    "selected_node_ids": ["person:corinna_maier"],
+                    "selected_edge_ids": [],
+                    "access_path": ["graph_neighbors_query"],
+                },
+            )
+
+            selection = build_unified_retrieval_selection(
+                query_texts=("Which phone number should I use for Corinna Maier?",),
+                episodic_entries=(build_episodic_selection_input(entry=distractor_entry, source_object=distractor_object),),
+                durable_objects=(),
+                conflict_queue=(),
+                conflict_supporting_objects=(),
+                midterm_packets=(related_midterm,),
+                graph_selection=graph_selection,
+            )
+
+        self.assertEqual(selection.query_plan["selected"]["episodic_entry_ids"], [])
+        distractor_candidate = next(
+            candidate
+            for candidate in selection.query_plan["dropped_candidates"]
+            if candidate["source"] == "episodic"
+        )
+        self.assertEqual(distractor_candidate["drop_reason"], "vetoed_by_exact_graph_precision_gate")
+
+    def test_unified_retrieval_selection_keeps_anchor_backed_episode_when_lexical_overlap_is_weak(self) -> None:
+        related_object = LongTermMemoryObjectV1(
+            memory_id="episode:corinna_called",
+            kind="episode",
+            summary='Conversation about "Corinna called earlier today."',
+            details="Corinna asked Erika to call her back after lunch.",
+            source=_source("turn:corinna"),
+            status="active",
+            confidence=1.0,
+            attributes={"person_ref": "person:corinna_maier"},
+        )
+        related_midterm = LongTermMidtermPacketV1(
+            packet_id="midterm:corinna_today",
+            kind="recent_contact_bundle",
+            summary="Corinna Maier is a recent practical contact for today's phone questions.",
+            details="Use when a phone-number question for Corinna comes up.",
+            source_memory_ids=("episode:corinna_called",),
+            attributes={"person_ref": "person:corinna_maier"},
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, _object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            related_entry = retriever._episodic_entry_from_object(related_object)
+            self.assertIsNotNone(related_entry)
+            graph_selection = UnifiedGraphSelectionInput(
+                document=TwinrGraphDocumentV1(
+                    subject_node_id="user:main",
+                    graph_id="graph:user_main",
+                    created_at="2026-04-08T09:00:00Z",
+                    updated_at="2026-04-08T09:00:00Z",
+                    nodes=(
+                        TwinrGraphNodeV1(
+                            node_id="user:main",
+                            node_type="user",
+                            label="Erika",
+                        ),
+                        TwinrGraphNodeV1(
+                            node_id="person:corinna_maier",
+                            node_type="person",
+                            label="Corinna Maier",
+                        ),
+                    ),
+                    edges=(),
+                    metadata={"kind": "personal_graph"},
+                ),
+                query_plan={
+                    "mode": "remote_query_first_subgraph",
+                    "matched_node_ids": ["person:corinna_maier"],
+                    "selected_node_ids": ["person:corinna_maier"],
+                    "selected_edge_ids": [],
+                    "access_path": ["graph_neighbors_query"],
+                },
+            )
+
+            selection = build_unified_retrieval_selection(
+                query_texts=("Which phone number should I use right now?",),
+                episodic_entries=(build_episodic_selection_input(entry=related_entry, source_object=related_object),),
+                durable_objects=(),
+                conflict_queue=(),
+                conflict_supporting_objects=(),
+                midterm_packets=(related_midterm,),
+                graph_selection=graph_selection,
+            )
+
+        self.assertEqual(
+            selection.query_plan["selected"]["episodic_entry_ids"],
+            ["episode:corinna_called"],
+        )
+        continuity_support = selection.query_plan["continuity_support"]
+        corinna_entry = next(
+            candidate
+            for candidate in continuity_support["candidates"]
+            if candidate["id"] == "episode:corinna_called"
+        )
+        self.assertTrue(corinna_entry["selected"])
+        self.assertGreaterEqual(corinna_entry["support_alignment_strength"], 1)
+
+    def test_unified_retrieval_selection_keeps_anchorless_routine_episode_when_no_focus_anchor_exists(self) -> None:
+        routine_object = LongTermMemoryObjectV1(
+            memory_id="episode:shopping_print",
+            kind="episode",
+            summary='Conversation about "After lunch I usually print my shopping list with Twinr."',
+            details="After lunch I usually print my shopping list with Twinr.",
+            source=_source("turn:shopping_print"),
+            status="active",
+            confidence=1.0,
+            attributes={},
+        )
+        durable_object = LongTermMemoryObjectV1(
+            memory_id="pattern:print:button:afternoon",
+            kind="sensor_routine",
+            summary="Printed Twinr output was used in the afternoon.",
+            details="The afternoon routine often ends with a printed shopping list.",
+            source=_source("sensor:print"),
+            status="active",
+            confidence=1.0,
+            attributes={},
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, _object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            routine_entry = retriever._episodic_entry_from_object(routine_object)
+            self.assertIsNotNone(routine_entry)
+
+            selection = build_unified_retrieval_selection(
+                query_texts=("after lunch usually print shopping list twinr afternoon",),
+                episodic_entries=(build_episodic_selection_input(entry=routine_entry, source_object=routine_object),),
+                durable_objects=(durable_object,),
+                conflict_queue=(),
+                conflict_supporting_objects=(),
+                midterm_packets=(),
+                graph_selection=None,
+            )
+
+        self.assertEqual(
+            selection.query_plan["selected"]["episodic_entry_ids"],
+            ["episode:shopping_print"],
+        )
+        kept_candidate = next(
+            candidate
+            for candidate in selection.query_plan["continuity_support"]["candidates"]
+            if candidate["id"] == "episode:shopping_print"
+        )
+        self.assertTrue(kept_candidate["selected"])
+        self.assertIsNone(kept_candidate["drop_reason"])
+
+    def test_unified_retrieval_selection_prefers_anna_owner_person_and_drops_irrelevant_midterm(self) -> None:
+        noisy_midterm = LongTermMidtermPacketV1(
+            packet_id="midterm:generic_becker_email",
+            kind="recent_contact_bundle",
+            summary="Recent email follow-up for a Becker contact.",
+            details="Use this when an email or address question comes up later.",
+            source_memory_ids=(),
+            attributes={},
+        )
+        graph_selection = UnifiedGraphSelectionInput(
+            document=TwinrGraphDocumentV1(
+                subject_node_id="user:main",
+                graph_id="graph:user_main",
+                created_at="2026-04-09T09:00:00Z",
+                updated_at="2026-04-09T09:00:00Z",
+                nodes=(
+                    TwinrGraphNodeV1(
+                        node_id="user:main",
+                        node_type="user",
+                        label="Erika",
+                    ),
+                    TwinrGraphNodeV1(
+                        node_id="person:anna_becker",
+                        node_type="person",
+                        label="Anna Becker",
+                    ),
+                    TwinrGraphNodeV1(
+                        node_id="person:chris_becker",
+                        node_type="person",
+                        label="Chris Becker",
+                    ),
+                    TwinrGraphNodeV1(
+                        node_id="email:anna_becker_example_com",
+                        node_type="email",
+                        label="anna.becker@example.com",
+                        attributes={"canonical": "anna.becker@example.com"},
+                    ),
+                    TwinrGraphNodeV1(
+                        node_id="phone:chris_becker",
+                        node_type="phone",
+                        label="+49 30 555 000",
+                        attributes={"canonical": "+49 30 555 000"},
+                    ),
+                ),
+                edges=(
+                    TwinrGraphEdgeV1(
+                        source_node_id="person:anna_becker",
+                        edge_type="general_has_contact_method",
+                        target_node_id="email:anna_becker_example_com",
+                        attributes={"kind": "email"},
+                    ),
+                    TwinrGraphEdgeV1(
+                        source_node_id="person:chris_becker",
+                        edge_type="general_has_contact_method",
+                        target_node_id="phone:chris_becker",
+                        attributes={"kind": "phone"},
+                    ),
+                ),
+                metadata={"kind": "personal_graph"},
+            ),
+            query_plan={
+                "mode": "remote_query_first_subgraph",
+                "matched_node_ids": [
+                    "person:anna_becker",
+                    "person:chris_becker",
+                    "email:anna_becker_example_com",
+                ],
+                "selected_node_ids": [
+                    "user:main",
+                    "person:anna_becker",
+                    "person:chris_becker",
+                    "email:anna_becker_example_com",
+                    "phone:chris_becker",
+                ],
+                "selected_edge_ids": [
+                    "person:anna_becker|general_has_contact_method|email:anna_becker_example_com",
+                    "person:chris_becker|general_has_contact_method|phone:chris_becker",
+                ],
+                "access_path": ["graph_neighbors_query"],
+            },
+        )
+
+        selection = build_unified_retrieval_selection(
+            query_texts=("What is Anna Becker's email address?",),
+            episodic_entries=(),
+            durable_objects=(),
+            conflict_queue=(),
+            conflict_supporting_objects=(),
+            midterm_packets=(noisy_midterm,),
+            graph_selection=graph_selection,
+        )
+
+        self.assertEqual(selection.query_plan["selected"]["graph_node_ids"], ["person:anna_becker"])
+        self.assertEqual(selection.query_plan["selected"]["midterm_packet_ids"], [])
+        self.assertEqual(
+            {candidate["source"] for candidate in selection.query_plan["candidates"]},
+            {"graph"},
+        )
+        self.assertEqual(selection.query_plan["pruning"]["mode"], "graph_only")
+        dropped_midterm = next(
+            candidate
+            for candidate in selection.query_plan["dropped_candidates"]
+            if candidate["source"] == "midterm"
+        )
+        self.assertEqual(dropped_midterm["drop_reason"], "vetoed_by_exact_graph_precision_gate")
+
+    def test_unified_retrieval_selection_forces_graph_only_for_exact_graph_contact_query_without_same_entity_support(self) -> None:
+        unrelated_durable = LongTermMemoryObjectV1(
+            memory_id="fact:corinna_phone_current",
+            kind="contact_method_fact",
+            summary="Corinna Maier currently uses the number +15555558877.",
+            details="Current confirmed phone number for Corinna Maier.",
+            source=_source("fact:corinna_phone_current"),
+            status="active",
+            confidence=0.98,
+            confirmed_by_user=True,
+            slot_key="contact:person:corinna_maier:phone",
+            value_key="+15555558877",
+            attributes={"person_ref": "person:corinna_maier"},
+        )
+        unrelated_conflict = LongTermConflictQueueItemV1(
+            slot_key="contact:person:corinna_maier:phone",
+            question="Which phone number should I use for Corinna Maier?",
+            reason="Conflicting phone numbers exist for Corinna Maier.",
+            candidate_memory_id="fact:corinna_phone_current",
+            options=(
+                LongTermConflictOptionV1(
+                    memory_id="fact:corinna_phone_current",
+                    summary=unrelated_durable.summary,
+                    status="active",
+                    value_key="+15555558877",
+                ),
+            ),
+        )
+        unrelated_midterm = LongTermMidtermPacketV1(
+            packet_id="midterm:camera_afternoon",
+            kind="recent_contact_bundle",
+            summary="Recent afternoon camera inspection context.",
+            details="Unrelated distractor packet.",
+            source_memory_ids=(),
+            query_hints=("camera", "afternoon"),
+            attributes={"subject_ref": "user:main"},
+        )
+        unrelated_episode = LongTermMemoryObjectV1(
+            memory_id="episode:camera_use_afternoon",
+            kind="episode",
+            summary='Conversation about "The camera was used in the afternoon."',
+            details='User said: "The camera was used in the afternoon."',
+            source=_source("episode:camera_use_afternoon"),
+            status="active",
+            confidence=1.0,
+            attributes={"subject_ref": "user:main"},
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, _object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            unrelated_entry = retriever._episodic_entry_from_object(unrelated_episode)
+            self.assertIsNotNone(unrelated_entry)
+            graph_selection = UnifiedGraphSelectionInput(
+                document=TwinrGraphDocumentV1(
+                    subject_node_id="user:main",
+                    graph_id="graph:user_main",
+                    created_at="2026-04-14T09:00:00Z",
+                    updated_at="2026-04-14T09:00:00Z",
+                    nodes=(
+                        TwinrGraphNodeV1(node_id="user:main", node_type="user", label="Erika"),
+                        TwinrGraphNodeV1(node_id="person:anna_becker", node_type="person", label="Anna Becker"),
+                        TwinrGraphNodeV1(
+                            node_id="email:anna_becker_example_com",
+                            node_type="email",
+                            label="anna.becker@example.com",
+                            attributes={"canonical": "anna.becker@example.com"},
+                        ),
+                    ),
+                    edges=(
+                        TwinrGraphEdgeV1(
+                            source_node_id="person:anna_becker",
+                            edge_type="general_has_contact_method",
+                            target_node_id="email:anna_becker_example_com",
+                            attributes={"kind": "email"},
+                        ),
+                    ),
+                    metadata={"kind": "personal_graph"},
+                ),
+                query_plan={
+                    "mode": "remote_query_first_subgraph",
+                    "matched_node_ids": ["person:anna_becker"],
+                    "selected_node_ids": [
+                        "user:main",
+                        "person:anna_becker",
+                        "email:anna_becker_example_com",
+                    ],
+                    "selected_edge_ids": [
+                        "person:anna_becker|general_has_contact_method|email:anna_becker_example_com",
+                    ],
+                    "access_path": ["graph_neighbors_query"],
+                },
+            )
+
+            for query_text in (
+                "How can I reach Anna Becker by email?",
+                "Wie lautet Anna Beckers E-Mail-Adresse?",
+            ):
+                with self.subTest(query_text=query_text):
+                    selection = build_unified_retrieval_selection(
+                        query_texts=(query_text,),
+                        episodic_entries=(
+                            build_episodic_selection_input(
+                                entry=unrelated_entry,
+                                source_object=unrelated_episode,
+                            ),
+                        ),
+                        durable_objects=(unrelated_durable,),
+                        conflict_queue=(unrelated_conflict,),
+                        conflict_supporting_objects=(unrelated_durable,),
+                        midterm_packets=(unrelated_midterm,),
+                        graph_selection=graph_selection,
+                    )
+
+                    self.assertEqual(selection.query_plan["pruning"]["mode"], "graph_only")
+                    self.assertTrue(selection.query_plan["pruning"]["exact_graph_precision_gate"])
+                    self.assertIn(
+                        "email",
+                        selection.query_plan["pruning"]["exact_graph_precision_attribute_families"],
+                    )
+                    self.assertEqual(selection.query_plan["selected"]["graph_node_ids"], ["person:anna_becker"])
+                    self.assertEqual(selection.query_plan["selected"]["durable_memory_ids"], [])
+                    self.assertEqual(selection.query_plan["selected"]["conflict_slot_keys"], [])
+                    self.assertEqual(selection.query_plan["selected"]["episodic_entry_ids"], [])
+                    self.assertEqual(selection.query_plan["selected"]["midterm_packet_ids"], [])
+                    self.assertEqual(
+                        {candidate["source"] for candidate in selection.query_plan["candidates"]},
+                        {"graph"},
+                    )
+                    dropped_non_graph = [
+                        candidate
+                        for candidate in selection.query_plan["dropped_candidates"]
+                        if candidate["source"] != "graph"
+                    ]
+                    self.assertTrue(dropped_non_graph)
+                    self.assertTrue(
+                        all(
+                            candidate["drop_reason"] == "vetoed_by_exact_graph_precision_gate"
+                            for candidate in dropped_non_graph
+                        )
+                    )
+
     def test_unified_retrieval_selection_prunes_practical_candidates_for_continuity_queries(self) -> None:
         episodic_object = LongTermMemoryObjectV1(
             memory_id="episode:corinna_called",
@@ -839,6 +1468,449 @@ class LongTermRetrieverTests(unittest.TestCase):
         self.assertEqual(
             join_anchors["person_ref:person:corinna_maier"],
             ["adaptive", "durable"],
+        )
+
+    def test_unified_retrieval_selection_rescues_anchorless_practical_patterns_from_thread_only_focus(self) -> None:
+        presence_morning = self._durable_pattern(
+            memory_id="pattern:presence:morning:near_device",
+            summary="Presence near the device was observed in the morning.",
+            details="Low-confidence multimodal pattern derived from PIR/camera evidence.",
+            slot_key="pattern:presence:morning:near_device",
+            value_key="presence_observed",
+            attributes={"daypart": "morning", "pattern_type": "presence"},
+        )
+        green_button = self._durable_pattern(
+            memory_id="pattern:button:green:start_listening:morning",
+            summary="The green button was used to start a conversation in the morning.",
+            details="Low-confidence button usage pattern derived from a physical interaction event.",
+            slot_key="pattern:button:green:start_listening:morning",
+            value_key="green:start_listening:morning",
+            attributes={"button": "green", "daypart": "morning", "pattern_type": "interaction"},
+        )
+        thread_episode = self._conversation_episode(
+            memory_id="episode:morning_presence_turn",
+            transcript="When I stand close to the device in the morning, I usually ask my first question right away.",
+            response="That morning presence cue can help start the day calmly.",
+            attributes={"thread_ref": "thread:morning_routine"},
+        )
+        supporting_episode = self._conversation_episode(
+            memory_id="episode:morning_weather_turn",
+            transcript="After breakfast I usually ask Twinr about the weather before I start my day.",
+            response="I can keep that morning weather routine in mind.",
+            attributes={"thread_ref": "thread:morning_routine"},
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, _object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            thread_entry = retriever._episodic_entry_from_object(thread_episode)
+            supporting_entry = retriever._episodic_entry_from_object(supporting_episode)
+            self.assertIsNotNone(thread_entry)
+            self.assertIsNotNone(supporting_entry)
+
+            selection = build_unified_retrieval_selection(
+                query_texts=("when am i usually near the device in the morning",),
+                episodic_entries=(
+                    build_episodic_selection_input(entry=thread_entry, source_object=thread_episode),
+                    build_episodic_selection_input(entry=supporting_entry, source_object=supporting_episode),
+                ),
+                durable_objects=(presence_morning, green_button),
+                conflict_queue=(),
+                conflict_supporting_objects=(),
+                midterm_packets=(),
+                graph_selection=None,
+            )
+
+        self.assertIn(
+            "pattern:presence:morning:near_device",
+            selection.query_plan["selected"]["durable_memory_ids"],
+        )
+        self.assertTrue(selection.query_plan["pruning"]["continuity_only_focus_anchors"])
+        self.assertIn(
+            "durable:pattern:presence:morning:near_device",
+            selection.query_plan["pruning"]["anchorless_practical_focus_rescue_ids"],
+        )
+        self.assertIn(
+            "episode:morning_presence_turn",
+            selection.query_plan["selected"]["episodic_entry_ids"],
+        )
+
+    def test_unified_retrieval_selection_rescues_practical_patterns_from_graph_only_plan_focus(self) -> None:
+        green_button = self._durable_pattern(
+            memory_id="pattern:button:green:start_listening:morning",
+            summary="After breakfast the green button usually starts the morning Twinr weather conversation.",
+            details="Low-confidence button usage pattern derived from repeated morning interaction events.",
+            slot_key="pattern:button:green:start_listening:morning",
+            value_key="green:start_listening:morning",
+            attributes={"button": "green", "daypart": "morning", "pattern_type": "interaction"},
+        )
+        presence_morning = self._durable_pattern(
+            memory_id="pattern:presence:morning:near_device",
+            summary="Presence near the device was observed in the morning.",
+            details="Low-confidence multimodal pattern derived from PIR/camera evidence.",
+            slot_key="pattern:presence:morning:near_device",
+            value_key="presence_observed",
+            attributes={"daypart": "morning", "pattern_type": "presence"},
+        )
+        weather_episode = self._conversation_episode(
+            memory_id="episode:weather_after_breakfast",
+            transcript="After breakfast I usually ask Twinr about the weather before I start my day.",
+            response="I can keep that morning weather routine in mind.",
+        )
+        weather_entry = PersistentMemoryEntry(
+            entry_id="episode:weather_after_breakfast",
+            kind="episodic_turn",
+            summary="Stored conversation excerpt",
+            details='User said: "After breakfast I usually ask Twinr about the weather before I start my day." Twinr answered: "I can keep that morning weather routine in mind."',
+            created_at=datetime(2026, 4, 14, 8, 12, tzinfo=ZoneInfo("Europe/Berlin")),
+            updated_at=datetime(2026, 4, 14, 8, 12, tzinfo=ZoneInfo("Europe/Berlin")),
+        )
+        graph_selection = UnifiedGraphSelectionInput(
+            document=TwinrGraphDocumentV1(
+                subject_node_id="user:main",
+                graph_id="graph:user_main",
+                created_at="2026-04-14T08:00:00Z",
+                updated_at="2026-04-14T08:00:00Z",
+                nodes=(
+                    TwinrGraphNodeV1(node_id="user:main", node_type="user", label="Erika"),
+                    TwinrGraphNodeV1(
+                        node_id="plan:routine_task_030_2026_04_14",
+                        node_type="plan",
+                        label="routine task 030",
+                    ),
+                    TwinrGraphNodeV1(
+                        node_id="plan:routine_task_031_2026_04_15",
+                        node_type="plan",
+                        label="routine task 031",
+                    ),
+                ),
+                edges=(),
+                metadata={"kind": "personal_graph"},
+            ),
+            query_plan={
+                "mode": "remote_query_first_subgraph",
+                "matched_node_ids": ["plan:routine_task_030_2026_04_14"],
+                "selected_node_ids": [
+                    "plan:routine_task_030_2026_04_14",
+                    "plan:routine_task_031_2026_04_15",
+                    "user:main",
+                ],
+                "selected_edge_ids": [],
+                "access_path": ["graph_neighbors_query"],
+            },
+        )
+
+        selection = build_unified_retrieval_selection(
+            query_texts=("weather routine after breakfast morning twinr",),
+            episodic_entries=(build_episodic_selection_input(entry=weather_entry, source_object=weather_episode),),
+            durable_objects=(green_button, presence_morning),
+            conflict_queue=(),
+            conflict_supporting_objects=(),
+            midterm_packets=(),
+            graph_selection=graph_selection,
+        )
+
+        self.assertIn(
+            "pattern:button:green:start_listening:morning",
+            selection.query_plan["selected"]["durable_memory_ids"],
+        )
+        self.assertIn(
+            "episode:weather_after_breakfast",
+            selection.query_plan["selected"]["episodic_entry_ids"],
+        )
+        self.assertTrue(selection.query_plan["pruning"]["graph_only_focus_anchors"])
+        self.assertTrue(selection.query_plan["pruning"]["practical_focus_starved"])
+        self.assertIn(
+            "durable:pattern:button:green:start_listening:morning",
+            selection.query_plan["pruning"]["practical_focus_rescue_ids"],
+        )
+
+    def test_unified_retrieval_selection_rescues_presence_pattern_from_graph_only_place_focus(self) -> None:
+        presence_morning = self._durable_pattern(
+            memory_id="pattern:presence:morning:near_device",
+            summary="Presence near the device was observed in the morning.",
+            details="Low-confidence multimodal pattern derived from PIR/camera evidence.",
+            slot_key="pattern:presence:morning:near_device",
+            value_key="presence_observed",
+            attributes={"daypart": "morning", "pattern_type": "presence"},
+        )
+        presence_afternoon = self._durable_pattern(
+            memory_id="pattern:presence:afternoon:near_device",
+            summary="Presence near the device was observed in the afternoon.",
+            details="Low-confidence multimodal pattern derived from PIR/camera evidence.",
+            slot_key="pattern:presence:afternoon:near_device",
+            value_key="presence_observed",
+            attributes={"daypart": "afternoon", "pattern_type": "presence"},
+        )
+        graph_selection = UnifiedGraphSelectionInput(
+            document=TwinrGraphDocumentV1(
+                subject_node_id="user:main",
+                graph_id="graph:user_main",
+                created_at="2026-04-14T08:00:00Z",
+                updated_at="2026-04-14T08:00:00Z",
+                nodes=(
+                    TwinrGraphNodeV1(node_id="user:main", node_type="user", label="Erika"),
+                    TwinrGraphNodeV1(node_id="place:store_000", node_type="place", label="store 000"),
+                    TwinrGraphNodeV1(node_id="place:store_001", node_type="place", label="store 001"),
+                ),
+                edges=(),
+                metadata={"kind": "personal_graph"},
+            ),
+            query_plan={
+                "mode": "remote_query_first_subgraph",
+                "matched_node_ids": ["place:store_000"],
+                "selected_node_ids": ["place:store_000", "place:store_001", "user:main"],
+                "selected_edge_ids": [],
+                "access_path": ["graph_neighbors_query"],
+            },
+        )
+
+        selection = build_unified_retrieval_selection(
+            query_texts=("when am i usually near the device in the morning",),
+            episodic_entries=(),
+            durable_objects=(presence_morning, presence_afternoon),
+            conflict_queue=(),
+            conflict_supporting_objects=(),
+            midterm_packets=(),
+            graph_selection=graph_selection,
+        )
+
+        self.assertEqual(selection.durable_objects[0].memory_id, "pattern:presence:morning:near_device")
+        self.assertIn(
+            "pattern:presence:morning:near_device",
+            selection.query_plan["selected"]["durable_memory_ids"],
+        )
+        self.assertTrue(selection.query_plan["pruning"]["graph_only_focus_anchors"])
+        self.assertTrue(selection.query_plan["pruning"]["practical_focus_starved"])
+
+    def test_unified_retrieval_selection_keeps_combined_weather_support_under_plan_only_focus_noise(self) -> None:
+        green_button = self._durable_pattern(
+            memory_id="pattern:button:green:start_listening:morning",
+            summary="The green button was used to start a conversation in the morning.",
+            details="Low-confidence button usage pattern derived from a physical interaction event.",
+            slot_key="pattern:button:green:start_listening:morning",
+            value_key="green:start_listening:morning",
+            attributes={"button": "green", "daypart": "morning", "pattern_type": "interaction"},
+        )
+        presence_morning = self._durable_pattern(
+            memory_id="pattern:presence:morning:near_device",
+            summary="Presence near the device was observed in the morning.",
+            details="Low-confidence multimodal pattern derived from PIR/camera evidence.",
+            slot_key="pattern:presence:morning:near_device",
+            value_key="presence_observed",
+            attributes={"daypart": "morning", "pattern_type": "presence"},
+        )
+        camera_side = self._durable_pattern(
+            memory_id="pattern:camera_interaction:morning",
+            summary="Camera-side interaction was observed in the morning.",
+            details="Low-confidence multimodal pattern derived from repeated camera-side interaction signals.",
+            slot_key="pattern:camera_interaction:morning",
+            value_key="camera_interaction_observed",
+            attributes={"daypart": "morning", "pattern_type": "interaction"},
+        )
+        weather_episode = self._conversation_episode(
+            memory_id="episode:turn_20260413t081200000000_0200_e63dbc150c:9a217f8b0fdc",
+            transcript="After breakfast I usually ask Twinr about the weather before I start my day.",
+            response="I can keep that morning weather routine in mind.",
+            attributes={
+                "plan_ref": "plan:routine_task_030_2026_04_14",
+                "subject_ref": "user:main",
+            },
+        )
+        weather_entry = PersistentMemoryEntry(
+            entry_id="episode:turn_20260413t081200000000_0200_e63dbc150c:9a217f8b0fdc",
+            kind="episodic_turn",
+            summary="Stored conversation excerpt",
+            details='User said: "After breakfast I usually ask Twinr about the weather before I start my day." Twinr answered: "I can keep that morning weather routine in mind."',
+            created_at=datetime(2026, 4, 14, 8, 12, tzinfo=ZoneInfo("Europe/Berlin")),
+            updated_at=datetime(2026, 4, 14, 8, 12, tzinfo=ZoneInfo("Europe/Berlin")),
+        )
+        graph_selection = UnifiedGraphSelectionInput(
+            document=TwinrGraphDocumentV1(
+                subject_node_id="user:main",
+                graph_id="graph:user_main",
+                created_at="2026-04-14T08:00:00Z",
+                updated_at="2026-04-14T08:00:00Z",
+                nodes=(
+                    TwinrGraphNodeV1(node_id="user:main", node_type="user", label="Erika"),
+                    TwinrGraphNodeV1(
+                        node_id="plan:routine_task_030_2026_04_14",
+                        node_type="plan",
+                        label="routine task 030",
+                    ),
+                    TwinrGraphNodeV1(
+                        node_id="plan:routine_task_031_2026_04_15",
+                        node_type="plan",
+                        label="routine task 031",
+                    ),
+                    TwinrGraphNodeV1(
+                        node_id="plan:routine_task_032_2026_03_20",
+                        node_type="plan",
+                        label="routine task 032",
+                    ),
+                    TwinrGraphNodeV1(
+                        node_id="plan:routine_task_035_2026_04_14",
+                        node_type="plan",
+                        label="routine task 035",
+                    ),
+                    TwinrGraphNodeV1(
+                        node_id="plan:routine_task_036_2026_04_15",
+                        node_type="plan",
+                        label="routine task 036",
+                    ),
+                    TwinrGraphNodeV1(
+                        node_id="plan:routine_task_040_2026_04_14",
+                        node_type="plan",
+                        label="routine task 040",
+                    ),
+                    TwinrGraphNodeV1(
+                        node_id="plan:routine_task_041_2026_04_15",
+                        node_type="plan",
+                        label="routine task 041",
+                    ),
+                ),
+                edges=(),
+                metadata={"kind": "personal_graph"},
+            ),
+            query_plan={
+                "mode": "remote_query_first_subgraph",
+                "matched_node_ids": ["plan:routine_task_030_2026_04_14"],
+                "selected_node_ids": [
+                    "user:main",
+                    "plan:routine_task_030_2026_04_14",
+                    "plan:routine_task_031_2026_04_15",
+                    "plan:routine_task_032_2026_03_20",
+                    "plan:routine_task_035_2026_04_14",
+                    "plan:routine_task_036_2026_04_15",
+                    "plan:routine_task_040_2026_04_14",
+                    "plan:routine_task_041_2026_04_15",
+                ],
+                "selected_edge_ids": [],
+                "access_path": ["graph_neighbors_query"],
+            },
+        )
+
+        selection = build_unified_retrieval_selection(
+            query_texts=(
+                "Was passt morgens gut zu meiner Wetterroutine mit Twinr? Variante 1",
+                "weather routine after breakfast morning twinr",
+            ),
+            episodic_entries=(build_episodic_selection_input(entry=weather_entry, source_object=weather_episode),),
+            durable_objects=(green_button, presence_morning, camera_side),
+            conflict_queue=(),
+            conflict_supporting_objects=(),
+            midterm_packets=(),
+            graph_selection=graph_selection,
+        )
+
+        self.assertEqual(selection.query_plan["pruning"]["mode"], "mixed")
+        self.assertEqual(
+            selection.query_plan["pruning"]["family_mode_query_score_fallback_families"],
+            ["practical"],
+        )
+        self.assertTrue(selection.query_plan["pruning"]["forced_mixed_due_to_practical_starvation"])
+        self.assertIn(
+            "pattern:button:green:start_listening:morning",
+            selection.query_plan["selected"]["durable_memory_ids"],
+        )
+        self.assertIn(
+            "episode:turn_20260413t081200000000_0200_e63dbc150c:9a217f8b0fdc",
+            selection.query_plan["selected"]["episodic_entry_ids"],
+        )
+        dropped_durable_by_id = {
+            candidate["id"]: candidate["drop_reason"]
+            for candidate in selection.query_plan["dropped_candidates"]
+            if candidate["source"] == "durable"
+        }
+        self.assertNotIn("pattern:button:green:start_listening:morning", dropped_durable_by_id)
+        self.assertNotIn("pattern:presence:morning:near_device", dropped_durable_by_id)
+        self.assertNotIn("pattern:camera_interaction:morning", dropped_durable_by_id)
+
+    def test_build_context_keeps_presence_pattern_when_thread_anchored_episode_competes_in_remote_scope(self) -> None:
+        from dataclasses import replace
+
+        from test.test_longterm_store import (
+            _FakeRemoteState,
+            _StaleSemanticDriftScopeTopKClient,
+            _typed_remote_state,
+        )
+
+        def _make_remote_retriever(
+            temp_dir: str,
+        ) -> tuple[LongTermRetriever, LongTermStructuredStore, object]:
+            base_retriever, _object_store, prompt_context_store, graph_store, midterm_store = self._make_retriever(
+                temp_dir
+            )
+            remote_state = _FakeRemoteState()
+            remote_state.client = _StaleSemanticDriftScopeTopKClient()
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            remote_store = LongTermStructuredStore(
+                base_path=Path(temp_dir) / "state" / "chonkydb_remote",
+                remote_state=_typed_remote_state(remote_state),
+            )
+            retriever = LongTermRetriever(
+                config=base_retriever.config,
+                prompt_context_store=prompt_context_store,
+                graph_store=graph_store,
+                object_store=remote_store,
+                midterm_store=midterm_store,
+                conflict_resolver=base_retriever.conflict_resolver,
+                subtext_builder=base_retriever.subtext_builder,
+                adaptive_policy_builder=base_retriever.adaptive_policy_builder,
+            )
+            return retriever, remote_store, remote_state
+
+        def _clone(item: LongTermMemoryObjectV1) -> LongTermMemoryObjectV1:
+            return replace(
+                item,
+                attributes=dict(getattr(item, "attributes", {}) or {}),
+                conflicts_with=tuple(getattr(item, "conflicts_with", ()) or ()),
+                supersedes=tuple(getattr(item, "supersedes", ()) or ()),
+            )
+
+        presence_morning = self._durable_pattern(
+            memory_id="pattern:presence:morning:near_device",
+            summary="Presence near the device was observed in the morning.",
+            details="Low-confidence multimodal pattern derived from PIR/camera evidence.",
+            slot_key="pattern:presence:morning:near_device",
+            value_key="presence_observed",
+            attributes={"daypart": "morning", "pattern_type": "presence"},
+        )
+        presence_afternoon = self._durable_pattern(
+            memory_id="pattern:presence:afternoon:near_device",
+            summary="Presence near the device was observed in the afternoon.",
+            details="Low-confidence multimodal pattern derived from PIR/camera evidence.",
+            slot_key="pattern:presence:afternoon:near_device",
+            value_key="presence_observed",
+            attributes={"daypart": "afternoon", "pattern_type": "presence"},
+        )
+        thread_episode = self._conversation_episode(
+            memory_id="episode:morning_presence_turn",
+            transcript="When I stand close to the device in the morning, I usually ask my first question right away.",
+            response="That morning presence cue can help start the day calmly.",
+            attributes={"thread_ref": "thread:morning_routine"},
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, remote_store, remote_state = _make_remote_retriever(temp_dir)
+            stale_client = remote_state.client
+            stale_objects = (_clone(thread_episode), _clone(presence_afternoon))
+            current_objects = (_clone(thread_episode), _clone(presence_morning))
+            remote_store.write_snapshot(objects=stale_objects, conflicts=(), archived_objects=())
+            stale_client.snapshot_scope_records()
+            remote_store.write_snapshot(objects=current_objects, conflicts=(), archived_objects=())
+
+            context = retriever.build_context(
+                query=LongTermQueryProfile.from_text(
+                    "Wann bin ich morgens meistens bei Twinr? Variante 1",
+                    canonical_english_text="when am i usually near the device in the morning",
+                ),
+                original_query_text="Wann bin ich morgens meistens bei Twinr? Variante 1",
+            )
+
+        self.assertIn(
+            "Presence near the device was observed in the morning.",
+            context.durable_context or "",
         )
 
     def test_build_context_surfaces_environment_reflection_in_durable_and_midterm_context(self) -> None:
@@ -1393,6 +2465,148 @@ class LongTermRetrieverTests(unittest.TestCase):
 
         self.assertIsNone(context.episodic_context)
 
+    def test_build_context_keeps_specific_recap_topic_across_large_episode_pool(self) -> None:
+        target_episode = self._conversation_episode(
+            memory_id="episode:topic_045",
+            transcript="We talked about topic 045 and the plan for later.",
+            response="You said topic 045 matters today, so I should remember it for our conversation.",
+        )
+        distractors = tuple(
+            self._conversation_episode(
+                memory_id=f"episode:distractor_{index:03d}",
+                transcript=f"I talked about distractor topic {index:03d} and a calm Twinr routine.",
+                response=f"Twinr answered distractor topic {index:03d} in a calm way.",
+            )
+            for index in range(60, 84)
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            object_store.write_snapshot(
+                objects=(target_episode, *distractors),
+                conflicts=(),
+                archived_objects=(),
+            )
+
+            context = retriever.build_context(
+                query=LongTermQueryProfile.from_text(
+                    "What did we say earlier about topic 045?",
+                    canonical_english_text="What did we say earlier about topic 045?",
+                ),
+                original_query_text="What did we say earlier about topic 045?",
+            )
+
+        self.assertIn("topic 045", context.episodic_context or "")
+        self.assertNotIn("distractor topic 060", context.episodic_context or "")
+
+    def test_build_context_keeps_specific_recap_topic_across_same_process_bridge_pool(self) -> None:
+        target_episode = self._conversation_episode(
+            memory_id="episode:topic_045",
+            transcript="We talked about topic 045 and the plan for later.",
+            response="You said topic 045 matters today, so I should remember it for our conversation.",
+        )
+        distractors = tuple(
+            self._conversation_episode(
+                memory_id=f"episode:distractor_{index:03d}",
+                transcript=f"I talked about distractor topic {index:03d} and a calm Twinr routine.",
+                response=f"Twinr answered distractor topic {index:03d} in a calm way.",
+            )
+            for index in range(60, 120)
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            bridge_objects = (target_episode, *distractors)
+            object_store._same_process_snapshot_bridge_objects = lambda: bridge_objects  # type: ignore[method-assign]
+
+            context = retriever.build_context(
+                query=LongTermQueryProfile.from_text(
+                    "What did we say earlier about topic 045?",
+                    canonical_english_text="What did we say earlier about topic 045?",
+                ),
+                original_query_text="What did we say earlier about topic 045?",
+            )
+
+        self.assertIn("topic 045", context.episodic_context or "")
+        self.assertNotIn("distractor topic 060", context.episodic_context or "")
+
+    def test_build_context_keeps_presence_pattern_across_large_durable_pool(self) -> None:
+        target_pattern = self._durable_pattern(
+            memory_id="pattern:presence:morning:near_device",
+            summary="Presence near the device was observed in the morning.",
+            details="Low-confidence multimodal pattern derived from PIR/camera evidence.",
+            slot_key="pattern:presence:morning:near_device",
+            value_key="presence_observed",
+            attributes={
+                "daypart": "morning",
+                "pattern_type": "presence",
+            },
+        )
+        distractors = tuple(
+            self._durable_pattern(
+                memory_id=f"pattern:distractor:{index:02d}",
+                summary=f"Twinr routine distractor {index:02d} was observed around the device.",
+                details="Low-confidence routine derived from unrelated mixed multimodal evidence.",
+                slot_key=f"pattern:distractor:{index:02d}",
+                value_key=f"distractor_{index:02d}",
+                attributes={
+                    "daypart": "morning",
+                    "pattern_type": "interaction",
+                    "request_source": "distractor",
+                },
+            )
+            for index in range(24)
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            object_store.write_snapshot(
+                objects=(target_pattern, *distractors),
+                conflicts=(),
+                archived_objects=(),
+            )
+
+            context = retriever.build_context(
+                query=LongTermQueryProfile.from_text(
+                    "Wann bin ich morgens meistens bei Twinr?",
+                    canonical_english_text="when am i usually near twinr in the morning",
+                ),
+                original_query_text="Wann bin ich morgens meistens bei Twinr?",
+            )
+
+        self.assertIn("Presence near the device was observed in the morning.", context.durable_context or "")
+
+    def test_select_relevant_context_objects_prefers_specific_presence_pattern_over_sensor_routine(self) -> None:
+        target_pattern = self._durable_pattern(
+            memory_id="pattern:presence:morning:near_device",
+            summary="Presence near the device was observed in the morning.",
+            details="Low-confidence multimodal pattern derived from PIR/camera evidence.",
+            slot_key="pattern:presence:morning:near_device",
+            value_key="presence_observed",
+            attributes={
+                "daypart": "morning",
+                "pattern_type": "presence",
+            },
+        )
+        presence_routine = self._sensor_routine(
+            memory_id="routine:presence:weekday:morning",
+            summary="Presence near the device is typical in the morning on weekdays.",
+            daypart="morning",
+            routine_type="presence",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _retriever, object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            object_store.write_snapshot(
+                objects=(target_pattern, presence_routine),
+                conflicts=(),
+                archived_objects=(),
+            )
+            episodic, durable = object_store.select_relevant_context_objects(
+                query_text="when am i usually near the device in the morning",
+                episodic_limit=1,
+                durable_limit=1,
+            )
+
+        self.assertEqual(episodic, ())
+        self.assertEqual(tuple(item.memory_id for item in durable), ("pattern:presence:morning:near_device",))
+
     def test_build_context_keeps_practical_support_for_connected_continuity_query(self) -> None:
         weather_episode = LongTermMemoryObjectV1(
             memory_id="episode:weather_morning",
@@ -1445,6 +2659,561 @@ class LongTermRetrieverTests(unittest.TestCase):
 
         self.assertIn("After breakfast I usually ask Twinr about the weather", context.episodic_context or "")
         self.assertIn("The green button was used to start a conversation in the morning.", context.durable_context or "")
+
+    def test_build_context_prefers_specific_button_pattern_when_sensor_routine_competes(self) -> None:
+        weather_episode = self._conversation_episode(
+            memory_id="episode:weather_morning",
+            transcript="After breakfast I usually ask Twinr about the weather before I start my day.",
+            response="I can keep that morning weather routine in mind.",
+        )
+        button_pattern = self._durable_pattern(
+            memory_id="pattern:button:green:start_listening:morning",
+            summary="The green button was used to start a conversation in the morning.",
+            details="Low-confidence button usage pattern derived from a physical interaction event.",
+            slot_key="pattern:button:green:start_listening:morning",
+            value_key="green:start_listening:morning",
+            attributes={
+                "button": "green",
+                "button_label": "green",
+                "action": "start_listening",
+                "daypart": "morning",
+                "pattern_type": "interaction",
+                "memory_domain": "interaction",
+            },
+        )
+        button_routine = self._sensor_routine(
+            memory_id="routine:interaction:conversation_start:weekday:morning",
+            summary="Conversation starts are typical in the morning on weekdays.",
+            daypart="morning",
+            routine_type="interaction",
+            interaction_type="conversation_start",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            object_store.write_snapshot(
+                objects=(weather_episode, button_pattern, button_routine),
+                conflicts=(),
+                archived_objects=(),
+            )
+
+            context = retriever.build_context(
+                query=LongTermQueryProfile.from_text(
+                    "Was passt morgens gut zu meiner Wetterroutine mit Twinr?",
+                    canonical_english_text="weather routine after breakfast morning twinr",
+                ),
+                original_query_text="Was passt morgens gut zu meiner Wetterroutine mit Twinr?",
+            )
+
+        self.assertIn("After breakfast I usually ask Twinr about the weather", context.episodic_context or "")
+        self.assertIn("The green button was used to start a conversation in the morning.", context.durable_context or "")
+
+    def test_select_relevant_context_objects_prefers_specific_print_patterns_over_sensor_routine(self) -> None:
+        yellow_button_pattern = self._durable_pattern(
+            memory_id="pattern:button:yellow:print_request:afternoon",
+            summary="The yellow button was used to request a printed answer in the afternoon.",
+            details="Low-confidence button usage pattern derived from a physical interaction event.",
+            slot_key="pattern:button:yellow:print_request:afternoon",
+            value_key="yellow:print_request:afternoon",
+            attributes={
+                "button": "yellow",
+                "button_label": "yellow",
+                "action": "print_request",
+                "daypart": "afternoon",
+                "pattern_type": "interaction",
+                "memory_domain": "interaction",
+            },
+        )
+        print_pattern = self._durable_pattern(
+            memory_id="pattern:print:yellow_button:afternoon",
+            summary="Printed Twinr output was used in the afternoon.",
+            details="Low-confidence print usage pattern derived from a yellow button print completion event.",
+            slot_key="pattern:print:yellow_button:afternoon",
+            value_key="printed_output",
+            attributes={
+                "request_source": "yellow_button",
+                "request_source_label": "yellow button",
+                "daypart": "afternoon",
+                "pattern_type": "interaction",
+                "memory_domain": "interaction",
+            },
+        )
+        print_routine = self._sensor_routine(
+            memory_id="routine:interaction:print:weekday:afternoon",
+            summary="Printed answers are typical in the afternoon on weekdays.",
+            daypart="afternoon",
+            routine_type="interaction",
+            interaction_type="print",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _retriever, object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            object_store.write_snapshot(
+                objects=(yellow_button_pattern, print_pattern, print_routine),
+                conflicts=(),
+                archived_objects=(),
+            )
+            _episodic, durable = object_store.select_relevant_context_objects(
+                query_text="how do i usually print answers with twinr in the afternoon yellow button print",
+                episodic_limit=1,
+                durable_limit=2,
+            )
+
+        self.assertEqual(
+            set(item.memory_id for item in durable),
+            {
+                "pattern:button:yellow:print_request:afternoon",
+                "pattern:print:yellow_button:afternoon",
+            },
+        )
+
+    def test_build_context_keeps_button_pattern_across_large_mixed_pool(self) -> None:
+        weather_episode = self._conversation_episode(
+            memory_id="episode:weather_morning",
+            transcript="After breakfast I usually ask Twinr about the weather before I start my day.",
+            response="I can keep that morning weather routine in mind.",
+        )
+        corinna_episode = self._conversation_episode(
+            memory_id="episode:corinna_called",
+            transcript="Corinna called earlier today.",
+            response="I can keep that in mind.",
+        )
+        button_pattern = self._durable_pattern(
+            memory_id="pattern:button:green:start_listening:morning",
+            summary="The green button was used to start a conversation in the morning.",
+            details="Low-confidence button usage pattern derived from a physical interaction event.",
+            slot_key="pattern:button:green:start_listening:morning",
+            value_key="green:start_listening:morning",
+            attributes={
+                "button": "green",
+                "action": "start_listening",
+                "daypart": "morning",
+                "pattern_type": "interaction",
+                "memory_domain": "interaction",
+            },
+        )
+        distractors = tuple(
+            self._durable_pattern(
+                memory_id=f"pattern:noise:{index:02d}",
+                summary=f"Twinr morning distractor pattern {index:02d}.",
+                details="Low-confidence distractor pattern around the device and routines.",
+                slot_key=f"pattern:noise:{index:02d}",
+                value_key=f"noise_{index:02d}",
+                attributes={
+                    "daypart": "morning",
+                    "pattern_type": "interaction",
+                    "memory_domain": "interaction",
+                },
+            )
+            for index in range(24)
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            object_store.write_snapshot(
+                objects=(weather_episode, corinna_episode, button_pattern, *distractors),
+                conflicts=(),
+                archived_objects=(),
+            )
+
+            context = retriever.build_context(
+                query=LongTermQueryProfile.from_text(
+                    "Was passt morgens gut zu meiner Wetterroutine mit Twinr?",
+                    canonical_english_text="weather routine after breakfast morning twinr",
+                ),
+                original_query_text="Was passt morgens gut zu meiner Wetterroutine mit Twinr?",
+            )
+
+        self.assertIn("After breakfast I usually ask Twinr about the weather", context.episodic_context or "")
+        self.assertIn("The green button was used to start a conversation in the morning.", context.durable_context or "")
+        self.assertNotIn("Corinna called earlier today", context.episodic_context or "")
+
+    def test_build_context_keeps_camera_pattern_across_large_mixed_pool(self) -> None:
+        camera_episode = self._conversation_episode(
+            memory_id="episode:camera_inspection",
+            transcript="If something looks odd, I use the camera to inspect it with Twinr in the afternoon.",
+            response="Then camera inspection is part of your afternoon routine.",
+        )
+        camera_pattern = self._durable_pattern(
+            memory_id="pattern:camera_use:vision_inspection:afternoon",
+            summary="The device camera was used in the afternoon.",
+            details="Low-confidence camera usage pattern derived from a vision inspection event.",
+            slot_key="pattern:camera_use:vision_inspection:afternoon",
+            value_key="camera_used",
+            attributes={
+                "purpose": "vision_inspection",
+                "purpose_label": "vision inspection",
+                "daypart": "afternoon",
+                "pattern_type": "interaction",
+                "memory_domain": "interaction",
+            },
+        )
+        distractors = tuple(
+            self._durable_pattern(
+                memory_id=f"pattern:camera_noise:{index:02d}",
+                summary=f"Camera distractor pattern {index:02d} was observed around the device.",
+                details="Low-confidence distractor interaction around the device in the afternoon.",
+                slot_key=f"pattern:camera_noise:{index:02d}",
+                value_key=f"camera_noise_{index:02d}",
+                attributes={
+                    "daypart": "afternoon",
+                    "pattern_type": "interaction",
+                    "memory_domain": "interaction",
+                },
+            )
+            for index in range(24)
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            object_store.write_snapshot(
+                objects=(camera_episode, camera_pattern, *distractors),
+                conflicts=(),
+                archived_objects=(),
+            )
+
+            context = retriever.build_context(
+                query=LongTermQueryProfile.from_text(
+                    "Wann nutze ich mit Twinr die Kamera zur Inspektion?",
+                    canonical_english_text="when do i use the device camera for inspection in the afternoon",
+                ),
+                original_query_text="Wann nutze ich mit Twinr die Kamera zur Inspektion?",
+            )
+
+        self.assertIn("If something looks odd, I use the camera to inspect it", context.episodic_context or "")
+        self.assertIn("The device camera was used in the afternoon.", context.durable_context or "")
+
+    def test_select_relevant_context_objects_prefers_specific_camera_side_pattern_over_sensor_routine(self) -> None:
+        camera_side_pattern = self._durable_pattern(
+            memory_id="pattern:camera_interaction:morning",
+            summary="Camera-side interaction was observed in the morning.",
+            details="Low-confidence multimodal pattern derived from repeated camera-side interaction signals.",
+            slot_key="pattern:camera_interaction:morning",
+            value_key="camera_interaction_observed",
+            attributes={
+                "daypart": "morning",
+                "pattern_type": "interaction",
+            },
+        )
+        camera_routine = self._sensor_routine(
+            memory_id="routine:interaction:camera_showing:weekday:morning",
+            summary="Camera interactions are typical in the morning on weekdays.",
+            daypart="morning",
+            routine_type="interaction",
+            interaction_type="camera_showing",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _retriever, object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            object_store.write_snapshot(
+                objects=(camera_side_pattern, camera_routine),
+                conflicts=(),
+                archived_objects=(),
+            )
+            _episodic, durable = object_store.select_relevant_context_objects(
+                query_text="when is there camera side interaction in the morning",
+                episodic_limit=1,
+                durable_limit=1,
+            )
+
+        self.assertEqual(tuple(item.memory_id for item in durable), ("pattern:camera_interaction:morning",))
+
+    def test_build_context_keeps_multimodal_patterns_when_full_stale_scope_competes(self) -> None:
+        from dataclasses import replace
+
+        from test.test_longterm_store import (
+            _FakeRemoteState,
+            _StaleSemanticDriftScopeTopKClient,
+            _typed_remote_state,
+        )
+
+        def _make_remote_retriever(
+            temp_dir: str,
+        ) -> tuple[LongTermRetriever, LongTermStructuredStore, object]:
+            base_retriever, _object_store, prompt_context_store, graph_store, midterm_store = self._make_retriever(
+                temp_dir
+            )
+            remote_state = _FakeRemoteState()
+            remote_state.client = _StaleSemanticDriftScopeTopKClient()
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            remote_store = LongTermStructuredStore(
+                base_path=Path(temp_dir) / "state" / "chonkydb_remote",
+                remote_state=_typed_remote_state(remote_state),
+            )
+            retriever = LongTermRetriever(
+                config=base_retriever.config,
+                prompt_context_store=prompt_context_store,
+                graph_store=graph_store,
+                object_store=remote_store,
+                midterm_store=midterm_store,
+                conflict_resolver=base_retriever.conflict_resolver,
+                subtext_builder=base_retriever.subtext_builder,
+                adaptive_policy_builder=base_retriever.adaptive_policy_builder,
+            )
+            return retriever, remote_store, remote_state
+
+        def _clone(item: LongTermMemoryObjectV1) -> LongTermMemoryObjectV1:
+            return replace(
+                item,
+                attributes=dict(getattr(item, "attributes", {}) or {}),
+                conflicts_with=tuple(getattr(item, "conflicts_with", ()) or ()),
+                supersedes=tuple(getattr(item, "supersedes", ()) or ()),
+            )
+
+        presence_morning = self._durable_pattern(
+            memory_id="pattern:presence:morning:near_device",
+            summary="Presence near the device was observed in the morning.",
+            details="Low-confidence multimodal pattern derived from PIR/camera evidence.",
+            slot_key="pattern:presence:morning:near_device",
+            value_key="presence_observed",
+            attributes={"daypart": "morning", "pattern_type": "presence"},
+        )
+        presence_afternoon = self._durable_pattern(
+            memory_id="pattern:presence:afternoon:near_device",
+            summary="Presence near the device was observed in the afternoon.",
+            details="Low-confidence multimodal pattern derived from PIR/camera evidence.",
+            slot_key="pattern:presence:afternoon:near_device",
+            value_key="presence_observed",
+            attributes={"daypart": "afternoon", "pattern_type": "presence"},
+        )
+        presence_evening = self._durable_pattern(
+            memory_id="pattern:presence:evening:near_device",
+            summary="Presence near the device was observed in the evening.",
+            details="Low-confidence multimodal pattern derived from PIR/camera evidence.",
+            slot_key="pattern:presence:evening:near_device",
+            value_key="presence_observed",
+            attributes={"daypart": "evening", "pattern_type": "presence"},
+        )
+        green_button = self._durable_pattern(
+            memory_id="pattern:button:green:start_listening:morning",
+            summary="The green button was used to start a conversation in the morning.",
+            details="Low-confidence button usage pattern derived from a physical interaction event.",
+            slot_key="pattern:button:green:start_listening:morning",
+            value_key="green:start_listening:morning",
+            attributes={"button": "green", "daypart": "morning", "pattern_type": "interaction"},
+        )
+        yellow_button = self._durable_pattern(
+            memory_id="pattern:button:yellow:print_request:afternoon",
+            summary="The yellow button was used to request a printed answer in the afternoon.",
+            details="Low-confidence button usage pattern derived from a physical interaction event.",
+            slot_key="pattern:button:yellow:print_request:afternoon",
+            value_key="yellow:print_request:afternoon",
+            attributes={"button": "yellow", "daypart": "afternoon", "pattern_type": "interaction"},
+        )
+        print_output = self._durable_pattern(
+            memory_id="pattern:print:button:afternoon",
+            summary="Printed Twinr output was used in the afternoon.",
+            details="Low-confidence print usage pattern derived from a button print completion event.",
+            slot_key="pattern:print:button:afternoon",
+            value_key="printed_output",
+            attributes={"request_source": "button", "daypart": "afternoon", "pattern_type": "interaction"},
+        )
+        camera_side = self._durable_pattern(
+            memory_id="pattern:camera_interaction:morning",
+            summary="Camera-side interaction was observed in the morning.",
+            details="Low-confidence multimodal pattern derived from repeated camera-side interaction signals.",
+            slot_key="pattern:camera_interaction:morning",
+            value_key="camera_interaction_observed",
+            attributes={"daypart": "morning", "pattern_type": "interaction"},
+        )
+        camera_use = self._durable_pattern(
+            memory_id="pattern:camera_use:vision_inspection:afternoon",
+            summary="The device camera was used in the afternoon.",
+            details="Low-confidence multimodal pattern derived from camera inspection usage.",
+            slot_key="pattern:camera_use:vision_inspection:afternoon",
+            value_key="camera_used",
+            attributes={"purpose": "vision_inspection", "daypart": "afternoon", "pattern_type": "interaction"},
+        )
+        weather_episode = self._conversation_episode(
+            memory_id="episode:weather_after_breakfast",
+            transcript="After breakfast I usually ask Twinr about the weather before I start my day.",
+            response="I can keep that morning weather routine in mind.",
+        )
+
+        scenarios = (
+            (
+                "presence_morning_1",
+                "Wann bin ich morgens meistens bei Twinr? Variante 1",
+                "when am i usually near the device in the morning",
+                (presence_afternoon, green_button, camera_side, camera_use, print_output, yellow_button),
+                (presence_morning,),
+                (),
+                ("Presence near the device was observed in the morning.",),
+                (),
+            ),
+            (
+                "green_button_1",
+                "Wie starte ich morgens meistens ein Gespräch mit Twinr? Variante 1",
+                "how do i usually start a conversation with twinr in the morning green button",
+                (presence_morning, presence_afternoon, camera_side, camera_use, print_output, yellow_button),
+                (green_button,),
+                (),
+                ("The green button was used to start a conversation in the morning.",),
+                (),
+            ),
+            (
+                "print_button_1",
+                "Wie drucke ich nachmittags meistens Antworten mit Twinr? Variante 1",
+                "how do i usually print answers with twinr in the afternoon yellow button print",
+                (presence_morning, presence_afternoon, green_button, camera_side, camera_use, presence_evening),
+                (yellow_button, print_output),
+                (),
+                (
+                    "The yellow button was used to request a printed answer in the afternoon.",
+                    "Printed Twinr output was used in the afternoon.",
+                ),
+                (),
+            ),
+            (
+                "camera_side_1",
+                "Wann gibt es morgens Bewegung direkt an der Kamera? Variante 1",
+                "when is there camera side interaction in the morning",
+                (presence_morning, presence_afternoon, green_button, camera_use, print_output, yellow_button),
+                (camera_side,),
+                (),
+                ("Camera-side interaction was observed in the morning.",),
+                (),
+            ),
+            (
+                "combined_weather_1",
+                "Was passt morgens gut zu meiner Wetterroutine mit Twinr? Variante 1",
+                "weather routine after breakfast morning twinr",
+                (presence_morning, presence_afternoon, camera_side, camera_use, print_output, yellow_button, weather_episode),
+                (green_button,),
+                (),
+                ("The green button was used to start a conversation in the morning.",),
+                ("After breakfast I usually ask Twinr about the weather before I start my day.",),
+            ),
+        )
+
+        for (
+            case_id,
+            query_text,
+            canonical_query_text,
+            stale_scope_objects,
+            current_head_objects,
+            extra_current_head_objects,
+            expected_durable_texts,
+                expected_episodic_texts,
+        ) in scenarios:
+            with self.subTest(case_id=case_id):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    retriever, remote_store, remote_state = _make_remote_retriever(temp_dir)
+                    stale_client = remote_state.client
+                    stale_objects = tuple(_clone(item) for item in stale_scope_objects)
+                    current_objects = tuple(_clone(item) for item in current_head_objects)
+                    extra_objects = tuple(_clone(item) for item in extra_current_head_objects)
+                    remote_store.write_snapshot(objects=stale_objects, conflicts=(), archived_objects=())
+                    stale_client.snapshot_scope_records()
+                    remote_store.write_snapshot(
+                        objects=stale_objects + current_objects + extra_objects,
+                        conflicts=(),
+                        archived_objects=(),
+                    )
+
+                    context = retriever.build_context(
+                        query=LongTermQueryProfile.from_text(
+                            query_text,
+                            canonical_english_text=canonical_query_text,
+                        ),
+                        original_query_text=query_text,
+                    )
+
+                for needle in expected_durable_texts:
+                    self.assertIn(needle, context.durable_context or "")
+                for needle in expected_episodic_texts:
+                    self.assertIn(needle, context.episodic_context or "")
+
+    def test_build_context_keeps_multimodal_context_when_graph_focus_is_plan_only_noise(self) -> None:
+        green_button = self._durable_pattern(
+            memory_id="pattern:button:green:start_listening:morning",
+            summary="After breakfast the green button usually starts the morning Twinr weather conversation.",
+            details="Low-confidence button usage pattern derived from repeated morning interaction events.",
+            slot_key="pattern:button:green:start_listening:morning",
+            value_key="green:start_listening:morning",
+            attributes={"button": "green", "daypart": "morning", "pattern_type": "interaction"},
+        )
+        presence_morning = self._durable_pattern(
+            memory_id="pattern:presence:morning:near_device",
+            summary="Presence near the device was observed in the morning.",
+            details="Low-confidence multimodal pattern derived from PIR/camera evidence.",
+            slot_key="pattern:presence:morning:near_device",
+            value_key="presence_observed",
+            attributes={"daypart": "morning", "pattern_type": "presence"},
+        )
+        weather_episode = self._conversation_episode(
+            memory_id="episode:weather_after_breakfast",
+            transcript="After breakfast I usually ask Twinr about the weather before I start my day.",
+            response="I can keep that morning weather routine in mind.",
+        )
+        graph_selection = UnifiedGraphSelectionInput(
+            document=TwinrGraphDocumentV1(
+                subject_node_id="user:main",
+                graph_id="graph:user_main",
+                created_at="2026-04-14T08:00:00Z",
+                updated_at="2026-04-14T08:00:00Z",
+                nodes=(
+                    TwinrGraphNodeV1(node_id="user:main", node_type="user", label="Erika"),
+                    TwinrGraphNodeV1(
+                        node_id="plan:routine_task_030_2026_04_14",
+                        node_type="plan",
+                        label="routine task 030",
+                    ),
+                    TwinrGraphNodeV1(
+                        node_id="plan:routine_task_031_2026_04_15",
+                        node_type="plan",
+                        label="routine task 031",
+                    ),
+                ),
+                edges=(),
+                metadata={"kind": "personal_graph"},
+            ),
+            query_plan={
+                "mode": "remote_query_first_subgraph",
+                "matched_node_ids": ["plan:routine_task_030_2026_04_14"],
+                "selected_node_ids": [
+                    "plan:routine_task_030_2026_04_14",
+                    "plan:routine_task_031_2026_04_15",
+                    "user:main",
+                ],
+                "selected_edge_ids": [],
+                "access_path": ["graph_neighbors_query"],
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            object_store.apply_consolidation(
+                LongTermConsolidationResultV1(
+                    turn_id="turn:weather_routine",
+                    occurred_at=datetime(2026, 4, 14, 8, 12, tzinfo=ZoneInfo("Europe/Berlin")),
+                    episodic_objects=(weather_episode,),
+                    durable_objects=(green_button, presence_morning),
+                    deferred_objects=(),
+                    conflicts=(),
+                    graph_edges=(),
+                )
+            )
+            with patch.object(
+                LongTermRetriever,
+                "_select_graph_context_selection",
+                return_value=graph_selection,
+            ):
+                context = retriever.build_context(
+                    query=LongTermQueryProfile.from_text(
+                        "Was passt morgens gut zu meiner Wetterroutine mit Twinr? Variante 1",
+                        canonical_english_text="weather routine after breakfast morning twinr",
+                    ),
+                    original_query_text="Was passt morgens gut zu meiner Wetterroutine mit Twinr? Variante 1",
+                )
+
+        self.assertIn(
+            "green button usually starts the morning Twinr weather conversation",
+            context.durable_context or "",
+        )
+        self.assertIn(
+            "After breakfast I usually ask Twinr about the weather before I start my day.",
+            context.episodic_context or "",
+        )
 
     def test_build_subtext_context_uses_preselected_graph_payload_and_updates_unified_plan(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

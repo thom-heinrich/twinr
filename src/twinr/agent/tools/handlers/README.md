@@ -19,6 +19,7 @@ automation parsing.
 - expose one bounded service-connect tool surface so a spoken request such as "verbinde mich mit WhatsApp" can start pairing and surface the QR/state on Twinr's right info panel
 - expose one bounded WhatsApp-send tool surface that resolves remembered contacts, requires explicit final confirmation, and hands delivery off to the running channel service
 - expose one smart-home tool surface for discovery, filtered state queries, low-risk control, and bounded stream inspection
+- expose one explicit durable-memory read surface so exact recall of `remember_memory` facts goes through a bounded runtime read instead of hidden prompt text
 - expose one temporary voice-quiet tool surface that suppresses transcript-first wake and automatic follow-up for a bounded runtime window without touching persistent settings
 - keep handler-local telemetry and audit side effects best-effort, including search-turn journaling for requested model, actual model, fallback cause, and the bounded output-budget trace actually used by the provider
 - keep handler-local telemetry and audit side effects best-effort, including machine-readable search verification and site-follow-up metadata so the specialist can route unresolved web answers into an explicit browser-permission step

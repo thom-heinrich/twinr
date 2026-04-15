@@ -25,8 +25,9 @@ instead of letting foreground prompt code mutate the personality directly.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, is_dataclass
+from datetime import datetime, timezone
 from hashlib import blake2b
 from threading import RLock
 from typing import Any
@@ -46,12 +47,72 @@ from twinr.agent.personality.intelligence import (
     WorldInterestSignal,
     WorldIntelligenceService,
 )
+from twinr.agent.personality.models import ContinuityThread, WorldSignal
 from twinr.agent.personality.signals import PersonalitySignalBatch, PersonalitySignalExtractor
 from twinr.memory.longterm.core.models import (
     LongTermConsolidationResultV1,
     LongTermConversationTurn,
 )
-from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
+from twinr.memory.longterm.storage._remote_current_records import LongTermRemoteCurrentRecordStore
+from twinr.memory.longterm.storage.remote_state import (
+    LongTermRemoteStateStore,
+    LongTermRemoteUnavailableError,
+)
+
+
+def _exception_summary(exc: Exception) -> str:
+    """Return one bounded exception summary for operator artifacts."""
+
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _parse_optional_iso_timestamp(value: object | None) -> datetime | None:
+    """Parse one optional ISO timestamp into aware UTC time when possible."""
+
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    if candidate.endswith("Z"):
+        candidate = f"{candidate[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _latest_history_commit_at(*payloads: Mapping[str, object] | None) -> str | None:
+    """Return the newest written_at timestamp across current-head payloads."""
+
+    newest_at: datetime | None = None
+    newest_written_at: str | None = None
+    for payload in payloads:
+        if not isinstance(payload, Mapping):
+            continue
+        written_at = str(payload.get("written_at") or "").strip()
+        parsed = _parse_optional_iso_timestamp(written_at)
+        if parsed is None:
+            continue
+        if newest_at is None or parsed > newest_at:
+            newest_at = parsed
+            newest_written_at = written_at
+    return newest_written_at
+
+
+@dataclass(frozen=True, slots=True)
+class PersonalityHistoryProbe:
+    """Describe whether persisted personality history is currently readable."""
+
+    history_read_status: str = "unavailable"
+    snapshot_head_status: str = "unknown"
+    delta_head_status: str = "unknown"
+    failure_stage: str | None = None
+    last_commit_at: str | None = None
+    error: str | None = None
 
 
 @dataclass(slots=True)
@@ -220,6 +281,12 @@ class PersonalityLearningService:
                 return None
             return self._flush_pending_locked()
 
+    def probe_history_status(self) -> PersonalityHistoryProbe:
+        """Return one authoritative read-status snapshot for persisted personality history."""
+
+        with self._lock:
+            return self._probe_history_status_locked()
+
     def configure_world_intelligence(
         self,
         *,
@@ -256,6 +323,123 @@ class PersonalityLearningService:
             self._commit_world_refresh_locked(result)
             return result
 
+    def _probe_history_status_locked(self) -> PersonalityHistoryProbe:
+        """Load the current personality heads and payloads without mutating state."""
+
+        loop = self.background_loop
+        remote_state = getattr(loop, "remote_state", None)
+        if remote_state is None:
+            return PersonalityHistoryProbe(
+                history_read_status="unavailable",
+                snapshot_head_status="unavailable",
+                delta_head_status="unavailable",
+                failure_stage="remote_state_missing",
+                error="background personality loop has no remote_state",
+            )
+
+        snapshot_store = getattr(loop, "snapshot_store", None)
+        evolution_store = getattr(loop, "evolution_store", None)
+        if snapshot_store is None or evolution_store is None:
+            return PersonalityHistoryProbe(
+                history_read_status="unavailable",
+                snapshot_head_status="unavailable",
+                delta_head_status="unavailable",
+                failure_stage="store_missing",
+                error="background personality loop is missing snapshot or evolution store",
+            )
+
+        snapshot_head: Mapping[str, object] | None = None
+        delta_head: Mapping[str, object] | None = None
+        try:
+            load_snapshot_head = getattr(snapshot_store, "load_remote_current_snapshot", None)
+            if callable(load_snapshot_head):
+                loaded_snapshot_head = load_snapshot_head(
+                    config=loop.config,
+                    remote_state=remote_state,
+                )
+                if isinstance(loaded_snapshot_head, Mapping):
+                    snapshot_head = loaded_snapshot_head
+        except Exception as exc:
+            return self._history_probe_failure(
+                stage="snapshot_current_head",
+                exc=exc,
+                snapshot_head_status="error",
+                delta_head_status="unknown",
+            )
+
+        snapshot_head_status = "loaded" if isinstance(snapshot_head, Mapping) else "missing"
+        try:
+            delta_snapshot_kind = str(getattr(evolution_store, "delta_snapshot_kind", "") or "").strip()
+            if delta_snapshot_kind:
+                loaded_delta_head = LongTermRemoteCurrentRecordStore(remote_state).load_current_head(
+                    snapshot_kind=delta_snapshot_kind
+                )
+                if isinstance(loaded_delta_head, Mapping):
+                    delta_head = loaded_delta_head
+        except Exception as exc:
+            return self._history_probe_failure(
+                stage="delta_current_head",
+                exc=exc,
+                snapshot_head_status=snapshot_head_status,
+                delta_head_status="error",
+            )
+
+        delta_head_status = "loaded" if isinstance(delta_head, Mapping) else "missing"
+        try:
+            snapshot = snapshot_store.load_snapshot(
+                config=loop.config,
+                remote_state=remote_state,
+            )
+        except Exception as exc:
+            return self._history_probe_failure(
+                stage="snapshot_payload",
+                exc=exc,
+                snapshot_head_status=snapshot_head_status,
+                delta_head_status=delta_head_status,
+            )
+
+        try:
+            deltas = evolution_store.load_personality_deltas(
+                config=loop.config,
+                remote_state=remote_state,
+            )
+        except Exception as exc:
+            return self._history_probe_failure(
+                stage="delta_payload",
+                exc=exc,
+                snapshot_head_status=snapshot_head_status,
+                delta_head_status=delta_head_status,
+            )
+
+        history_read_status = "loaded"
+        if snapshot is None and not deltas and snapshot_head is None and delta_head is None:
+            history_read_status = "missing"
+        return PersonalityHistoryProbe(
+            history_read_status=history_read_status,
+            snapshot_head_status=snapshot_head_status,
+            delta_head_status=delta_head_status,
+            last_commit_at=_latest_history_commit_at(snapshot_head, delta_head),
+        )
+
+    def _history_probe_failure(
+        self,
+        *,
+        stage: str,
+        exc: Exception,
+        snapshot_head_status: str,
+        delta_head_status: str,
+    ) -> PersonalityHistoryProbe:
+        """Normalize one history-probe failure into an explicit status object."""
+
+        status = "remote_unavailable" if isinstance(exc, LongTermRemoteUnavailableError) else "error"
+        return PersonalityHistoryProbe(
+            history_read_status=status,
+            snapshot_head_status=snapshot_head_status,
+            delta_head_status=delta_head_status,
+            failure_stage=stage,
+            error=_exception_summary(exc),
+        )
+
     def _record_world_interest_signals(
         self,
         signals: Sequence[WorldInterestSignal],
@@ -272,12 +456,12 @@ class PersonalityLearningService:
         if not batch.has_any():
             return
 
-        for signal in batch.interaction_signals:
-            self.background_loop.enqueue_interaction_signal(signal)
-        for signal in batch.place_signals:
-            self.background_loop.enqueue_place_signal(signal)
-        for signal in batch.world_signals:
-            self.background_loop.enqueue_world_signal(signal)
+        for interaction_signal in batch.interaction_signals:
+            self.background_loop.enqueue_interaction_signal(interaction_signal)
+        for place_signal in batch.place_signals:
+            self.background_loop.enqueue_place_signal(place_signal)
+        for world_signal in batch.world_signals:
+            self.background_loop.enqueue_world_signal(world_signal)
         for thread in batch.continuity_threads:
             self.background_loop.enqueue_continuity_thread(thread)
 
@@ -344,8 +528,16 @@ class PersonalityLearningService:
             self._enqueue_world_interest_signals_locked(refresh_interest_signals)
 
         batch = PersonalitySignalBatch(
-            world_signals=tuple(refresh_result.world_signals),
-            continuity_threads=tuple(refresh_result.continuity_threads),
+            world_signals=tuple(
+                signal
+                for signal in refresh_result.world_signals
+                if isinstance(signal, WorldSignal)
+            ),
+            continuity_threads=tuple(
+                thread
+                for thread in refresh_result.continuity_threads
+                if isinstance(thread, ContinuityThread)
+            ),
         )
         if not batch.has_any():
             self._persist_pending_world_interest_signals_locked()

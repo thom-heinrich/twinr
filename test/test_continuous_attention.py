@@ -34,8 +34,8 @@ class ContinuousAttentionTrackerTests(unittest.TestCase):
 
         self.assertTrue(snapshot.active)
         self.assertEqual(snapshot.state, "active_visible_person")
-        self.assertAlmostEqual(snapshot.target_center_x, 0.51, places=2)
-        self.assertAlmostEqual(snapshot.target_center_y, 0.24, places=2)
+        self.assertAlmostEqual(snapshot.target_center_x or 0.0, 0.51, places=2)
+        self.assertAlmostEqual(snapshot.target_center_y or 0.0, 0.24, places=2)
 
     def test_keeps_recent_unmatched_second_track_through_brief_detector_drop(self) -> None:
         tracker = ContinuousAttentionTracker.from_config(TwinrConfig())
@@ -161,6 +161,7 @@ class ContinuousAttentionTrackerTests(unittest.TestCase):
         self.assertEqual(snapshot.state, "active_visible_speaker_track")
         self.assertTrue(snapshot.speaker_locked)
         self.assertAlmostEqual(snapshot.target_center_x or 0.0, 0.748, places=3)
+        self.assertGreaterEqual(snapshot.confidence, 0.6)
 
     def test_does_not_hold_stale_selected_track_over_fresh_visible_anchor(self) -> None:
         tracker = ContinuousAttentionTracker.from_config(TwinrConfig())
